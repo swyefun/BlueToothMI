@@ -880,9 +880,10 @@ mod page {
         n as u32
     }
 
-    /// Human-readable Class of Device: major device class plus the service
-    /// bits that matter for headset use. Bluetooth Assigned Numbers:
-    /// major = (cod >> 8) & 0x1F, services live in bits 13..20.
+    /// Human-readable Class of Device. 0.9.2: NOT rendered - the extra
+    /// status row added in 0.9.1 black-screens the Manager UI page, so this
+    /// diagnostic path is disabled until the render regression is understood.
+    #[allow(dead_code)]
     fn cod_text(buf: &mut [u8]) -> u32 {
         let cod = BOND_COD.load(Ordering::Relaxed);
         if cod == 0 {
@@ -1026,8 +1027,6 @@ mod page {
             let n_err = err_text(&mut b_err);
             let mut b_bond = [0u8; 20];
             let n_bond = bond_text(&mut b_bond);
-            let mut b_cod = [0u8; 28];
-            let n_cod = cod_text(&mut b_cod);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
@@ -1072,9 +1071,6 @@ mod page {
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 6, "对端地址", &b_peer[..n_peer as usize]);
-            }
-            if rc == UI_OK {
-                rc = status_row(ui_obj, tree, 20, "设备类别", &b_cod[..n_cod as usize]);
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
