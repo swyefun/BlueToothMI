@@ -232,25 +232,26 @@ mod device {
     /// 17-word adapter table. Slot order per `CALLBACK_ADAPTER_STATE` /
     /// `CALLBACK_DISCOVERY_STATE` / `CALLBACK_DISCOVERY_RESULT` /
     /// `CALLBACK_PAIR_REQUEST` / `CALLBACK_PAIR_DISPLAY` (0,1,2,5,6).
-    static CALLBACK_TABLE: [u32; 17] = [
-        on_adapter_state as usize as u32 | THUMB,
-        on_discovery_state as usize as u32 | THUMB,
-        on_discovery_result as usize as u32 | THUMB,
-        stub as usize as u32 | THUMB, // 3
-        stub as usize as u32 | THUMB, // 4
-        stub as usize as u32 | THUMB, // 5 pair request: not acted on
-        stub as usize as u32 | THUMB, // 6 pair display
-        stub as usize as u32 | THUMB, // 7
-        stub as usize as u32 | THUMB, // 8
-        stub as usize as u32 | THUMB, // 9 bond state
-        stub as usize as u32 | THUMB, // 10
-        stub as usize as u32 | THUMB, // 11
-        stub as usize as u32 | THUMB, // 12
-        stub as usize as u32 | THUMB, // 13
-        stub as usize as u32 | THUMB, // 14
-        stub as usize as u32 | THUMB, // 15
-        stub as usize as u32 | THUMB, // 16
-    ];
+    /// Fn-pointer-to-integer casts are rejected by const eval, so the words
+    /// are filled at runtime by [`fill_callback_table`] right before
+    /// `bt_adapter_register` is handed the buffer.
+    static mut CALLBACK_TABLE: [u32; 17] = [0; 17];
+    static TABLE_READY: AtomicU32 = AtomicU32::new(0);
+
+    /// Fills the adapter callback table with Thumb-callable words. The
+    /// supervisor serves module calls from a single task, so this write races
+    /// with nothing.
+    fn fill_callback_table() {
+        let table = unsafe { &mut *core::ptr::addr_of_mut!(CALLBACK_TABLE) };
+        table[0] = on_adapter_state as usize as u32 | THUMB;
+        table[1] = on_discovery_state as usize as u32 | THUMB;
+        table[2] = on_discovery_result as usize as u32 | THUMB;
+        let stub_word = stub as usize as u32 | THUMB;
+        for slot in table[3..17].iter_mut() {
+            *slot = stub_word;
+        }
+        TABLE_READY.store(1, Ordering::Relaxed);
+    }
 
     pub fn guard_ok() -> bool {
         canopus_target_private::canopus_identity_guard() == 0
@@ -292,7 +293,11 @@ mod device {
         // Append-only registration (IDA-verified observer list at adapter+120);
         // the stock table keeps receiving events. One registration per load.
         if REGISTRATION.load(Ordering::Relaxed) == 0 {
-            let reg = unsafe { bt_adapter_register(adapter, CALLBACK_TABLE.as_ptr()) };
+            if TABLE_READY.load(Ordering::Relaxed) == 0 {
+                fill_callback_table();
+            }
+            let table = core::ptr::addr_of!(CALLBACK_TABLE);
+            let reg = unsafe { bt_adapter_register(adapter, table.cast()) };
             if reg == 0 {
                 return fail(E_IO, 0);
             }
