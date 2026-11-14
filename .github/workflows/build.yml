@@ -9,6 +9,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   CANOPUS_SHA: f196b200823f47780c73ae48c4c62da8fe5311df
   TARGET_ID: xiaomi-band-11-4.100.179
