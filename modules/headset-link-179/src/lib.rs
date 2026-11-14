@@ -274,8 +274,14 @@ mod device {
         CB_COUNT.fetch_add(1, Ordering::Relaxed);
         // Reversed-order peer match: only the selected peer drives the page,
         // so a stray bond event from the phone/laptop cannot fake "paired".
+        // Iterator zip (no alloc): incoming[i] == peer[5-i] for all six bytes.
         let peer = peer_bytes();
-        if has_peer(&peer) && incoming[..] == peer.iter().rev().copied().collect::<Vec<_>>()[..] {
+        if has_peer(&peer)
+            && incoming
+                .iter()
+                .zip(peer.iter().rev())
+                .all(|(a, b)| a == b)
+        {
             BOND_COD.store(r2 as u32, Ordering::Relaxed);
             BOND_STATE.store(r3 as u32, Ordering::Relaxed);
         }
