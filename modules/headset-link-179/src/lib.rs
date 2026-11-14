@@ -151,26 +151,15 @@ fn has_peer(addr: &[u8; 6]) -> bool {
     addr.iter().any(|&b| b != 0)
 }
 
-/// Bounded busy-wait between IPC retries. no_std has no timer in the UI task;
-/// the loop is short enough not to stall the host.
-#[cfg(feature = "device")]
-fn ipc_pause() {
-    let mut n = 0u32;
-    while n < 200_000 {
-        core::hint::spin_loop();
-        n += 1;
-    }
-}
-
 #[cfg(feature = "device")]
 mod device {
     use super::*;
     use canopus_target_private::{
         ADAPTER_STATE_ON, CLASSIC_TRANSPORT, CONNECT_ADDRESS_OFFSET, CONNECT_REQUEST_SIZE,
-        CREATE_BOND_ADAPTER_NOT_READY, DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
+        DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
         SdpAvrcpControllerRecord, SdpSourceRecord, bt_adapter_get_instance, bt_adapter_get_state,
         bt_adapter_register, bt_adapter_unregister, bt_alloc, bt_create_bond, bt_discovery_start,
-        bt_discovery_stop, bt_get_bond_state, bt_l2cap_connect, configure_avctp_connect_request,
+        bt_discovery_stop, bt_l2cap_connect, configure_avctp_connect_request,
         configure_avdtp_connect_request, discovery_name, sdp_builder_create, sdp_commit,
         sdp_set_raw_attribute, sdp_unregister,
     };
@@ -397,17 +386,12 @@ mod device {
         if adapter.is_null() {
             return ok(ST_IDLE);
         }
-        // IDA: sub_C46A18C returns 1 when the 708-byte IPC send fails. That
-        // leaves the inquiry running, which then makes create_bond fail too.
-        // Retry a few times with a short pause instead of giving up on the
-        // first transient socket error.
-        let mut rc = unsafe { bt_discovery_stop(adapter) };
-        let mut tries = 1;
-        while rc == 1 && tries < 4 {
-            ipc_pause();
-            rc = unsafe { bt_discovery_stop(adapter) };
-            tries += 1;
-        }
+        // Exactly one IPC request. IDA: sub_C46A18C parks the request buffer
+        // at adapter+72 until the response arrives, so back-to-back stop
+        // calls (v0.7 retried four times) can overwrite an in-flight slot.
+        // Restore the single-call behaviour of 0.3/0.4, the only build that
+        // ever produced a pairing dialog on the band.
+        let rc = unsafe { bt_discovery_stop(adapter) };
         LAST_STOP_RC.store(rc, Ordering::Relaxed);
         // Always drop back to idle, even on a firmware error: a stale
         // ST_FAILED would keep the page red and block the next scan.
@@ -424,45 +408,19 @@ mod device {
         if !has_peer(&addr) || ADAPTER.load(Ordering::Relaxed).is_null() {
             return fail(E_ARGUMENT, 0);
         }
-        // create_bond is rejected with ADAPTER_NOT_READY while an inquiry is
-        // still winding down. The stop entry is idempotent on this firmware
-        // (IDA: it returns a protocol status byte), so always issue one
-        // before bonding, regardless of the UI-side STATE snapshot.
-        let adapter = ADAPTER.load(Ordering::Relaxed);
-        let mut stop_rc = unsafe { bt_discovery_stop(adapter) };
-        let mut stop_tries = 1;
-        while stop_rc == 1 && stop_tries < 4 {
-            ipc_pause();
-            stop_rc = unsafe { bt_discovery_stop(adapter) };
-            stop_tries += 1;
-        }
-        LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
-        STATE.store(ST_IDLE, Ordering::Relaxed);
-
-        // rc == 1 is the same IPC send failure; rc == 2 is
-        // ADAPTER_NOT_READY while the inquiry winds down. Both are transient.
-        let mut rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
-        let mut tries = 1;
-        while (rc == 1 || rc == CREATE_BOND_ADAPTER_NOT_READY) && tries < 4 {
-            ipc_pause();
-            let _ = unsafe { bt_discovery_stop(adapter) };
-            rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
-            tries += 1;
-        }
+        // Back to the only build that ever produced a pairing dialog (0.3/0.4):
+        // ONE create_bond, no preceding discovery_stop, no retry, and no
+        // get_bond_state immediately afterwards.
+        //
+        // IDA: sub_C46A18C parks the 708-byte request at adapter+72 until its
+        // response arrives - a single in-flight slot. v0.5+ chained stop ->
+        // create_bond -> get_bond_state (v0.7 retried each), which can clobber
+        // that slot. Bond results now arrive asynchronously via on_bond_state
+        // (callback slot 9), so no follow-up IPC is needed here.
+        let rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
-        // Do not clobber a bond state delivered asynchronously by the slot-9
-        // callback with an early NONE snapshot.
-        let bond = unsafe { bt_get_bond_state(addr.as_ptr()) };
-        if bond != 0 {
-            BOND_STATE.store(bond, Ordering::Relaxed);
-        }
-        // IDA: create_bond (cmd 94) and get_bond_state (cmd 83) both go
-        // through sub_C46A18C's 708-byte IPC and return the response status
-        // word at +12, not an errno. A non-zero value can mean "accepted",
-        // "already bonded" or "in progress". Neither rc nor bond is a
-        // trustworthy success predicate, so never turn them into a hard
-        // failure - that is exactly what produced the bogus 失败 on 0.3/0.4.
-        // Both raw numbers stay on the page for diagnosis.
+        // rc is a response status word, not an errno; never turn it into a
+        // hard failure. The raw number stays on the page for diagnosis.
         ok(ST_BONDING)
     }
 
@@ -820,12 +778,10 @@ mod page {
             ST_SCANNING => "扫描中",
             ST_PEER_SET => "对端已设",
             ST_BONDING => {
-                if LAST_PAIR_RC.load(Ordering::Relaxed) == 1 {
-                    "请求未送出"
-                } else if BOND_STATE.load(Ordering::Relaxed) == 2 {
-                    "已配对"
-                } else {
-                    "配对已提交"
+                match BOND_STATE.load(Ordering::Relaxed) {
+                    1 => "配对中",
+                    2 => "已配对",
+                    _ => "配对已提交",
                 }
             }
             ST_SDP_READY => "SDP 就绪",
@@ -1200,8 +1156,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.7.0"),
-    build_id: pack(b"headset-link-179-0.7.0"),
+    module_version: pack(b"0.8.0"),
+    build_id: pack(b"headset-link-179-0.8.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
