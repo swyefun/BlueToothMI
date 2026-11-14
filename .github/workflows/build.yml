@@ -106,6 +106,8 @@ jobs:
             --product headset-link --target "$TARGET_ID" \
             --payload-dir build/payload --assets-dir build/assets \
             --output-dir build/installer
+          python3 ../scripts/patch_installer_button.py \
+            build/installer/xiaomi-band-11/main.lua
           cp -r build/installer/xiaomi-band-11/* ../module-installer-watchface/
 
       - name: Publish deliverables to dist branch

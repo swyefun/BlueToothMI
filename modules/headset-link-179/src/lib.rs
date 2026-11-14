@@ -46,9 +46,9 @@
 //! to `sub_C867C80(PSM, ...)`, i.e. it expects an already-registered PSM
 //! handler for AVDTP (0x19) / AVCTP (0x17). `queue_connect` below zeroes +12
 //! and registers no PSM handler, so CMD_CONNECT is an UNVERIFIED path that
-//! may dereference a null callback. Published callbacks also require boot
-//! residency while this module is declared `lifecycle = "removable"`.
-//! Do not run CMD_CONNECT on hardware until both points are resolved. See
+//! may dereference a null callback. Boot residency is now declared through
+//! `lifecycle = "resident-after-activation"`; the PSM-handler gap remains.
+//! Do not run CMD_CONNECT on hardware until that point is resolved. See
 //! `NOTES-ida-179.md` for the address evidence and the build hand-off.
 //!
 //! All firmware calls are exact-target full-trust absolute addresses. `.179`
@@ -851,8 +851,9 @@ mod page {
             let n_bond = put_num(&mut b_bond, BOND_STATE.load(Ordering::Relaxed) as i32);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
-            let scan = [0u8; 256];
-            let found = ctl(CMD_SCAN_RESULTS, scan.as_ptr());
+            // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
+            let mut scan = [0u8; 256];
+            let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
             let mut b_found = [0u8; 16];
             let n_found = match found {
                 count if count < 0 => put_str(&mut b_found, "暂不可用"),
@@ -903,6 +904,11 @@ mod page {
                 );
             }
             if rc == UI_OK {
+                // Each container needs its own end(): the previous section and
+                // the root navigation page are distinct open containers.
+                rc = (ui_obj.end)(tree); // section "状态"
+            }
+            if rc == UI_OK {
                 rc = section(ui_obj, tree, 8, "操作");
             }
             if rc == UI_OK {
@@ -921,10 +927,10 @@ mod page {
                 rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
             }
             if rc == UI_OK {
-                rc = (ui_obj.end)(tree); // section
+                rc = (ui_obj.end)(tree); // section "操作"
             }
             if rc == UI_OK {
-                rc = (ui_obj.end)(tree); // page
+                rc = (ui_obj.end)(tree); // navigation page
             }
             if rc == UI_OK {
                 (ui_obj.tree_commit)(tree)
@@ -947,8 +953,8 @@ mod page {
     /// sets the peer address and bonds. `CMD_CONNECT` is deliberately not
     /// reachable from the UI (unverified null-callback firmware path).
     fn pair_first() -> i32 {
-        let scan = [0u8; 256];
-        let found = ctl(CMD_SCAN_RESULTS, scan.as_ptr());
+        let mut scan = [0u8; 256];
+        let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
         if found <= 0 {
             return fail(E_STATE, 0);
         }
@@ -1026,8 +1032,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.2.0"),
-    build_id: pack(b"headset-link-179-0.2.0"),
+    module_version: pack(b"0.3.0"),
+    build_id: pack(b"headset-link-179-0.3.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),

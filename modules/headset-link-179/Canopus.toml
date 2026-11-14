@@ -2,11 +2,11 @@ schema = 1
 
 [module]
 id = "headset_link_179"
-version = "0.2.0"
-version_code = 2
+version = "0.3.0"
+version_code = 3
 kind = "target"
 language = "rust"
-lifecycle = "removable"
+lifecycle = "resident-after-activation"
 canopus_abi = "2"
 description = "Band 11 4.100.179 headset link front-end: scan/pair/SDP/L2CAP; AVDTP media path not implemented"
 
