@@ -590,9 +590,29 @@ mod device {
         ok(ST_SDP_READY)
     }
 
-    /// Queues one 68-byte L2CAP connect request. The callback word at +12 is
-    /// left zero: no completion-event handler is installed (see module header).
-    /// `bt_l2cap_connect` returns the accepted queue node, 0 when rejected.
+    /// L2CAP connect completion evidence (callback installed at request+12).
+    static L2CAP_EVENTS: AtomicU32 = AtomicU32::new(0);
+    static L2CAP_EVENT: AtomicI32 = AtomicI32::new(0);
+    static L2CAP_CID: AtomicU32 = AtomicU32::new(0);
+
+    /// Completion callback the firmware invokes as `cb(event, request)`;
+    /// event 2 = CONFIRM (channel open, CID written to request+0). Deliberately
+    /// leaks the request and the firmware's completion event: the callback owns
+    /// freeing them, but their full event-time layout is unverified and a
+    /// wrong free is a crash - a 188-byte leak per attempt is the safer side.
+    unsafe extern "C" fn on_l2cap_event(event: i32, request: *mut u8) {
+        if request.is_null() {
+            return;
+        }
+        let cid = unsafe { core::ptr::read_unaligned(request.cast::<u16>()) };
+        L2CAP_EVENT.store(event, Ordering::Relaxed);
+        L2CAP_CID.store(cid as u32, Ordering::Relaxed);
+        L2CAP_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Queues one 68-byte L2CAP connect request with the completion callback
+    /// installed. `bt_l2cap_connect` returns the accepted queue node, 0 when
+    /// rejected.
     unsafe fn queue_connect(
         configure: unsafe fn(*mut u8),
         addr: &[u8; 6],
@@ -611,6 +631,14 @@ mod device {
                 addr.len(),
             );
             configure(request);
+            // A zero callback word makes the firmware silently drop the work
+            // node (0.10.4: no page ever went out). Install the completion
+            // callback so the connect actually proceeds; the firmware invokes
+            // it as cb(event=2 CONFIRM, request) with the CID at request+0.
+            core::ptr::write_unaligned(
+                request.add(CONNECT_CALLBACK_OFFSET).cast::<u32>(),
+                on_l2cap_event as *const () as usize as u32 | THUMB,
+            );
         }
         let queued = unsafe { bt_l2cap_connect(request.cast()) };
         node.store(queued as usize as *mut c_void, Ordering::Relaxed);
@@ -1002,6 +1030,21 @@ mod page {
                 n += 2;
             }
         }
+        // L2CAP completion evidence: event code + negotiated CID. Kept short -
+        // status-row values over ~32 bytes crashed the UI backend (0.10.1).
+        if L2CAP_EVENTS.load(Ordering::Relaxed) != 0 && n + 8 <= buf.len() {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let cid = L2CAP_CID.load(Ordering::Relaxed);
+            n += put_str(&mut buf[n..], " L") as usize;
+            n += put_num(&mut buf[n..], L2CAP_EVENT.load(Ordering::Relaxed)) as usize;
+            buf[n] = b':';
+            n += 1;
+            for shift in [12, 8, 4, 0] {
+                let nib = ((cid >> shift) & 0xF) as usize;
+                buf[n] = HEX[nib];
+                n += 1;
+            }
+        }
         n as u32
     }
 
@@ -1150,7 +1193,7 @@ mod page {
             let n_state = state_text(&mut b_state);
             let mut b_err = [0u8; 28];
             let n_err = err_text(&mut b_err);
-            let mut b_bond = [0u8; 24];
+            let mut b_bond = [0u8; 36];
             let n_bond = bond_text(&mut b_bond);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
