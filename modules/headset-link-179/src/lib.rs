@@ -103,6 +103,11 @@ static LAST_ERROR: AtomicI32 = AtomicI32::new(0);
 /// from LAST_ERROR because this firmware entry is not device-validated: a
 /// non-negative value can mean "already running" rather than success/failure.
 static LAST_FW_RC: AtomicI32 = AtomicI32::new(0);
+/// Raw return values of the last stop / bond requests. Both firmware entries
+/// are unvalidated on hardware; surfacing the numbers lets us pin down their
+/// real semantics instead of guessing whether a non-zero value is an error.
+static LAST_STOP_RC: AtomicI32 = AtomicI32::new(0);
+static LAST_PAIR_RC: AtomicI32 = AtomicI32::new(0);
 static BOND_STATE: AtomicU32 = AtomicU32::new(0);
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
@@ -342,17 +347,28 @@ mod device {
     }
 
     fn scan_stop() -> i32 {
+        // Discovery ends by itself after DISCOVERY_TIMEOUT_SECONDS, and the UI
+        // host can deliver ACTIVATE + VALUE_CHANGED for a single tap. Both make
+        // us call stop when nothing is running; the firmware then returns a
+        // non-zero "no inquiry in progress" status. bt_discovery_stop is
+        // STATIC_RECOVERED / device not_probed, so only a negative errno is
+        // treated as fatal.
+        if STATE.load(Ordering::Relaxed) == ST_IDLE {
+            return ok(ST_IDLE);
+        }
         let adapter = ADAPTER.load(Ordering::Relaxed);
         if adapter.is_null() {
-            return fail(E_STATE, 0);
+            return ok(ST_IDLE);
         }
         let rc = unsafe { bt_discovery_stop(adapter) };
-        LAST_ERROR.store(rc, Ordering::Relaxed);
-        if rc != 0 {
-            return fail(E_IO, rc);
+        LAST_STOP_RC.store(rc, Ordering::Relaxed);
+        // Always drop back to idle, even on a firmware error: a stale
+        // ST_FAILED would keep the page red and block the next scan.
+        STATE.store(ST_IDLE, Ordering::Relaxed);
+        if rc < 0 {
+            LAST_ERROR.store(rc, Ordering::Relaxed);
+            return E_IO;
         }
-        // Return to idle so a later "开始扫描" is not skipped by the
-        // idempotent guard in scan_start().
         ok(ST_IDLE)
     }
 
@@ -361,10 +377,22 @@ mod device {
         if !has_peer(&addr) || ADAPTER.load(Ordering::Relaxed).is_null() {
             return fail(E_ARGUMENT, 0);
         }
-        let rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
-        if rc == CREATE_BOND_ADAPTER_NOT_READY {
-            return fail(E_STATE, rc);
+        // create_bond is rejected with ADAPTER_NOT_READY while an inquiry is
+        // still in flight. Stop discovery first, then retry once if the
+        // firmware still reports that transient state.
+        let adapter = ADAPTER.load(Ordering::Relaxed);
+        if STATE.load(Ordering::Relaxed) == ST_SCANNING {
+            let stop_rc = unsafe { bt_discovery_stop(adapter) };
+            LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
+            STATE.store(ST_IDLE, Ordering::Relaxed);
         }
+        let mut rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
+        if rc == CREATE_BOND_ADAPTER_NOT_READY {
+            let stop_rc = unsafe { bt_discovery_stop(adapter) };
+            LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
+            rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
+        }
+        LAST_PAIR_RC.store(rc, Ordering::Relaxed);
         if rc != 0 {
             return fail(E_IO, rc);
         }
@@ -549,6 +577,8 @@ pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
     STATE.store(ST_IDLE, Ordering::Relaxed);
     LAST_ERROR.store(0, Ordering::Relaxed);
     LAST_FW_RC.store(0, Ordering::Relaxed);
+    LAST_STOP_RC.store(0, Ordering::Relaxed);
+    LAST_PAIR_RC.store(0, Ordering::Relaxed);
     BOND_STATE.store(0, Ordering::Relaxed);
     0
 }
@@ -873,6 +903,10 @@ mod page {
             let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
             let mut b_fwrc = [0u8; 12];
             let n_fwrc = put_num(&mut b_fwrc, LAST_FW_RC.load(Ordering::Relaxed));
+            let mut b_stoprc = [0u8; 12];
+            let n_stoprc = put_num(&mut b_stoprc, LAST_STOP_RC.load(Ordering::Relaxed));
+            let mut b_pairrc = [0u8; 12];
+            let n_pairrc = put_num(&mut b_pairrc, LAST_PAIR_RC.load(Ordering::Relaxed));
             let mut b_found = [0u8; 16];
             let n_found = match found {
                 count if count < 0 => put_str(&mut b_found, "暂不可用"),
@@ -911,7 +945,13 @@ mod page {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
             }
             if rc == UI_OK {
-                rc = status_row(ui_obj, tree, 17, "固件返回", &b_fwrc[..n_fwrc as usize]);
+                rc = status_row(ui_obj, tree, 17, "开始返回", &b_fwrc[..n_fwrc as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 18, "停止返回", &b_stoprc[..n_stoprc as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 19, "配对返回", &b_pairrc[..n_pairrc as usize]);
             }
             for i in 0..shown {
                 if rc != UI_OK {
@@ -1054,8 +1094,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.4.0"),
-    build_id: pack(b"headset-link-179-0.4.0"),
+    module_version: pack(b"0.5.0"),
+    build_id: pack(b"headset-link-179-0.5.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
