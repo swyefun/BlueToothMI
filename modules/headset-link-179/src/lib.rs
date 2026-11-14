@@ -892,22 +892,16 @@ mod page {
     }
 
     fn bond_text(buf: &mut [u8]) -> u32 {
-        let v = BOND_STATE.load(Ordering::Relaxed);
-        let mut n = put_num(buf, v as i32) as usize;
-        let name = match v {
-            1 => " 配对中",
-            2 => " 已配对",
-            0 => " 未配对",
-            _ => "",
-        };
-        n += put_str(&mut buf[n..], name) as usize;
-        // Diagnostics: slot-9 fire count and last event address prefix, so a
-        // silent callback vs. a filtered one is visible on the page itself.
-        if n < buf.len() {
-            buf[n] = b' ';
-            n += 1;
-        }
-        n += put_str(&mut buf[n..], "cb") as usize;
+        // 0.9.5: r3 stayed 0 through a successful pairing (cb3 @BB07), so it
+        // is NOT the bond state. Show both callback words raw - if r2 reads
+        // 1/2 after pairing, the state lives in r2; if r2 reads the COD
+        // (240404 for the NPU), the state is elsewhere entirely.
+        let r3 = BOND_STATE.load(Ordering::Relaxed);
+        let r2 = BOND_COD.load(Ordering::Relaxed);
+        let mut n = put_num(buf, r3 as i32) as usize;
+        n += put_str(&mut buf[n..], "/") as usize;
+        n += put_num(&mut buf[n..], r2 as i32) as usize;
+        n += put_str(&mut buf[n..], " cb") as usize;
         n += put_num(&mut buf[n..], CB_COUNT.load(Ordering::Relaxed) as i32) as usize;
         let a = CB_ADDR.load(Ordering::Relaxed);
         if a != 0 && n + 6 <= buf.len() {
