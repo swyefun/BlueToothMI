@@ -86,13 +86,13 @@ fn monotonic_ms() -> u32 {
         tv_nsec: 0,
     };
     let rc =
-        unsafe { canopus_fw_clock_gettime(CLOCK_MONOTONIC, core::ptr::addr_of_mut!(time).cast()) };
+        unsafe { canopus_fw_clock_gettime(CLOCK_MONOTONIC, core::ptr::addr_of_mut!(time)) };
     if rc != 0 || time.tv_sec < 0 {
         return 0;
     }
-    ((time.tv_sec as u64).saturating_mul(1000) + u64::from(time.tv_nsec as u32) / 1_000_000)
-        & 0xFFFF_FFFF
-} as u32
+    (((time.tv_sec as u64).saturating_mul(1000) + u64::from(time.tv_nsec as u32) / 1_000_000)
+        & 0xFFFF_FFFF) as u32
+}
 
 // ---------------------------------------------------------------------------
 // Device state
