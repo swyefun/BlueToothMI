@@ -99,6 +99,10 @@ pub const E_UNSUPPORTED: i32 = -38;
 
 static STATE: AtomicU32 = AtomicU32::new(ST_IDLE);
 static LAST_ERROR: AtomicI32 = AtomicI32::new(0);
+/// Raw return value of the last `bt_discovery_start` call. Kept separately
+/// from LAST_ERROR because this firmware entry is not device-validated: a
+/// non-negative value can mean "already running" rather than success/failure.
+static LAST_FW_RC: AtomicI32 = AtomicI32::new(0);
 static BOND_STATE: AtomicU32 = AtomicU32::new(0);
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
@@ -281,6 +285,12 @@ mod device {
     }
 
     fn scan_start() -> i32 {
+        // The UI host can deliver both ACTIVATE and VALUE_CHANGED for one tap.
+        // Re-issuing discovery while it runs makes the firmware return a
+        // non-zero "already in progress" status; stay idempotent instead.
+        if STATE.load(Ordering::Relaxed) == ST_SCANNING {
+            return ok(ST_SCANNING);
+        }
         let adapter = unsafe { bt_adapter_get_instance() };
         if adapter.is_null() {
             return fail(E_STATE, 0);
@@ -305,7 +315,12 @@ mod device {
         }
         FOUND_LEN.store(0, Ordering::Relaxed);
         let rc = unsafe { bt_discovery_start(adapter, DISCOVERY_TIMEOUT_SECONDS) };
-        if rc != 0 {
+        LAST_FW_RC.store(rc, Ordering::Relaxed);
+        // This entry is STATIC_RECOVERED / device not_probed. Observed on the
+        // band: a non-zero rc still starts discovery and the result callback
+        // keeps delivering peers. Only a negative errno is treated as fatal;
+        // the raw value is surfaced on the page for further diagnosis.
+        if rc < 0 {
             return fail(E_IO, rc);
         }
         ok(ST_SCANNING)
@@ -532,6 +547,7 @@ pub extern "C" fn canopus_headset_control(cmd: u32, arg: *const u8) -> i32 {
 pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
     STATE.store(ST_IDLE, Ordering::Relaxed);
     LAST_ERROR.store(0, Ordering::Relaxed);
+    LAST_FW_RC.store(0, Ordering::Relaxed);
     BOND_STATE.store(0, Ordering::Relaxed);
     0
 }
@@ -854,6 +870,8 @@ mod page {
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
             let mut scan = [0u8; 256];
             let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
+            let mut b_fwrc = [0u8; 12];
+            let n_fwrc = put_num(&mut b_fwrc, LAST_FW_RC.load(Ordering::Relaxed));
             let mut b_found = [0u8; 16];
             let n_found = match found {
                 count if count < 0 => put_str(&mut b_found, "暂不可用"),
@@ -890,6 +908,9 @@ mod page {
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 17, "固件返回", &b_fwrc[..n_fwrc as usize]);
             }
             for i in 0..shown {
                 if rc != UI_OK {
@@ -1032,8 +1053,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.3.0"),
-    build_id: pack(b"headset-link-179-0.3.0"),
+    module_version: pack(b"0.4.0"),
+    build_id: pack(b"headset-link-179-0.4.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
