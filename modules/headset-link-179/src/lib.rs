@@ -1130,9 +1130,6 @@ mod page {
                 entry.copy_from_slice(&scan[i * 32..i * 32 + 32]);
                 n_names[i] = peer_name(&entry, &mut b_names[i]);
             }
-            let mut b_audio = [0u8; 48];
-            let n_audio = device::audio_diag(&mut b_audio);
-
             if rc == UI_OK {
                 rc = section(ui_obj, tree, 2, "状态");
             }
@@ -1150,12 +1147,6 @@ mod page {
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
-            }
-            if rc == UI_OK {
-                // Key 8 is unused by any other row; keys 20/21 belong to the
-                // action rows and a 0.9.1 collision with key 20 black-screened
-                // the page (tree_commit conflict).
-                rc = status_row(ui_obj, tree, 8, "音频设备", &b_audio[..n_audio as usize]);
             }
             for i in 0..shown {
                 if rc != UI_OK {
