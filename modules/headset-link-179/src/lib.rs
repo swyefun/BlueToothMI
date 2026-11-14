@@ -852,14 +852,14 @@ mod page {
         }
     }
 
-    fn put_str(buf: &mut [u8], text: &str) -> u32 {
+    pub(crate) fn put_str(buf: &mut [u8], text: &str) -> u32 {
         let bytes = text.as_bytes();
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         n as u32
     }
 
-    fn put_num(buf: &mut [u8], value: i32) -> u32 {
+    pub(crate) fn put_num(buf: &mut [u8], value: i32) -> u32 {
         let mut tmp = [0u8; 12];
         let mut i = 0usize;
         let mut rest = value.unsigned_abs();
