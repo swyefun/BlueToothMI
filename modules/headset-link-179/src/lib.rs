@@ -120,6 +120,11 @@ static BOND_STATE: AtomicU32 = AtomicU32::new(0);
 /// 24-bit COD at offset 12 - bt_get_bond_state's return value is the COD,
 /// NOT a bond-state enum (NPU=0x240404 Audio/Video, PC=0x2E410C Computer).
 static BOND_COD: AtomicU32 = AtomicU32::new(0);
+/// Slot-9 diagnostics: total callback invocations and the first four address
+/// bytes (b0 | b1<<8 | b2<<16 | b3<<24) of the last event, packed for the
+/// status row. Verifies whether the .179 firmware ever fires this slot.
+static CB_COUNT: AtomicU32 = AtomicU32::new(0);
+static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SDP_AVRCP: AtomicU32 = AtomicU32::new(0);
@@ -250,24 +255,26 @@ mod device {
     unsafe extern "C" fn on_bond_state(
         _cookie: *mut c_void,
         address: *const u8,
-        cod: i32,
-        state: i32,
+        r2: i32,
+        r3: i32,
     ) {
         if address.is_null() {
             return;
         }
-        let peer = peer_bytes();
-        if !has_peer(&peer) {
-            return;
-        }
+        // 0.9.3 diagnostics: record EVERY slot-9 event unconditionally. The
+        // old peer-address filter (byte-order unverified) silently dropped
+        // events, so "未配对" was shown even though the firmware logged
+        // BONDING->BONDED for the peer. r2/r3 semantics per cmd83: r2=COD,
+        // r3=state candidate; both stay on the page for review.
         let incoming = unsafe { core::slice::from_raw_parts(address, 6) };
-        if incoming != &peer[..] {
-            return;
-        }
-        // ABI: r2 = 24-bit Class of Device, r3 = bond-state change. The cmd83
-        // response proves the "bond state" slot carries COD in this stack.
-        BOND_COD.store(cod as u32, Ordering::Relaxed);
-        BOND_STATE.store(state as u32, Ordering::Relaxed);
+        let packed = (incoming[0] as u32)
+            | (incoming[1] as u32) << 8
+            | (incoming[2] as u32) << 16
+            | (incoming[3] as u32) << 24;
+        CB_ADDR.store(packed, Ordering::Relaxed);
+        CB_COUNT.fetch_add(1, Ordering::Relaxed);
+        BOND_COD.store(r2 as u32, Ordering::Relaxed);
+        BOND_STATE.store(r3 as u32, Ordering::Relaxed);
     }
 
     /// Placeholder for slots this module does not act on. Declared with two
@@ -655,6 +662,8 @@ pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
     LAST_PAIR_RC.store(0, Ordering::Relaxed);
     BOND_STATE.store(0, Ordering::Relaxed);
     BOND_COD.store(0, Ordering::Relaxed);
+    CB_COUNT.store(0, Ordering::Relaxed);
+    CB_ADDR.store(0, Ordering::Relaxed);
     0
 }
 
@@ -877,6 +886,26 @@ mod page {
             _ => "",
         };
         n += put_str(&mut buf[n..], name) as usize;
+        // Diagnostics: slot-9 fire count and last event address prefix, so a
+        // silent callback vs. a filtered one is visible on the page itself.
+        if n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        n += put_str(&mut buf[n..], "cb") as usize;
+        n += put_num(&mut buf[n..], CB_COUNT.load(Ordering::Relaxed) as i32) as usize;
+        let a = CB_ADDR.load(Ordering::Relaxed);
+        if a != 0 && n + 6 <= buf.len() {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            buf[n] = b'@';
+            n += 1;
+            for shift in [0, 8] {
+                let byte = ((a >> shift) & 0xFF) as u8;
+                buf[n] = HEX[((byte >> 4) & 0xF) as usize];
+                buf[n + 1] = HEX[(byte & 0xF) as usize];
+                n += 2;
+            }
+        }
         n as u32
     }
 
@@ -1025,7 +1054,7 @@ mod page {
             let n_state = state_text(&mut b_state);
             let mut b_err = [0u8; 28];
             let n_err = err_text(&mut b_err);
-            let mut b_bond = [0u8; 20];
+            let mut b_bond = [0u8; 24];
             let n_bond = bond_text(&mut b_bond);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
