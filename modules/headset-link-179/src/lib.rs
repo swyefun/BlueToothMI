@@ -116,6 +116,10 @@ static LAST_FW_RC: AtomicI32 = AtomicI32::new(0);
 static LAST_STOP_RC: AtomicI32 = AtomicI32::new(0);
 static LAST_PAIR_RC: AtomicI32 = AtomicI32::new(0);
 static BOND_STATE: AtomicU32 = AtomicU32::new(0);
+/// Peer Class of Device. IDA (4.100.179): the cmd83 IPC response stores the
+/// 24-bit COD at offset 12 - bt_get_bond_state's return value is the COD,
+/// NOT a bond-state enum (NPU=0x240404 Audio/Video, PC=0x2E410C Computer).
+static BOND_COD: AtomicU32 = AtomicU32::new(0);
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SDP_AVRCP: AtomicU32 = AtomicU32::new(0);
@@ -246,8 +250,8 @@ mod device {
     unsafe extern "C" fn on_bond_state(
         _cookie: *mut c_void,
         address: *const u8,
+        cod: i32,
         state: i32,
-        _extra: i32,
     ) {
         if address.is_null() {
             return;
@@ -260,6 +264,9 @@ mod device {
         if incoming != &peer[..] {
             return;
         }
+        // ABI: r2 = 24-bit Class of Device, r3 = bond-state change. The cmd83
+        // response proves the "bond state" slot carries COD in this stack.
+        BOND_COD.store(cod as u32, Ordering::Relaxed);
         BOND_STATE.store(state as u32, Ordering::Relaxed);
     }
 
@@ -311,6 +318,9 @@ mod device {
                 if !set_peer(arg) {
                     fail(E_ARGUMENT, 0)
                 } else {
+                    // New peer: stale COD/bond info belongs to the old one.
+                    BOND_COD.store(0, Ordering::Relaxed);
+                    BOND_STATE.store(0, Ordering::Relaxed);
                     ok(ST_PEER_SET)
                 }
             }
@@ -413,17 +423,18 @@ mod device {
         ok(ST_IDLE)
     }
 
-    /// Reads the adapter's bond state for the current peer. Bonds created in
-    /// an earlier session never emit a bond-state change event, so the slot-9
-    /// callback alone always leaves BOND_STATE at NONE.
+    /// Queries the adapter for the current peer's Class of Device. The cmd83
+    /// response's state slot is actually the 24-bit COD (see BOND_COD), so
+    /// this never overwrites BOND_STATE - bond state only arrives via the
+    /// slot-9 callback while pairing runs.
     fn query_bond() -> i32 {
         let addr = peer_bytes();
         if !has_peer(&addr) {
-            BOND_STATE.store(0, Ordering::Relaxed);
+            BOND_COD.store(0, Ordering::Relaxed);
             return ok(STATE.load(Ordering::Relaxed));
         }
-        let state = unsafe { bt_get_bond_state(addr.as_ptr()) };
-        BOND_STATE.store(state, Ordering::Relaxed);
+        let cod = unsafe { bt_get_bond_state(addr.as_ptr()) };
+        BOND_COD.store(cod as u32, Ordering::Relaxed);
         ok(STATE.load(Ordering::Relaxed))
     }
 
@@ -437,6 +448,7 @@ mod device {
         let rc = unsafe { bt_remove_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
         BOND_STATE.store(0, Ordering::Relaxed);
+        BOND_COD.store(0, Ordering::Relaxed);
         ok(ST_IDLE)
     }
 
@@ -603,6 +615,7 @@ mod device {
         AVDTP_NODE.store(core::ptr::null_mut(), Ordering::Relaxed);
         AVCTP_NODE.store(core::ptr::null_mut(), Ordering::Relaxed);
         BOND_STATE.store(0, Ordering::Relaxed);
+        BOND_COD.store(0, Ordering::Relaxed);
         STATE.store(ST_IDLE, Ordering::Relaxed);
         0
     }
@@ -641,6 +654,7 @@ pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
     LAST_STOP_RC.store(0, Ordering::Relaxed);
     LAST_PAIR_RC.store(0, Ordering::Relaxed);
     BOND_STATE.store(0, Ordering::Relaxed);
+    BOND_COD.store(0, Ordering::Relaxed);
     0
 }
 
@@ -860,9 +874,41 @@ mod page {
             1 => " 配对中",
             2 => " 已配对",
             0 => " 未配对",
-            _ => " 未知",
+            _ => "",
         };
         n += put_str(&mut buf[n..], name) as usize;
+        n as u32
+    }
+
+    /// Human-readable Class of Device: major device class plus the service
+    /// bits that matter for headset use. Bluetooth Assigned Numbers:
+    /// major = (cod >> 8) & 0x1F, services live in bits 13..20.
+    fn cod_text(buf: &mut [u8]) -> u32 {
+        let cod = BOND_COD.load(Ordering::Relaxed);
+        if cod == 0 {
+            return put_str(buf, "未查询");
+        }
+        const MAJORS: [&str; 10] = [
+            "杂项", "电脑", "手机", "网络", "音视频", "外设", "影像", "穿戴", "玩具", "医疗",
+        ];
+        let major = ((cod >> 8) & 0x1F) as usize;
+        let mut n = put_str(
+            buf,
+            if major < MAJORS.len() { MAJORS[major] } else { "类别?" },
+        ) as usize;
+        let svc = cod >> 13;
+        for (bit, tag) in [
+            (3, "渲染"),
+            (4, "传输"),
+            (5, "音频"),
+            (6, "电话"),
+        ] {
+            if svc & (1 << bit) != 0 && n < buf.len() - 7 {
+                buf[n] = b' ';
+                n += 1;
+                n += put_str(&mut buf[n..], tag) as usize;
+            }
+        }
         n as u32
     }
 
@@ -980,6 +1026,8 @@ mod page {
             let n_err = err_text(&mut b_err);
             let mut b_bond = [0u8; 20];
             let n_bond = bond_text(&mut b_bond);
+            let mut b_cod = [0u8; 28];
+            let n_cod = cod_text(&mut b_cod);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
@@ -1024,6 +1072,9 @@ mod page {
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 6, "对端地址", &b_peer[..n_peer as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 20, "设备类别", &b_cod[..n_cod as usize]);
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
@@ -1079,7 +1130,7 @@ mod page {
                 rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 22, "刷新状态", "重新查询已配对状态", EV_REFRESH);
+                rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端设备类别(COD)", EV_REFRESH);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
