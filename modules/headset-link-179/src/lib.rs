@@ -781,7 +781,7 @@ mod page {
             title: title.as_bytes().as_ptr().cast(),
             title_len: title.len() as u32,
         };
-        (ui_obj.section)(tree, key, &props as *const UiSectionPropsV1 as *const c_void)
+        (unsafe { (ui_obj.section)(tree, key, &props as *const UiSectionPropsV1 as *const c_void) })
     }
 
     fn status_row(
@@ -798,7 +798,7 @@ mod page {
             value: value.as_ptr().cast(),
             value_len: value.len() as u32,
         };
-        (ui_obj.status_row)(tree, key, &props as *const UiStatusRowPropsV1 as *const c_void)
+        unsafe { (ui_obj.status_row)(tree, key, &props as *const UiStatusRowPropsV1 as *const c_void) }
     }
 
     fn action_row(
@@ -818,7 +818,7 @@ mod page {
             event_id,
             enabled: 1,
         };
-        (ui_obj.action_row)(tree, key, &props as *const UiActionRowPropsV1 as *const c_void)
+        unsafe { (ui_obj.action_row)(tree, key, &props as *const UiActionRowPropsV1 as *const c_void) }
     }
 
     /// Builds the single-page tree and commits it. Value buffers stay alive
@@ -852,7 +852,7 @@ mod page {
             let n_bond = put_num(&mut b_bond, BOND_STATE.load(Ordering::Relaxed) as i32);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
-            let mut scan = [0u8; 256];
+            let scan = [0u8; 256];
             let found = ctl(CMD_SCAN_RESULTS, scan.as_ptr());
             let mut b_found = [0u8; 16];
             let n_found = match found {
