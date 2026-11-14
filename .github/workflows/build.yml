@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 env:
-  CANOPUS_REF: f196b20
+  CANOPUS_SHA: f196b200823f47780c73ae48c4c62da8fe5311df
   TARGET_ID: xiaomi-band-11-4.100.179
 
 jobs:
@@ -19,12 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout Canopus toolchain (pinned)
-        uses: actions/checkout@v4
-        with:
-          repository: AstralSightStudios/Canopus
-          ref: ${{ env.CANOPUS_REF }}
-          path: canopus
+      - name: Clone Canopus toolchain (pinned, anonymous)
+        run: |
+          git clone --quiet https://github.com/AstralSightStudios/Canopus.git canopus
+          git -C canopus checkout --quiet --detach "$CANOPUS_SHA"
 
       - name: Install Rust (stable + thumbv8m.main-none-eabi)
         uses: dtolnay/rust-toolchain@stable
