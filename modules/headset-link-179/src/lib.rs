@@ -378,14 +378,13 @@ mod device {
             return fail(E_ARGUMENT, 0);
         }
         // create_bond is rejected with ADAPTER_NOT_READY while an inquiry is
-        // still in flight. Stop discovery first, then retry once if the
-        // firmware still reports that transient state.
+        // still winding down. The stop entry is idempotent on this firmware
+        // (IDA: it returns a protocol status byte), so always issue one
+        // before bonding, regardless of the UI-side STATE snapshot.
         let adapter = ADAPTER.load(Ordering::Relaxed);
-        if STATE.load(Ordering::Relaxed) == ST_SCANNING {
-            let stop_rc = unsafe { bt_discovery_stop(adapter) };
-            LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
-            STATE.store(ST_IDLE, Ordering::Relaxed);
-        }
+        let stop_rc = unsafe { bt_discovery_stop(adapter) };
+        LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
+        STATE.store(ST_IDLE, Ordering::Relaxed);
         let mut rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
         if rc == CREATE_BOND_ADAPTER_NOT_READY {
             let stop_rc = unsafe { bt_discovery_stop(adapter) };
@@ -393,10 +392,19 @@ mod device {
             rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
         }
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
+        let bond = unsafe { bt_get_bond_state(addr.as_ptr()) };
+        BOND_STATE.store(bond, Ordering::Relaxed);
+        // create_bond goes through the same adapter_request/sendrecv path as
+        // discovery_start/stop: its return value is a protocol status byte,
+        // not an errno. A non-zero rc can mean "accepted / in progress".
+        // The authoritative result is the adapter's bond state: BONDING(1)
+        // or BONDED(2) means pairing really started, whatever rc was.
+        if bond != 0 {
+            return ok(ST_BONDING);
+        }
         if rc != 0 {
             return fail(E_IO, rc);
         }
-        BOND_STATE.store(unsafe { bt_get_bond_state(addr.as_ptr()) }, Ordering::Relaxed);
         ok(ST_BONDING)
     }
 
@@ -693,6 +701,8 @@ mod page {
     const EV_SDP: u32 = 3;
     const EV_PAIR_FIRST: u32 = 4;
     const EV_TEARDOWN: u32 = 5;
+    const EV_PAIR_SECOND: u32 = 6;
+    const EV_PAIR_THIRD: u32 = 7;
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -750,7 +760,13 @@ mod page {
             ST_IDLE => "待机",
             ST_SCANNING => "扫描中",
             ST_PEER_SET => "对端已设",
-            ST_BONDING => "配对中",
+            ST_BONDING => {
+                if BOND_STATE.load(Ordering::Relaxed) == 2 {
+                    "已配对"
+                } else {
+                    "配对中"
+                }
+            }
             ST_SDP_READY => "SDP 就绪",
             ST_CHANNELS_QUEUED => "信道已排",
             ST_FAILED => "失败",
@@ -780,6 +796,15 @@ mod page {
         }
         n += put_num(&mut buf[n..], code) as usize;
         n as u32
+    }
+
+    fn bond_text(buf: &mut [u8]) -> u32 {
+        let name = match BOND_STATE.load(Ordering::Relaxed) {
+            1 => "配对中",
+            2 => "已配对",
+            _ => "未配对",
+        };
+        put_str(buf, name)
     }
 
     fn peer_text(buf: &mut [u8]) -> u32 {
@@ -895,7 +920,7 @@ mod page {
             let mut b_err = [0u8; 28];
             let n_err = err_text(&mut b_err);
             let mut b_bond = [0u8; 12];
-            let n_bond = put_num(&mut b_bond, BOND_STATE.load(Ordering::Relaxed) as i32);
+            let n_bond = bond_text(&mut b_bond);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
@@ -983,7 +1008,13 @@ mod page {
                 rc = action_row(ui_obj, tree, 11, "注册 SDP", "发布 A2DP/AVRCP 记录", EV_SDP);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 12, "配对第一台", "与扫描结果第一台建 bond", EV_PAIR_FIRST);
+                rc = action_row(ui_obj, tree, 12, "配对第一台", "设备 1：仅交换配对密钥", EV_PAIR_FIRST);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 20, "配对第 2 台", "设备 2：仅交换配对密钥", EV_PAIR_SECOND);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 21, "配对第 3 台", "设备 3：仅交换配对密钥", EV_PAIR_THIRD);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
@@ -1011,20 +1042,28 @@ mod page {
         render(ctx.cast(), ui)
     }
 
-    /// Pairs with the first discovered peer: re-queries the control plane,
-    /// sets the peer address and bonds. `CMD_CONNECT` is deliberately not
-    /// reachable from the UI (unverified null-callback firmware path).
-    fn pair_first() -> i32 {
+    /// Pairs with the peer at `index` in the discovery list. The first entry
+    /// is frequently a phone or laptop rather than the headset, so explicit
+    /// selection is required. `CMD_CONNECT` stays unreachable from the UI
+    /// (unverified null-callback firmware path).
+    fn pair_at(index: usize) -> i32 {
         let mut scan = [0u8; 256];
         let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
-        if found <= 0 {
+        if found <= index as i32 {
             return fail(E_STATE, 0);
         }
-        let rc = ctl(CMD_SET_PEER, scan.as_ptr());
+        let base = index * 32; // FOUND_STRIDE: address[6] + rssi + CoD + name
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&scan[base..base + 6]);
+        let rc = ctl(CMD_SET_PEER, addr.as_ptr());
         if rc < 0 {
             return rc;
         }
         ctl(CMD_PAIR, core::ptr::null())
+    }
+
+    fn pair_first() -> i32 {
+        pair_at(0)
     }
 
     unsafe extern "C" fn on_event(
@@ -1042,6 +1081,8 @@ mod page {
             EV_SCAN_STOP => ctl(CMD_SCAN_STOP, core::ptr::null()),
             EV_SDP => ctl(CMD_REGISTER_SDP, core::ptr::null()),
             EV_PAIR_FIRST => pair_first(),
+            EV_PAIR_SECOND => pair_at(1),
+            EV_PAIR_THIRD => pair_at(2),
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
             _ => 0,
         };
@@ -1094,8 +1135,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.5.0"),
-    build_id: pack(b"headset-link-179-0.5.0"),
+    module_version: pack(b"0.6.0"),
+    build_id: pack(b"headset-link-179-0.6.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
