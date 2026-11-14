@@ -351,8 +351,9 @@ mod device {
         if rc != 0 {
             return fail(E_IO, rc);
         }
-        LAST_ERROR.store(0, Ordering::Relaxed);
-        0
+        // Return to idle so a later "开始扫描" is not skipped by the
+        // idempotent guard in scan_start().
+        ok(ST_IDLE)
     }
 
     fn pair() -> i32 {
