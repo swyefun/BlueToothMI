@@ -46,15 +46,28 @@ jobs:
       - name: Build module
         working-directory: canopus/modules/headset-link-179
         run: |
-          ../../target/release/canopus build
-          ../../target/release/canopus package
+          set -o pipefail
+          ../../target/release/canopus build 2>&1 | tee build-cli.log
+          ../../target/release/canopus package 2>&1 | tee package.log
 
       - name: Verify ELF against target pack
         working-directory: canopus
         run: |
           elf=$(find modules/headset-link-179/build -name '*.elf' | head -1)
           echo "verifying $elf"
-          target/release/canopus verify "$elf" --target "$TARGET_ID" --targets-dir targets
+          target/release/canopus verify "$elf" --target "$TARGET_ID" --targets-dir targets 2>&1 | tee modules/headset-link-179/verify.log
+
+      - name: Push build log on failure
+        if: failure()
+        run: |
+          git config user.name "ci-logs"
+          git config user.email "ci-logs@users.noreply.github.com"
+          cp canopus/modules/headset-link-179/*.log . 2>/dev/null || true
+          git checkout --orphan ci-logs-tmp
+          git rm -rf --quiet . || true
+          git add -A
+          git commit -m "ci log: run ${{ github.run_id }} (sha ${{ github.sha }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/ci-logs
 
       - name: Collect artifacts
         run: |
