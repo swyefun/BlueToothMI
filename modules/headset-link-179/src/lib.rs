@@ -98,6 +98,10 @@ pub const CMD_QUERY_BOND: u32 = 9;
 /// Removes the current peer's bond (bt_remove_bond / device_request 95) so a
 /// fresh create_bond can run the pairing dialog again.
 pub const CMD_REMOVE_BOND: u32 = 10;
+/// ACL-hold test: L2CAP to PSM 1 (SDP). bluetoothd's own handler serves that
+/// PSM, so the callback-0 fallback in `bt_l2cap_connect` resolves instead of
+/// null-dereferencing; holding the channel keeps the ACL link up.
+pub const CMD_CONNECT_ACL: u32 = 11;
 
 // Service error codes from sdk/c/canopus_services.h; E_IDENTITY is local.
 pub const E_IDENTITY: i32 = -1;
@@ -175,12 +179,13 @@ mod device {
     use super::*;
     use crate::page::{put_num, put_str};
     use canopus_target_private::{
-        ADAPTER_STATE_ON, CLASSIC_TRANSPORT, CONNECT_ADDRESS_OFFSET, CONNECT_REQUEST_SIZE,
-        DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
-        SdpAvrcpControllerRecord, SdpSourceRecord, bt_adapter_get_instance, bt_adapter_get_state,
-        bt_adapter_register, bt_adapter_unregister, bt_alloc, bt_create_bond, bt_discovery_start,
-        bt_discovery_stop, bt_get_pairing_state, bt_l2cap_connect, bt_remove_bond,
-        configure_avctp_connect_request,
+        ADAPTER_STATE_ON, CLASSIC_TRANSPORT, CONNECT_ADDRESS_OFFSET, CONNECT_CONFIG_OFFSET,
+        CONNECT_OPTION_LOCAL_MTU, CONNECT_OPTIONS_OFFSET, CONNECT_PSM_OFFSET,
+        CONNECT_REQUEST_SIZE, DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
+        SdpAvrcpControllerRecord, SdpSourceRecord, AVDTP_LOCAL_RX_MTU, bt_adapter_get_instance,
+        bt_adapter_get_state, bt_adapter_register, bt_adapter_unregister, bt_alloc,
+        bt_create_bond, bt_discovery_start, bt_discovery_stop, bt_get_pairing_state,
+        bt_l2cap_connect, bt_remove_bond, configure_avctp_connect_request,
         configure_avdtp_connect_request, discovery_name, sdp_builder_create, sdp_commit,
         sdp_set_raw_attribute, sdp_unregister,
     };
@@ -374,6 +379,7 @@ mod device {
             CMD_REMOVE_BOND => remove_bond(),
             CMD_REGISTER_SDP => register_sdp(),
             CMD_CONNECT => connect(),
+            CMD_CONNECT_ACL => connect_acl(),
             CMD_TEARDOWN => teardown(false),
             CMD_SCAN_RESULTS => scan_results(arg),
             _ => fail(E_ARGUMENT, 0),
@@ -638,6 +644,44 @@ mod device {
         ok(ST_CHANNELS_QUEUED)
     }
 
+    static SDP_NODE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// PSM 1 (SDP) variant of the connect request. bluetoothd always registers
+    /// an SDP handler, so `bt_l2cap_connect`'s callback-0 fallback lookup
+    /// resolves a real handler instead of dereferencing null - the safe way to
+    /// hold an ACL link to the peer.
+    unsafe fn configure_sdp_connect_request(request: *mut u8) {
+        unsafe {
+            core::ptr::write_unaligned(
+                request.add(CONNECT_PSM_OFFSET).cast::<u16>(),
+                1u16.to_le(),
+            );
+            core::ptr::write_unaligned(
+                request.add(CONNECT_CONFIG_OFFSET).cast::<u16>(),
+                AVDTP_LOCAL_RX_MTU.to_le(),
+            );
+            core::ptr::write_unaligned(
+                request.add(CONNECT_OPTIONS_OFFSET).cast::<u16>(),
+                CONNECT_OPTION_LOCAL_MTU.to_le(),
+            );
+        }
+    }
+
+    /// Queues one PSM-1 L2CAP connect to the current peer and parks in
+    /// ST_CHANNELS_QUEUED. No completion callback is installed: the channel
+    /// (and the ACL) stays up until teardown/disconnect or the peer drops it.
+    pub fn connect_acl() -> i32 {
+        let addr = peer_bytes();
+        if !has_peer(&addr) {
+            return fail(E_ARGUMENT, 0);
+        }
+        let rc = unsafe { queue_connect(configure_sdp_connect_request, &addr, &SDP_NODE) };
+        if rc != 0 {
+            return fail(rc, 0);
+        }
+        ok(ST_CHANNELS_QUEUED)
+    }
+
     /// `unregister_callbacks`: true on module deactivate/stop (the callback
     /// table would dangle once the code is unloaded), false on the UI "复位"
     /// button - unregistering there deafened the page for the rest of the
@@ -833,6 +877,7 @@ mod page {
     const EV_PAIR_THIRD: u32 = 7;
     const EV_REFRESH: u32 = 8; // query the adapter's bond state + re-render
     const EV_REMOVE_BOND: u32 = 9;
+    const EV_CONNECT_ACL: u32 = 10; // hold an ACL to the peer via PSM 1
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -1190,7 +1235,10 @@ mod page {
                 rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端设备类别(COD)", EV_REFRESH);
+                rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端配对状态", EV_REFRESH);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 24, "连接测试", "PSM1 建立 ACL，对端可能提示已连接", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
@@ -1261,6 +1309,7 @@ mod page {
             EV_PAIR_THIRD => pair_at(2),
             EV_REFRESH => ctl(CMD_QUERY_BOND, core::ptr::null()),
             EV_REMOVE_BOND => ctl(CMD_REMOVE_BOND, core::ptr::null()),
+            EV_CONNECT_ACL => ctl(CMD_CONNECT_ACL, core::ptr::null()),
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
             _ => 0,
         };
