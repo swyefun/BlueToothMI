@@ -1,0 +1,17 @@
+schema = 1
+
+[module]
+id = "headset_link_179"
+version = "0.1.0"
+version_code = 1
+kind = "target"
+language = "rust"
+lifecycle = "removable"
+canopus_abi = "2"
+description = "Band 11 4.100.179 headset link front-end: scan/pair/SDP/L2CAP; AVDTP media path not implemented"
+
+[build]
+sources = ["Cargo.toml"]
+
+[targets]
+include = ["xiaomi-band-11-4.100.179"]

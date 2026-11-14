@@ -1,0 +1,33 @@
+[package]
+name = "headset_link_179"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-only"
+rust-version = "1.88"
+description = "Xiaomi Band 11 (4.100.179) headset link front-end"
+
+[lib]
+name = "headset_link_179"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+# `canopus build` passes --no-default-features --features device and adds
+# canopus-target-private/target-xiaomi-band-11-4-100-179 for the exact pack.
+[features]
+default = []
+device = ["dep:canopus-target-private"]
+
+[dependencies]
+canopus-abi = { path = "../../sdk/rust/canopus-abi" }
+canopus-runtime = { path = "../../sdk/rust/canopus-runtime" }
+canopus-target-private = { path = "../../sdk/rust/canopus-target-private", optional = true, default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+
+# Standalone crate: do not join the repository root workspace.
+[workspace]
