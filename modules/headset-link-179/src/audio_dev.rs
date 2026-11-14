@@ -153,7 +153,7 @@ unsafe extern "C" fn dev_read(_filep: *mut c_void, buf: *mut u8, len: u32) -> is
         return -1;
     }
     let slot = (tail as usize) % EVT_SLOTS * 4;
-    let event = unsafe { EVENT_QUEUE.as_ptr().add(slot) };
+    let event = unsafe { core::ptr::addr_of!(EVENT_QUEUE).cast::<u32>().add(slot) };
     for i in 0..4 {
         let word = unsafe { *event.add(i) };
         for b in 0..4 {
@@ -334,7 +334,7 @@ pub fn push_control(kind: u32) -> bool {
         return false;
     }
     let slot = (head as usize) % EVT_SLOTS * 4;
-    let event = unsafe { EVENT_QUEUE.as_mut_ptr().add(slot) };
+    let event = unsafe { core::ptr::addr_of_mut!(EVENT_QUEUE).cast::<u32>().add(slot) };
     unsafe {
         *event.add(0) = CONTROL_EVENT_SIZE as u32;
         *event.add(1) = kind;
