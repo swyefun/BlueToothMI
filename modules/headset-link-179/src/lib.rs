@@ -636,8 +636,9 @@ const TARGET_ID: &str = match option_env!("CANOPUS_TARGET_ID") {
 mod page {
     use super::*;
     use canopus_abi::{
-        CanopusContext, UiActionRowPropsV1, UiEntryV1, UiEventV1, UiNavigationPagePropsV1,
-        UiSectionPropsV1, UiStatusRowPropsV1, UI_EVENT_ACTIVATE, UI_EVENT_VALUE_CHANGED, UI_OK,
+        CanopusContext, CanopusUiObj, UiActionRowPropsV1, UiEntryV1, UiEventV1,
+        UiNavigationPagePropsV1, UiSectionPropsV1, UiStatusRowPropsV1, UI_EVENT_ACTIVATE,
+        UI_EVENT_VALUE_CHANGED, UI_OK,
     };
     use canopus_runtime::ui::{clear_entry, set_entry};
 
@@ -841,7 +842,7 @@ mod page {
                 title: title.as_bytes().as_ptr().cast(),
                 title_len: title.len() as u32,
             };
-            rc = (ui_obj.navigation_page)(tree, 1, &page);
+            rc = (ui_obj.navigation_page)(tree, 1, &page as *const UiNavigationPagePropsV1 as *const c_void);
 
             let mut b_state = [0u8; 16];
             let n_state = state_text(&mut b_state);
@@ -947,7 +948,7 @@ mod page {
     /// sets the peer address and bonds. `CMD_CONNECT` is deliberately not
     /// reachable from the UI (unverified null-callback firmware path).
     fn pair_first() -> i32 {
-        let mut scan = [0u8; 256];
+        let scan = [0u8; 256];
         let found = ctl(CMD_SCAN_RESULTS, scan.as_ptr());
         if found <= 0 {
             return fail(E_STATE, 0);
