@@ -233,26 +233,23 @@ mod device {
     /// `CALLBACK_DISCOVERY_STATE` / `CALLBACK_DISCOVERY_RESULT` /
     /// `CALLBACK_PAIR_REQUEST` / `CALLBACK_PAIR_DISPLAY` (0,1,2,5,6).
     static CALLBACK_TABLE: [u32; 17] = [
-        (on_adapter_state as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB,
-        (on_discovery_state as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB,
-        (on_discovery_result as unsafe extern "C" fn(*mut c_void, *const DiscoveryResult))
-            as usize
-            as u32
-            | THUMB,
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 3
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 4
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 5 pair request: not acted on
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 6 pair display
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 7
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 8
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 9 bond state
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 10
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 11
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 12
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 13
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 14
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 15
-        (stub as unsafe extern "C" fn(*mut c_void, i32)) as usize as u32 | THUMB, // 16
+        on_adapter_state as usize as u32 | THUMB,
+        on_discovery_state as usize as u32 | THUMB,
+        on_discovery_result as usize as u32 | THUMB,
+        stub as usize as u32 | THUMB, // 3
+        stub as usize as u32 | THUMB, // 4
+        stub as usize as u32 | THUMB, // 5 pair request: not acted on
+        stub as usize as u32 | THUMB, // 6 pair display
+        stub as usize as u32 | THUMB, // 7
+        stub as usize as u32 | THUMB, // 8
+        stub as usize as u32 | THUMB, // 9 bond state
+        stub as usize as u32 | THUMB, // 10
+        stub as usize as u32 | THUMB, // 11
+        stub as usize as u32 | THUMB, // 12
+        stub as usize as u32 | THUMB, // 13
+        stub as usize as u32 | THUMB, // 14
+        stub as usize as u32 | THUMB, // 15
+        stub as usize as u32 | THUMB, // 16
     ];
 
     pub fn guard_ok() -> bool {
