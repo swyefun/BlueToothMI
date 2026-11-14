@@ -333,6 +333,24 @@ mod device {
         audio_dev::init()
     }
 
+    /// One-line audio-device diagnostic for the status page:
+    /// `reg<rc> open<n> st<s> acc<b> mono<m> bad<c>`.
+    pub fn audio_diag(buf: &mut [u8]) -> u32 {
+        let mut n = put_str(buf, "reg") as usize;
+        n += put_num(&mut buf[n..], audio_dev::reg_rc()) as usize;
+        n += put_str(&mut buf[n..], " open") as usize;
+        n += put_num(&mut buf[n..], audio_dev::open_count() as i32) as usize;
+        n += put_str(&mut buf[n..], " st") as usize;
+        n += put_num(&mut buf[n..], audio_dev::state() as i32) as usize;
+        n += put_str(&mut buf[n..], " acc") as usize;
+        n += put_num(&mut buf[n..], audio_dev::bytes_accepted() as i32) as usize;
+        n += put_str(&mut buf[n..], " mono") as usize;
+        n += put_num(&mut buf[n..], audio_dev::mono_ok() as i32) as usize;
+        n += put_str(&mut buf[n..], " bad") as usize;
+        n += put_num(&mut buf[n..], audio_dev::bad_ioctl() as i32) as usize;
+        n as u32
+    }
+
     pub fn control(cmd: u32, arg: *const u8) -> i32 {
         if !guard_ok() {
             return fail(E_IDENTITY, -1);
@@ -1117,6 +1135,8 @@ mod page {
                 entry.copy_from_slice(&scan[i * 32..i * 32 + 32]);
                 n_names[i] = peer_name(&entry, &mut b_names[i]);
             }
+            let mut b_audio = [0u8; 48];
+            let n_audio = device::audio_diag(&mut b_audio);
 
             if rc == UI_OK {
                 rc = section(ui_obj, tree, 2, "状态");
@@ -1135,6 +1155,12 @@ mod page {
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
+            }
+            if rc == UI_OK {
+                // Key 8 is unused by any other row; keys 20/21 belong to the
+                // action rows and a 0.9.1 collision with key 20 black-screened
+                // the page (tree_commit conflict).
+                rc = status_row(ui_obj, tree, 8, "音频设备", &b_audio[..n_audio as usize]);
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 17, "开始返回", &b_fwrc[..n_fwrc as usize]);

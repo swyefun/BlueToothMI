@@ -90,8 +90,13 @@ fn monotonic_ms() -> u32 {
     if rc != 0 || time.tv_sec < 0 {
         return 0;
     }
-    (((time.tv_sec as u64).saturating_mul(1000) + u64::from(time.tv_nsec as u32) / 1_000_000)
-        & 0xFFFF_FFFF) as u32
+    let ms = (((time.tv_sec as u64).saturating_mul(1000)
+        + u64::from(time.tv_nsec as u32) / 1_000_000)
+        & 0xFFFF_FFFF) as u32;
+    if ms != 0 {
+        MONO_OK.store(1, Ordering::Relaxed);
+    }
+    ms
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +116,15 @@ static DRAIN_STARTED_AT: AtomicU32 = AtomicU32::new(0);
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 static LAST_ERROR: AtomicI32 = AtomicI32::new(0);
 static OPEN_COUNT: AtomicU32 = AtomicU32::new(0);
+/// register_driver result; -999 means init() never ran (module not activated).
+static REG_RC: AtomicI32 = AtomicI32::new(-999);
+/// 1 once monotonic_ms() ever returned a nonzero value - exposes a dead
+/// clock_gettime, which would freeze pcm_frames at 0 (client shows "Playing"
+/// only when state==PLAYING AND pcm_frames!=0).
+static MONO_OK: AtomicU32 = AtomicU32::new(0);
+/// Count of unrecognized ioctl commands + the last such command.
+static BAD_IOCTL: AtomicU32 = AtomicU32::new(0);
+static LAST_BAD_CMD: AtomicI32 = AtomicI32::new(0);
 /// Headset-gesture queue (phase 3 feeds it from AVRCP pass-through).
 static EVT_HEAD: AtomicU32 = AtomicU32::new(0);
 static EVT_TAIL: AtomicU32 = AtomicU32::new(0);
@@ -315,7 +329,11 @@ unsafe extern "C" fn dev_ioctl(_filep: *mut c_void, cmd: i32, arg: u32) -> i32 {
             unsafe { *(arg as *mut u32) = VOLUME.load(Ordering::Relaxed) };
             0
         }
-        _ => ENOTTY,
+        _ => {
+            BAD_IOCTL.fetch_add(1, Ordering::Relaxed);
+            LAST_BAD_CMD.store(cmd, Ordering::Relaxed);
+            ENOTTY
+        }
     }
 }
 
@@ -362,9 +380,37 @@ fn fill_fops() {
 }
 
 /// Registers `/dev/canopus_audio`. Call once after activation. Returns the
-/// firmware's register_driver result (0 on success).
+/// firmware's register_driver result (0 on success), also stored in REG_RC.
 pub fn init() -> i32 {
     fill_fops();
     let fops = addr_of!(FOPS).cast::<c_void>();
-    unsafe { canopus_fw_register_driver(DEVICE_PATH.as_ptr(), fops, 0, core::ptr::null_mut()) }
+    let rc = unsafe {
+        canopus_fw_register_driver(DEVICE_PATH.as_ptr(), fops, 0, core::ptr::null_mut())
+    };
+    REG_RC.store(rc, Ordering::Relaxed);
+    rc
+}
+
+// -- diagnostics (0.10.1: shown on the page so a silent failure is visible) --
+
+pub fn reg_rc() -> i32 {
+    REG_RC.load(Ordering::Relaxed)
+}
+pub fn open_count() -> u32 {
+    OPEN_COUNT.load(Ordering::Relaxed)
+}
+pub fn state() -> u32 {
+    STATE.load(Ordering::Relaxed)
+}
+pub fn bytes_accepted() -> u32 {
+    BYTES_ACCEPTED.load(Ordering::Relaxed)
+}
+pub fn mono_ok() -> u32 {
+    MONO_OK.load(Ordering::Relaxed)
+}
+pub fn bad_ioctl() -> u32 {
+    BAD_IOCTL.load(Ordering::Relaxed)
+}
+pub fn last_bad_cmd() -> i32 {
+    LAST_BAD_CMD.load(Ordering::Relaxed)
 }
