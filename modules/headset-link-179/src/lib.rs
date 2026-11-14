@@ -151,6 +151,17 @@ fn has_peer(addr: &[u8; 6]) -> bool {
     addr.iter().any(|&b| b != 0)
 }
 
+/// Bounded busy-wait between IPC retries. no_std has no timer in the UI task;
+/// the loop is short enough not to stall the host.
+#[cfg(feature = "device")]
+fn ipc_pause() {
+    let mut n = 0u32;
+    while n < 200_000 {
+        core::hint::spin_loop();
+        n += 1;
+    }
+}
+
 #[cfg(feature = "device")]
 mod device {
     use super::*;
@@ -232,6 +243,29 @@ mod device {
         }
     }
 
+    /// Bond state changes arrive asynchronously on the firmware BT task.
+    /// Slot 9 used to be a stub, so BOND_STATE was only ever the snapshot
+    /// taken right after create_bond - always NONE at that point.
+    unsafe extern "C" fn on_bond_state(
+        _cookie: *mut c_void,
+        address: *const u8,
+        state: i32,
+        _extra: i32,
+    ) {
+        if address.is_null() {
+            return;
+        }
+        let peer = peer_bytes();
+        if !has_peer(&peer) {
+            return;
+        }
+        let incoming = unsafe { core::slice::from_raw_parts(address, 6) };
+        if incoming != &peer[..] {
+            return;
+        }
+        BOND_STATE.store(state as u32, Ordering::Relaxed);
+    }
+
     /// Placeholder for slots this module does not act on. Declared with two
     /// parameters: extra AAPCS register arguments are ignored, r0 = 0.
     unsafe extern "C" fn stub(_cookie: *mut c_void, _a: i32) -> i32 {
@@ -259,6 +293,9 @@ mod device {
         for slot in table[3..17].iter_mut() {
             *slot = stub_word;
         }
+        // CALLBACK_BOND_STATE = 9 in the .179 ABI; install the real handler
+        // after the stub sweep so asynchronous bond events reach BOND_STATE.
+        table[9] = on_bond_state as usize as u32 | THUMB;
         TABLE_READY.store(1, Ordering::Relaxed);
     }
 
@@ -360,7 +397,17 @@ mod device {
         if adapter.is_null() {
             return ok(ST_IDLE);
         }
-        let rc = unsafe { bt_discovery_stop(adapter) };
+        // IDA: sub_C46A18C returns 1 when the 708-byte IPC send fails. That
+        // leaves the inquiry running, which then makes create_bond fail too.
+        // Retry a few times with a short pause instead of giving up on the
+        // first transient socket error.
+        let mut rc = unsafe { bt_discovery_stop(adapter) };
+        let mut tries = 1;
+        while rc == 1 && tries < 4 {
+            ipc_pause();
+            rc = unsafe { bt_discovery_stop(adapter) };
+            tries += 1;
+        }
         LAST_STOP_RC.store(rc, Ordering::Relaxed);
         // Always drop back to idle, even on a firmware error: a stale
         // ST_FAILED would keep the page red and block the next scan.
@@ -382,18 +429,33 @@ mod device {
         // (IDA: it returns a protocol status byte), so always issue one
         // before bonding, regardless of the UI-side STATE snapshot.
         let adapter = ADAPTER.load(Ordering::Relaxed);
-        let stop_rc = unsafe { bt_discovery_stop(adapter) };
+        let mut stop_rc = unsafe { bt_discovery_stop(adapter) };
+        let mut stop_tries = 1;
+        while stop_rc == 1 && stop_tries < 4 {
+            ipc_pause();
+            stop_rc = unsafe { bt_discovery_stop(adapter) };
+            stop_tries += 1;
+        }
         LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
         STATE.store(ST_IDLE, Ordering::Relaxed);
+
+        // rc == 1 is the same IPC send failure; rc == 2 is
+        // ADAPTER_NOT_READY while the inquiry winds down. Both are transient.
         let mut rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
-        if rc == CREATE_BOND_ADAPTER_NOT_READY {
-            let stop_rc = unsafe { bt_discovery_stop(adapter) };
-            LAST_STOP_RC.store(stop_rc, Ordering::Relaxed);
+        let mut tries = 1;
+        while (rc == 1 || rc == CREATE_BOND_ADAPTER_NOT_READY) && tries < 4 {
+            ipc_pause();
+            let _ = unsafe { bt_discovery_stop(adapter) };
             rc = unsafe { bt_create_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
+            tries += 1;
         }
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
+        // Do not clobber a bond state delivered asynchronously by the slot-9
+        // callback with an early NONE snapshot.
         let bond = unsafe { bt_get_bond_state(addr.as_ptr()) };
-        BOND_STATE.store(bond, Ordering::Relaxed);
+        if bond != 0 {
+            BOND_STATE.store(bond, Ordering::Relaxed);
+        }
         // IDA: create_bond (cmd 94) and get_bond_state (cmd 83) both go
         // through sub_C46A18C's 708-byte IPC and return the response status
         // word at +12, not an errno. A non-zero value can mean "accepted",
@@ -699,6 +761,7 @@ mod page {
     const EV_TEARDOWN: u32 = 5;
     const EV_PAIR_SECOND: u32 = 6;
     const EV_PAIR_THIRD: u32 = 7;
+    const EV_REFRESH: u32 = 8;
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -757,7 +820,9 @@ mod page {
             ST_SCANNING => "扫描中",
             ST_PEER_SET => "对端已设",
             ST_BONDING => {
-                if BOND_STATE.load(Ordering::Relaxed) == 2 {
+                if LAST_PAIR_RC.load(Ordering::Relaxed) == 1 {
+                    "请求未送出"
+                } else if BOND_STATE.load(Ordering::Relaxed) == 2 {
                     "已配对"
                 } else {
                     "配对已提交"
@@ -1016,6 +1081,9 @@ mod page {
                 rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
             }
             if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 22, "刷新状态", "读取异步配对结果", EV_REFRESH);
+            }
+            if rc == UI_OK {
                 rc = (ui_obj.end)(tree); // section "操作"
             }
             if rc == UI_OK {
@@ -1079,6 +1147,7 @@ mod page {
             EV_PAIR_FIRST => pair_first(),
             EV_PAIR_SECOND => pair_at(1),
             EV_PAIR_THIRD => pair_at(2),
+            EV_REFRESH => 0, // re-render only; read the async bond state
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
             _ => 0,
         };
@@ -1131,8 +1200,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.6.0"),
-    build_id: pack(b"headset-link-179-0.6.0"),
+    module_version: pack(b"0.7.0"),
+    build_id: pack(b"headset-link-179-0.7.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
