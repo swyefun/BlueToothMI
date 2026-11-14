@@ -1,7 +1,8 @@
 name: build
 
-# 构建 BlueToothMI 模块：检出 pin 版 Canopus 工具链，覆盖模块后走
-# canopus build -> verify -> package，产物上传到 Actions Artifacts。
+# 构建 BlueToothMI 模块与 .179 全套安装材料：检出 pin 版 Canopus 工具链，
+# 覆盖模块后走 canopus build -> verify -> package；再构建 .179 Supervisor 与
+# Band 11 框架安装器表盘资源。全部产物发布到 dist 分支（匿名可下载）。
 
 on:
   push:
@@ -15,6 +16,7 @@ permissions:
 env:
   CANOPUS_SHA: f196b200823f47780c73ae48c4c62da8fe5311df
   TARGET_ID: xiaomi-band-11-4.100.179
+  MODULE_ID: headset_link_179
 
 jobs:
   build:
@@ -32,7 +34,7 @@ jobs:
         with:
           targets: thumbv8m.main-none-eabi
 
-      - name: Install LLVM toolchain (clang, ld.lld, llvm-ar)
+      - name: Install LLVM toolchain (clang, ld.lld, llvm-ar, objcopy)
         run: sudo apt-get update && sudo apt-get install -y clang lld llvm
 
       - name: Overlay module into Canopus tree
@@ -60,6 +62,40 @@ jobs:
           echo "verifying $elf"
           target/release/canopus verify "$elf" --target "$TARGET_ID" --targets-dir targets 2>&1 | tee modules/headset-link-179/verify.log
 
+      - name: Build .179 Supervisor + Band 11 installer watchface
+        working-directory: canopus
+        run: |
+          CANOPUS_TARGET="$TARGET_ID" sh scripts/build_canopus_supervisor.sh
+          echo "--- staged installer watchface ---"
+          find watchfaces/canopus-installer-prod/xiaomi-band-11 -type f | sort
+
+      - name: Collect deliverables
+        run: |
+          mkdir -p out inbox installer-watchface
+          cp canopus/modules/headset-link-179/dist/*.canopus out/ 2>/dev/null || \
+            find canopus/modules/headset-link-179 -name '*.canopus' -exec cp {} out/ \;
+          find canopus/modules/headset-link-179/build -name '*.elf' -exec cp {} out/headset_link_179.elf \;
+          pkg=$(find out -name '*.canopus' | head -1)
+          tar -xf "$pkg" -C out
+          cp out/receipts/*.cmi "inbox/${MODULE_ID}.cmi.next"
+          cp out/artifacts/*/module.elf "inbox/${MODULE_ID}.ko.next"
+          cp -r canopus/watchfaces/canopus-installer-prod/xiaomi-band-11/* installer-watchface/
+          echo "--- deliverables ---"
+          find out inbox installer-watchface -type f | sort
+
+      - name: Publish deliverables to dist branch
+        if: success()
+        run: |
+          git config user.name "ci-dist"
+          git config user.email "ci-dist@users.noreply.github.com"
+          rm -rf canopus
+          cp -r out inbox installer-watchface .
+          git checkout -B dist-tmp
+          git rm -rf --quiet . || true
+          git add -A
+          git commit -m "dist: build ${{ github.sha }}"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/dist
+
       - name: Push build log on failure
         if: failure()
         run: |
@@ -71,45 +107,3 @@ jobs:
           git add -A
           git commit -m "ci log: run ${{ github.run_id }} (sha ${{ github.sha }})"
           git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/ci-logs
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p out
-          find canopus/modules/headset-link-179 -type f \
-            \( -name '*.elf' -o -name '*.canopus' \) -not -path '*/build/cargo/*' -exec cp {} out/ \;
-          ls -la out/
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: headset-link-179-${{ github.sha }}
-          path: out/
-          if-no-files-found: error
-
-      - name: Publish artifacts to dist branch
-        if: success()
-        run: |
-          git config user.name "ci-dist"
-          git config user.email "ci-dist@users.noreply.github.com"
-          cp out/* .
-          git checkout -B dist-tmp
-          git rm -rf --quiet . || true
-          git add -A
-          git commit -m "dist: build ${{ github.sha }}"
-          git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/dist
-
-      - name: Unpack .canopus and publish inbox files
-        if: success()
-        run: |
-          mkdir -p unpack
-          pkg=$(find out -name '*.canopus' | head -1)
-          tar -tvf "$pkg"
-          tar -xf "$pkg" -C unpack
-          find unpack -type f | sort
-          cp unpack/artifacts/*/*/*.ko unpack/ 2>/dev/null || true
-          cp unpack/receipts/*.cmi unpack/ 2>/dev/null || true
-          ls -la unpack/ || true
-          echo "## Package contents" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tar -tf "$pkg" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
