@@ -394,17 +394,13 @@ mod device {
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
         let bond = unsafe { bt_get_bond_state(addr.as_ptr()) };
         BOND_STATE.store(bond, Ordering::Relaxed);
-        // create_bond goes through the same adapter_request/sendrecv path as
-        // discovery_start/stop: its return value is a protocol status byte,
-        // not an errno. A non-zero rc can mean "accepted / in progress".
-        // The authoritative result is the adapter's bond state: BONDING(1)
-        // or BONDED(2) means pairing really started, whatever rc was.
-        if bond != 0 {
-            return ok(ST_BONDING);
-        }
-        if rc != 0 {
-            return fail(E_IO, rc);
-        }
+        // IDA: create_bond (cmd 94) and get_bond_state (cmd 83) both go
+        // through sub_C46A18C's 708-byte IPC and return the response status
+        // word at +12, not an errno. A non-zero value can mean "accepted",
+        // "already bonded" or "in progress". Neither rc nor bond is a
+        // trustworthy success predicate, so never turn them into a hard
+        // failure - that is exactly what produced the bogus 失败 on 0.3/0.4.
+        // Both raw numbers stay on the page for diagnosis.
         ok(ST_BONDING)
     }
 
@@ -764,7 +760,7 @@ mod page {
                 if BOND_STATE.load(Ordering::Relaxed) == 2 {
                     "已配对"
                 } else {
-                    "配对中"
+                    "配对已提交"
                 }
             }
             ST_SDP_READY => "SDP 就绪",
