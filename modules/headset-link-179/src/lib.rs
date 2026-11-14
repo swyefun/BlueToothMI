@@ -379,7 +379,7 @@ mod device {
             CMD_REMOVE_BOND => remove_bond(),
             CMD_REGISTER_SDP => register_sdp(),
             CMD_CONNECT => connect(),
-            CMD_CONNECT_ACL => connect_acl(),
+            CMD_CONNECT_ACL => device::connect_profiles(),
             CMD_TEARDOWN => teardown(false),
             CMD_SCAN_RESULTS => scan_results(arg),
             _ => fail(E_ARGUMENT, 0),
@@ -496,6 +496,13 @@ mod device {
         let addr = peer_bytes();
         if !has_peer(&addr) {
             return fail(E_ARGUMENT, 0);
+        }
+        // Drop the peer's profiles/ACL first (IPC cmd 63): removing a bond
+        // while the peer is still ACL-connected leaves a stale link whose
+        // re-pairing stalls forever (log 11: laptop BONDING with no SSP).
+        // The server ignores disconnect when the connected flag is clear.
+        unsafe {
+            adapter_ipc(63, &addr);
         }
         let rc = unsafe { bt_remove_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
@@ -676,18 +683,51 @@ mod device {
     /// current peer, both with the completion callback installed. Profile-level
     /// signalling is what makes audio peers announce "connected"; the PSM-1
     /// SDP test (0.10.5) never produced one. Parks in ST_CHANNELS_QUEUED.
-    pub fn connect_acl() -> i32 {
+    /// Raw adapter IPC envelope - the same 708-byte sendrecv the SDK's
+    /// private adapter_request uses, embedded here because the SDK helper and
+    /// its call! macro are crate-internal. Sendrecv thumb callable 0xc46a18d,
+    /// built from non-address operands for the ELF verifier.
+    const SENDRECV_LO: u32 = 0x0A46_A18D;
+    const SENDRECV_HI: u32 = 0x0600_0000; // xor -> 0x0C46A18D
+
+    /// cmd 62 = connect: payload {addr[6], profile_id}, 255 = all profiles.
+    /// cmd 63 = disconnect: payload {addr[6]}. Server dispatcher sub_C90D90C
+    /// (IDA, case cmd-23=39/40): per-device node flags at +288 bit3 mean
+    /// "connected" - connect requires it clear, disconnect requires it set.
+    unsafe fn adapter_ipc(command: u32, payload: &[u8]) -> i32 {
+        let adapter = unsafe { bt_adapter_get_instance() };
+        if adapter.is_null() || payload.len() > 648 {
+            return 7;
+        }
+        let mut request = [0u32; 177]; // 708-byte envelope
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(request.as_mut_ptr().cast::<u8>(), 708)
+        };
+        bytes[60..60 + payload.len()].copy_from_slice(payload);
+        let f: unsafe extern "C" fn(*mut c_void, *mut u32, u32) -> i32 =
+            core::mem::transmute(SENDRECV_LO ^ SENDRECV_HI);
+        let rc = unsafe { f(adapter, request.as_mut_ptr(), command) };
+        if rc != 0 {
+            return rc;
+        }
+        (request[3] & 255) as i32 // status byte at response offset 12
+    }
+
+    /// Asks the adapter service to connect ALL of the peer's profiles
+    /// (profile_id 255). This is the firmware's own connect path - the same
+    /// one its headset service drives.
+    pub fn connect_profiles() -> i32 {
         let addr = peer_bytes();
         if !has_peer(&addr) {
             return fail(E_ARGUMENT, 0);
         }
-        let avdtp = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE) };
-        if avdtp != 0 {
-            return fail(avdtp, 0);
-        }
-        let avctp = unsafe { queue_connect(configure_avctp_connect_request, &addr, &AVCTP_NODE) };
-        if avctp != 0 {
-            return fail(avctp, 0);
+        let mut payload = [0u8; 7];
+        payload[..6].copy_from_slice(&addr);
+        payload[6] = 255;
+        let rc = unsafe { adapter_ipc(62, &payload) };
+        LAST_PAIR_RC.store(rc, Ordering::Relaxed);
+        if rc != 0 {
+            return fail(rc, 0);
         }
         ok(ST_CHANNELS_QUEUED)
     }
@@ -1263,7 +1303,7 @@ mod page {
                 rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端配对状态", EV_REFRESH);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 24, "连接测试", "AVDTP/AVCTP 信令连接", EV_CONNECT_ACL);
+                rc = action_row(ui_obj, tree, 24, "连接测试", "IPC62 连接全部 profile", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
