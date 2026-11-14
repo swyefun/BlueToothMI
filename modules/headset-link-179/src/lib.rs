@@ -542,8 +542,7 @@ pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
         return -1;
     }
     STATE.store(ST_IDLE, Ordering::Relaxed);
-    page::register(ctx);
-    0
+    page::register(ctx)
 }
 
 #[unsafe(no_mangle)]
@@ -995,14 +994,20 @@ mod page {
         on_pause: None,
     };
 
-    /// Registers the Manager page entry. Failure (a build without the Manager
-    /// UI backend) is not an activation error; the control plane stays usable.
-    pub fn register(ctx: *const ContextV1) {
-        let context = ctx.cast::<CanopusContext>();
-        if context.is_null() {
-            return;
+    /// Registers the Manager page entry and propagates the result: a failed
+    /// registration surfaces as the module's activation error (visible in the
+    /// Manager detail page) instead of a silently missing "打开界面" entry.
+    pub fn register(ctx: *const ContextV1) -> i32 {
+        let Some(context) = (unsafe { (ctx as *const CanopusContext).as_ref() }) else {
+            return 0;
+        };
+        if context.ui.is_null() {
+            return 0;
         }
-        let _ = set_entry(context, &ENTRY);
+        match set_entry(ctx.cast(), &ENTRY) {
+            Ok(()) => 0,
+            Err(rc) => rc,
+        }
     }
 
     pub fn unregister(ctx: *const ContextV1) {
