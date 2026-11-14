@@ -179,9 +179,9 @@ mod device {
     use super::*;
     use crate::page::{put_num, put_str};
     use canopus_target_private::{
-        ADAPTER_STATE_ON, CLASSIC_TRANSPORT, CONNECT_ADDRESS_OFFSET, CONNECT_CONFIG_OFFSET,
-        CONNECT_OPTION_LOCAL_MTU, CONNECT_OPTIONS_OFFSET, CONNECT_PSM_OFFSET,
-        CONNECT_REQUEST_SIZE, DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
+        ADAPTER_STATE_ON, CLASSIC_TRANSPORT, CONNECT_ADDRESS_OFFSET, CONNECT_CALLBACK_OFFSET,
+        CONNECT_CONFIG_OFFSET, CONNECT_OPTION_LOCAL_MTU, CONNECT_OPTIONS_OFFSET,
+        CONNECT_PSM_OFFSET, CONNECT_REQUEST_SIZE, DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
         SdpAvrcpControllerRecord, SdpSourceRecord, AVDTP_LOCAL_RX_MTU, bt_adapter_get_instance,
         bt_adapter_get_state, bt_adapter_register, bt_adapter_unregister, bt_alloc,
         bt_create_bond, bt_discovery_start, bt_discovery_stop, bt_get_pairing_state,
@@ -591,9 +591,9 @@ mod device {
     }
 
     /// L2CAP connect completion evidence (callback installed at request+12).
-    static L2CAP_EVENTS: AtomicU32 = AtomicU32::new(0);
-    static L2CAP_EVENT: AtomicI32 = AtomicI32::new(0);
-    static L2CAP_CID: AtomicU32 = AtomicU32::new(0);
+    pub static L2CAP_EVENTS: AtomicU32 = AtomicU32::new(0);
+    pub static L2CAP_EVENT: AtomicI32 = AtomicI32::new(0);
+    pub static L2CAP_CID: AtomicU32 = AtomicU32::new(0);
 
     /// Completion callback the firmware invokes as `cb(event, request)`;
     /// event 2 = CONFIRM (channel open, CID written to request+0). Deliberately
@@ -1032,11 +1032,11 @@ mod page {
         }
         // L2CAP completion evidence: event code + negotiated CID. Kept short -
         // status-row values over ~32 bytes crashed the UI backend (0.10.1).
-        if L2CAP_EVENTS.load(Ordering::Relaxed) != 0 && n + 8 <= buf.len() {
+        if device::L2CAP_EVENTS.load(Ordering::Relaxed) != 0 && n + 8 <= buf.len() {
             const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            let cid = L2CAP_CID.load(Ordering::Relaxed);
+            let cid = device::L2CAP_CID.load(Ordering::Relaxed);
             n += put_str(&mut buf[n..], " L") as usize;
-            n += put_num(&mut buf[n..], L2CAP_EVENT.load(Ordering::Relaxed)) as usize;
+            n += put_num(&mut buf[n..], device::L2CAP_EVENT.load(Ordering::Relaxed)) as usize;
             buf[n] = b':';
             n += 1;
             for shift in [12, 8, 4, 0] {
