@@ -261,11 +261,10 @@ mod device {
         if address.is_null() {
             return;
         }
-        // 0.9.3 diagnostics: record EVERY slot-9 event unconditionally. The
-        // old peer-address filter (byte-order unverified) silently dropped
-        // events, so "未配对" was shown even though the firmware logged
-        // BONDING->BONDED for the peer. r2/r3 semantics per cmd83: r2=COD,
-        // r3=state candidate; both stay on the page for review.
+        // Device-proven ABI (0.9.3 diagnostics): the firmware hands the
+        // address in OTA REVERSED byte order (NPU 1B:01:73:5E:07:BB arrived
+        // as BB:07:5E:73:01:1B), r3 carries the bond state (a BOND_NONE
+        // removal surfaced as state 0). r2 follows the cmd83 layout (COD).
         let incoming = unsafe { core::slice::from_raw_parts(address, 6) };
         let packed = (incoming[0] as u32)
             | (incoming[1] as u32) << 8
@@ -273,8 +272,13 @@ mod device {
             | (incoming[3] as u32) << 24;
         CB_ADDR.store(packed, Ordering::Relaxed);
         CB_COUNT.fetch_add(1, Ordering::Relaxed);
-        BOND_COD.store(r2 as u32, Ordering::Relaxed);
-        BOND_STATE.store(r3 as u32, Ordering::Relaxed);
+        // Reversed-order peer match: only the selected peer drives the page,
+        // so a stray bond event from the phone/laptop cannot fake "paired".
+        let peer = peer_bytes();
+        if has_peer(&peer) && incoming[..] == peer.iter().rev().copied().collect::<Vec<_>>()[..] {
+            BOND_COD.store(r2 as u32, Ordering::Relaxed);
+            BOND_STATE.store(r3 as u32, Ordering::Relaxed);
+        }
     }
 
     /// Placeholder for slots this module does not act on. Declared with two
@@ -336,7 +340,7 @@ mod device {
             CMD_REMOVE_BOND => remove_bond(),
             CMD_REGISTER_SDP => register_sdp(),
             CMD_CONNECT => connect(),
-            CMD_TEARDOWN => teardown(),
+            CMD_TEARDOWN => teardown(false),
             CMD_SCAN_RESULTS => scan_results(arg),
             _ => fail(E_ARGUMENT, 0),
         }
@@ -599,7 +603,12 @@ mod device {
         ok(ST_CHANNELS_QUEUED)
     }
 
-    pub fn teardown() -> i32 {
+    /// `unregister_callbacks`: true on module deactivate/stop (the callback
+    /// table would dangle once the code is unloaded), false on the UI "复位"
+    /// button - unregistering there deafened the page for the rest of the
+    /// session (0.9.3 log: bond events only reached the stock table until
+    /// the next scan_start re-registration).
+    pub fn teardown(unregister_callbacks: bool) -> i32 {
         let source = SDP_SOURCE.swap(0, Ordering::Relaxed);
         if source != 0 {
             LAST_ERROR.store(unsafe { sdp_unregister(source) }, Ordering::Relaxed);
@@ -612,11 +621,11 @@ mod device {
         if !adapter.is_null() {
             unsafe { bt_discovery_stop(adapter) };
         }
-        // Remove this module's table from the adapter's observer list so the
-        // firmware stops calling into it once the module is deactivated.
-        let reg = REGISTRATION.swap(0, Ordering::Relaxed);
-        if reg != 0 && !adapter.is_null() {
-            LAST_ERROR.store(unsafe { bt_adapter_unregister(adapter, reg) }, Ordering::Relaxed);
+        if unregister_callbacks {
+            let reg = REGISTRATION.swap(0, Ordering::Relaxed);
+            if reg != 0 && !adapter.is_null() {
+                LAST_ERROR.store(unsafe { bt_adapter_unregister(adapter, reg) }, Ordering::Relaxed);
+            }
         }
         FOUND_LEN.store(0, Ordering::Relaxed);
         AVDTP_NODE.store(core::ptr::null_mut(), Ordering::Relaxed);
@@ -681,7 +690,7 @@ pub extern "C" fn canopus_mod_deactivate(ctx: *const ContextV1) -> i32 {
     page::unregister(ctx);
     #[cfg(feature = "device")]
     {
-        device::teardown()
+        device::teardown(true)
     }
     #[cfg(not(feature = "device"))]
     {
@@ -693,7 +702,7 @@ pub extern "C" fn canopus_mod_deactivate(ctx: *const ContextV1) -> i32 {
 pub extern "C" fn canopus_mod_stop(_ctx: *const ContextV1) -> i32 {
     #[cfg(feature = "device")]
     {
-        device::teardown()
+        device::teardown(true)
     }
     #[cfg(not(feature = "device"))]
     {
