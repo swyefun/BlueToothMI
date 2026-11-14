@@ -672,40 +672,22 @@ mod device {
         ok(ST_CHANNELS_QUEUED)
     }
 
-    static SDP_NODE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
-
-    /// PSM 1 (SDP) variant of the connect request. bluetoothd always registers
-    /// an SDP handler, so `bt_l2cap_connect`'s callback-0 fallback lookup
-    /// resolves a real handler instead of dereferencing null - the safe way to
-    /// hold an ACL link to the peer.
-    unsafe fn configure_sdp_connect_request(request: *mut u8) {
-        unsafe {
-            core::ptr::write_unaligned(
-                request.add(CONNECT_PSM_OFFSET).cast::<u16>(),
-                1u16.to_le(),
-            );
-            core::ptr::write_unaligned(
-                request.add(CONNECT_CONFIG_OFFSET).cast::<u16>(),
-                AVDTP_LOCAL_RX_MTU.to_le(),
-            );
-            core::ptr::write_unaligned(
-                request.add(CONNECT_OPTIONS_OFFSET).cast::<u16>(),
-                CONNECT_OPTION_LOCAL_MTU.to_le(),
-            );
-        }
-    }
-
-    /// Queues one PSM-1 L2CAP connect to the current peer and parks in
-    /// ST_CHANNELS_QUEUED. No completion callback is installed: the channel
-    /// (and the ACL) stays up until teardown/disconnect or the peer drops it.
+    /// Queues AVDTP (PSM 0x19) + AVCTP (PSM 0x17) signaling connects to the
+    /// current peer, both with the completion callback installed. Profile-level
+    /// signalling is what makes audio peers announce "connected"; the PSM-1
+    /// SDP test (0.10.5) never produced one. Parks in ST_CHANNELS_QUEUED.
     pub fn connect_acl() -> i32 {
         let addr = peer_bytes();
         if !has_peer(&addr) {
             return fail(E_ARGUMENT, 0);
         }
-        let rc = unsafe { queue_connect(configure_sdp_connect_request, &addr, &SDP_NODE) };
-        if rc != 0 {
-            return fail(rc, 0);
+        let avdtp = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE) };
+        if avdtp != 0 {
+            return fail(avdtp, 0);
+        }
+        let avctp = unsafe { queue_connect(configure_avctp_connect_request, &addr, &AVCTP_NODE) };
+        if avctp != 0 {
+            return fail(avctp, 0);
         }
         ok(ST_CHANNELS_QUEUED)
     }
@@ -1281,7 +1263,7 @@ mod page {
                 rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端配对状态", EV_REFRESH);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 24, "连接测试", "PSM1 建立 ACL，对端可能提示已连接", EV_CONNECT_ACL);
+                rc = action_row(ui_obj, tree, 24, "连接测试", "AVDTP/AVCTP 信令连接", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
