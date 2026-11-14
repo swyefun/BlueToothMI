@@ -88,4 +88,4 @@ GitHub Actions 侧：在 `ci.yml` 的 linux job 里复用同一套 Rust/clang/ll
 
 ## 8. 仍未解决（汇总）
 
-构建未跑过（本机无工具链；WSL 被安全策略禁止）；编译、ELF verifier、host 测试、Unicorn、真机全部为 0 次；AVDTP 信令、SBC、媒体包、音频源、AVRCP、L2CAP 完成回调/PSM 注册未实现；符号仍 restricted/PENDING、`capabilities = []`；§7 列出的分发语义各项未验证。`.179` 有固化后循环重启的事故记录，勿直接刷日常设备。
+构建已于 CI 闭环（github.com/swyefun/BlueToothMI，run 43542452980）：canopus build + ELF verifier + package 全部通过，修复了两处编译错误（回调表 fn-ptr→usize 的 E0605 与 static const-eval 限制，改为运行时填表）。host 测试、Unicorn、真机仍为 0 次；AVDTP 信令、SBC、媒体包、音频源、AVRCP、L2CAP 完成回调/PSM 注册未实现；符号仍 restricted/PENDING、`capabilities = []`；§7 列出的分发语义各项未验证。`.179` 有固化后循环重启的事故记录，勿直接刷日常设备。
