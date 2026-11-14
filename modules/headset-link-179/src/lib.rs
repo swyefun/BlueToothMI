@@ -173,6 +173,7 @@ fn has_peer(addr: &[u8; 6]) -> bool {
 #[cfg(feature = "device")]
 mod device {
     use super::*;
+    use crate::page::{put_num, put_str};
     use canopus_target_private::{
         ADAPTER_STATE_ON, CLASSIC_TRANSPORT, CONNECT_ADDRESS_OFFSET, CONNECT_REQUEST_SIZE,
         DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
