@@ -88,4 +88,4 @@ GitHub Actions 侧：在 `ci.yml` 的 linux job 里复用同一套 Rust/clang/ll
 
 ## 8. 仍未解决（汇总）
 
-构建已于 CI 闭环（github.com/swyefun/BlueToothMI，run 43542452980）：canopus build + ELF verifier + package 全部通过，修复了两处编译错误（回调表 fn-ptr→usize 的 E0605 与 static const-eval 限制，改为运行时填表）。host 测试、Unicorn、真机仍为 0 次；AVDTP 信令、SBC、媒体包、音频源、AVRCP、L2CAP 完成回调/PSM 注册未实现；符号仍 restricted/PENDING、`capabilities = []`；§7 列出的分发语义各项未验证。`.179` 有固化后循环重启的事故记录，勿直接刷日常设备。
+构建已于 CI 闭环（github.com/swyefun/BlueToothMI，run 43542452980）：canopus build + ELF verifier + package 全部通过，修复了两处编译错误（回调表 fn-ptr→usize 的 E0605 与 static const-eval 限制，改为运行时填表）。host 测试、Unicorn、真机仍为 0 次；v0.2.0 增加 Manager UI 控制页（ADR-CAN-010：activate 注册 `ctx->ui->set_entry`，单页树：状态行模块/错误/配对/对端/扫描结果 + 操作行开始扫描/停止扫描/注册 SDP/配对第一台/复位；`CMD_CONNECT` 与 UI 选 peer 的 `CMD_PAIR` 刻意不上 UI）；AVDTP 信令、SBC、媒体包、音频源、AVRCP、L2CAP 完成回调/PSM 注册未实现；符号仍 restricted/PENDING、`capabilities = []`；§7 列出的分发语义各项未验证。`.179` 有固化后循环重启的事故记录，勿直接刷日常设备。

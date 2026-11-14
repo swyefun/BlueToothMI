@@ -537,16 +537,18 @@ pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_activate(_ctx: *const ContextV1) -> i32 {
+pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
     if !identity_ok() {
         return -1;
     }
     STATE.store(ST_IDLE, Ordering::Relaxed);
+    page::register(ctx);
     0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_deactivate(_ctx: *const ContextV1) -> i32 {
+pub extern "C" fn canopus_mod_deactivate(ctx: *const ContextV1) -> i32 {
+    page::unregister(ctx);
     #[cfg(feature = "device")]
     {
         device::teardown()
@@ -625,6 +627,392 @@ const TARGET_ID: &str = match option_env!("CANOPUS_TARGET_ID") {
     None => "xiaomi-band-11-4.100-179",
 };
 
+// ---------------------------------------------------------------------------
+// Manager UI page (ADR-CAN-010). Registered on activation so the Manager
+// detail page offers an entry; rows dispatch the same control commands as
+// `canopus_headset_control`. Unverified firmware paths (CMD_CONNECT, and
+// CMD_PAIR with a UI-chosen peer) stay out of the surface.
+// ---------------------------------------------------------------------------
+mod page {
+    use super::*;
+    use canopus_abi::{
+        CanopusContext, UiActionRowPropsV1, UiEntryV1, UiEventV1, UiNavigationPagePropsV1,
+        UiSectionPropsV1, UiStatusRowPropsV1, UI_EVENT_ACTIVATE, UI_EVENT_VALUE_CHANGED, UI_OK,
+    };
+    use canopus_runtime::ui::{clear_entry, set_entry};
+
+    const EV_SCAN_START: u32 = 1;
+    const EV_SCAN_STOP: u32 = 2;
+    const EV_SDP: u32 = 3;
+    const EV_PAIR_FIRST: u32 = 4;
+    const EV_TEARDOWN: u32 = 5;
+
+    const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
+
+    /// NUL-terminated entry label (`UI_ENTRY_LABEL_MAX` is 24 bytes).
+    static LABEL: &[u8] = "耳机连接\0".as_bytes();
+
+    /// Dispatches a control command; on the device build this is the same
+    /// `device::control` path as `canopus_headset_control`.
+    fn ctl(cmd: u32, arg: *const u8) -> i32 {
+        #[cfg(feature = "device")]
+        {
+            device::control(cmd, arg)
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            let _ = (cmd, arg);
+            E_UNSUPPORTED
+        }
+    }
+
+    fn put_str(buf: &mut [u8], text: &str) -> u32 {
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        n as u32
+    }
+
+    fn put_num(buf: &mut [u8], value: i32) -> u32 {
+        let mut tmp = [0u8; 12];
+        let mut i = 0usize;
+        let mut rest = value.unsigned_abs();
+        loop {
+            tmp[i] = b'0' + (rest % 10) as u8;
+            i += 1;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        let mut n = 0usize;
+        if value < 0 && n < buf.len() {
+            buf[n] = b'-';
+            n += 1;
+        }
+        while i > 0 && n < buf.len() {
+            i -= 1;
+            buf[n] = tmp[i];
+            n += 1;
+        }
+        n as u32
+    }
+
+    fn state_text(buf: &mut [u8]) -> u32 {
+        let name = match STATE.load(Ordering::Relaxed) {
+            ST_IDLE => "待机",
+            ST_SCANNING => "扫描中",
+            ST_PEER_SET => "对端已设",
+            ST_BONDING => "配对中",
+            ST_SDP_READY => "SDP 就绪",
+            ST_CHANNELS_QUEUED => "信道已排",
+            ST_FAILED => "失败",
+            _ => "未知",
+        };
+        put_str(buf, name)
+    }
+
+    fn err_text(buf: &mut [u8]) -> u32 {
+        let code = LAST_ERROR.load(Ordering::Relaxed);
+        if code == 0 {
+            return put_str(buf, "无");
+        }
+        let name = match code {
+            E_IDENTITY => "身份不符",
+            E_STATE => "状态错误",
+            E_ARGUMENT => "参数错误",
+            E_IO => "固件IO",
+            E_NOMEM => "内存不足",
+            E_UNSUPPORTED => "不支持",
+            _ => "固件",
+        };
+        let mut n = put_str(buf, name) as usize;
+        if n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        n += put_num(&mut buf[n..], code) as usize;
+        n as u32
+    }
+
+    fn peer_text(buf: &mut [u8]) -> u32 {
+        let addr = peer_bytes();
+        if !has_peer(&addr) {
+            return put_str(buf, "未设置");
+        }
+        addr_text(&addr, buf)
+    }
+
+    fn addr_text(addr: &[u8], buf: &mut [u8]) -> u32 {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut n = 0usize;
+        for (i, byte) in addr.iter().enumerate() {
+            if i > 0 && n < buf.len() {
+                buf[n] = b':';
+                n += 1;
+            }
+            for shift in [4, 0] {
+                if n < buf.len() {
+                    buf[n] = HEX[((byte >> shift) & 0xF) as usize];
+                    n += 1;
+                }
+            }
+        }
+        n as u32
+    }
+
+    /// Name of one discovered peer (`FOUND_STRIDE` layout: address[6], rssi,
+    /// reserved, class_of_device[4], name[20]); falls back to the address.
+    fn peer_name(entry: &[u8; 32], buf: &mut [u8]) -> u32 {
+        let name = &entry[12..32];
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        if end > 0 {
+            let n = end.min(buf.len());
+            buf[..n].copy_from_slice(&name[..n]);
+            return n as u32;
+        }
+        addr_text(&entry[..6], buf)
+    }
+
+    fn section(ui_obj: &CanopusUiObj, tree: *mut c_void, key: u32, title: &str) -> i32 {
+        let props = UiSectionPropsV1 {
+            struct_size: core::mem::size_of::<UiSectionPropsV1>() as u32,
+            title: title.as_bytes().as_ptr().cast(),
+            title_len: title.len() as u32,
+        };
+        (ui_obj.section)(tree, key, &props as *const UiSectionPropsV1 as *const c_void)
+    }
+
+    fn status_row(
+        ui_obj: &CanopusUiObj,
+        tree: *mut c_void,
+        key: u32,
+        label: &str,
+        value: &[u8],
+    ) -> i32 {
+        let props = UiStatusRowPropsV1 {
+            struct_size: core::mem::size_of::<UiStatusRowPropsV1>() as u32,
+            label: label.as_bytes().as_ptr().cast(),
+            label_len: label.len() as u32,
+            value: value.as_ptr().cast(),
+            value_len: value.len() as u32,
+        };
+        (ui_obj.status_row)(tree, key, &props as *const UiStatusRowPropsV1 as *const c_void)
+    }
+
+    fn action_row(
+        ui_obj: &CanopusUiObj,
+        tree: *mut c_void,
+        key: u32,
+        label: &str,
+        detail: &str,
+        event_id: u32,
+    ) -> i32 {
+        let props = UiActionRowPropsV1 {
+            struct_size: core::mem::size_of::<UiActionRowPropsV1>() as u32,
+            label: label.as_bytes().as_ptr().cast(),
+            label_len: label.len() as u32,
+            detail: detail.as_bytes().as_ptr().cast(),
+            detail_len: detail.len() as u32,
+            event_id,
+            enabled: 1,
+        };
+        (ui_obj.action_row)(tree, key, &props as *const UiActionRowPropsV1 as *const c_void)
+    }
+
+    /// Builds the single-page tree and commits it. Value buffers stay alive
+    /// until `tree_commit`, matching the C demo's contract with the backend.
+    fn render(ctx: *const CanopusContext, ui: *mut c_void) -> i32 {
+        let object = unsafe { (*ctx).ui };
+        if object.is_null() {
+            return E_UNSUPPORTED;
+        }
+        let ui_obj = unsafe { &*object };
+        unsafe {
+            let mut tree: *mut c_void = core::ptr::null_mut();
+            let mut rc = (ui_obj.tree_begin)(ui, &mut tree);
+            if rc != UI_OK {
+                return rc;
+            }
+
+            let title = "耳机连接";
+            let page = UiNavigationPagePropsV1 {
+                struct_size: core::mem::size_of::<UiNavigationPagePropsV1>() as u32,
+                title: title.as_bytes().as_ptr().cast(),
+                title_len: title.len() as u32,
+            };
+            rc = (ui_obj.navigation_page)(tree, 1, &page);
+
+            let mut b_state = [0u8; 16];
+            let n_state = state_text(&mut b_state);
+            let mut b_err = [0u8; 28];
+            let n_err = err_text(&mut b_err);
+            let mut b_bond = [0u8; 12];
+            let n_bond = put_num(&mut b_bond, BOND_STATE.load(Ordering::Relaxed) as i32);
+            let mut b_peer = [0u8; 20];
+            let n_peer = peer_text(&mut b_peer);
+            let mut scan = [0u8; 256];
+            let found = ctl(CMD_SCAN_RESULTS, scan.as_ptr());
+            let mut b_found = [0u8; 16];
+            let n_found = match found {
+                count if count < 0 => put_str(&mut b_found, "暂不可用"),
+                0 => put_str(&mut b_found, "无"),
+                count => {
+                    let mut n = put_num(&mut b_found, count) as usize;
+                    n += put_str(&mut b_found[n..], " 台") as usize;
+                    n as u32
+                }
+            };
+            let mut b_names = [[0u8; 24]; 3];
+            let mut n_names = [0u32; 3];
+            let shown = found.clamp(0, 3) as usize;
+            for i in 0..shown {
+                let mut entry = [0u8; 32];
+                entry.copy_from_slice(&scan[i * 32..i * 32 + 32]);
+                n_names[i] = peer_name(&entry, &mut b_names[i]);
+            }
+
+            if rc == UI_OK {
+                rc = section(ui_obj, tree, 2, "状态");
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 3, "模块", &b_state[..n_state as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 4, "最近错误", &b_err[..n_err as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 5, "配对状态", &b_bond[..n_bond as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 6, "对端地址", &b_peer[..n_peer as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
+            }
+            for i in 0..shown {
+                if rc != UI_OK {
+                    break;
+                }
+                rc = status_row(
+                    ui_obj,
+                    tree,
+                    14 + i as u32,
+                    DEV_LABELS[i],
+                    &b_names[i][..n_names[i] as usize],
+                );
+            }
+            if rc == UI_OK {
+                rc = section(ui_obj, tree, 8, "操作");
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 9, "开始扫描", "搜索附近耳机", EV_SCAN_START);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 10, "停止扫描", "结束 discovery", EV_SCAN_STOP);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 11, "注册 SDP", "发布 A2DP/AVRCP 记录", EV_SDP);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 12, "配对第一台", "与扫描结果第一台建 bond", EV_PAIR_FIRST);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
+            }
+            if rc == UI_OK {
+                rc = (ui_obj.end)(tree); // section
+            }
+            if rc == UI_OK {
+                rc = (ui_obj.end)(tree); // page
+            }
+            if rc == UI_OK {
+                (ui_obj.tree_commit)(tree)
+            } else {
+                (ui_obj.tree_abort)(tree);
+                rc
+            }
+        }
+    }
+
+    unsafe extern "C" fn on_open(
+        ctx: *const ContextV1,
+        ui: *mut c_void,
+        _user_data: *mut c_void,
+    ) -> i32 {
+        render(ctx.cast(), ui)
+    }
+
+    /// Pairs with the first discovered peer: re-queries the control plane,
+    /// sets the peer address and bonds. `CMD_CONNECT` is deliberately not
+    /// reachable from the UI (unverified null-callback firmware path).
+    fn pair_first() -> i32 {
+        let mut scan = [0u8; 256];
+        let found = ctl(CMD_SCAN_RESULTS, scan.as_ptr());
+        if found <= 0 {
+            return fail(E_STATE, 0);
+        }
+        let rc = ctl(CMD_SET_PEER, scan.as_ptr());
+        if rc < 0 {
+            return rc;
+        }
+        ctl(CMD_PAIR, core::ptr::null())
+    }
+
+    unsafe extern "C" fn on_event(
+        ctx: *const ContextV1,
+        ui: *mut c_void,
+        event: *const UiEventV1,
+        _user_data: *mut c_void,
+    ) -> i32 {
+        let event = unsafe { &*event };
+        if event.type_ != UI_EVENT_ACTIVATE && event.type_ != UI_EVENT_VALUE_CHANGED {
+            return UI_OK;
+        }
+        let rc = match event.event_id {
+            EV_SCAN_START => ctl(CMD_SCAN_START, core::ptr::null()),
+            EV_SCAN_STOP => ctl(CMD_SCAN_STOP, core::ptr::null()),
+            EV_SDP => ctl(CMD_REGISTER_SDP, core::ptr::null()),
+            EV_PAIR_FIRST => pair_first(),
+            EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
+            _ => 0,
+        };
+        let _ = rc;
+        render(ctx.cast(), ui)
+    }
+
+    static ENTRY: UiEntryV1 = UiEntryV1 {
+        struct_size: core::mem::size_of::<UiEntryV1>() as u32,
+        label: LABEL.as_ptr().cast(),
+        on_open: Some(on_open),
+        on_event: Some(on_event),
+        on_back: None,
+        on_close: None,
+        user_data: core::ptr::null_mut(),
+        page_count: 0,
+        on_resume: None,
+        on_pause: None,
+    };
+
+    /// Registers the Manager page entry. Failure (a build without the Manager
+    /// UI backend) is not an activation error; the control plane stays usable.
+    pub fn register(ctx: *const ContextV1) {
+        let context = ctx.cast::<CanopusContext>();
+        if context.is_null() {
+            return;
+        }
+        let _ = set_entry(context, &ENTRY);
+    }
+
+    pub fn unregister(ctx: *const ContextV1) {
+        let context = ctx.cast::<CanopusContext>();
+        if context.is_null() {
+            return;
+        }
+        let _ = clear_entry(context);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     struct_size: core::mem::size_of::<ModuleDescriptorV1>() as u32,
@@ -632,8 +1020,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.1.0"),
-    build_id: pack(b"headset-link-179-0.1.0"),
+    module_version: pack(b"0.2.0"),
+    build_id: pack(b"headset-link-179-0.2.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
