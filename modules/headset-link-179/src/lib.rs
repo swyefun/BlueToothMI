@@ -1112,12 +1112,6 @@ mod page {
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
             let mut scan = [0u8; 256];
             let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
-            let mut b_fwrc = [0u8; 12];
-            let n_fwrc = put_num(&mut b_fwrc, LAST_FW_RC.load(Ordering::Relaxed));
-            let mut b_stoprc = [0u8; 12];
-            let n_stoprc = put_num(&mut b_stoprc, LAST_STOP_RC.load(Ordering::Relaxed));
-            let mut b_pairrc = [0u8; 12];
-            let n_pairrc = put_num(&mut b_pairrc, LAST_PAIR_RC.load(Ordering::Relaxed));
             let mut b_found = [0u8; 16];
             let n_found = match found {
                 count if count < 0 => put_str(&mut b_found, "暂不可用"),
@@ -1162,15 +1156,6 @@ mod page {
                 // action rows and a 0.9.1 collision with key 20 black-screened
                 // the page (tree_commit conflict).
                 rc = status_row(ui_obj, tree, 8, "音频设备", &b_audio[..n_audio as usize]);
-            }
-            if rc == UI_OK {
-                rc = status_row(ui_obj, tree, 17, "开始返回", &b_fwrc[..n_fwrc as usize]);
-            }
-            if rc == UI_OK {
-                rc = status_row(ui_obj, tree, 18, "停止返回", &b_stoprc[..n_stoprc as usize]);
-            }
-            if rc == UI_OK {
-                rc = status_row(ui_obj, tree, 19, "配对返回", &b_pairrc[..n_pairrc as usize]);
             }
             for i in 0..shown {
                 if rc != UI_OK {
