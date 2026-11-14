@@ -88,6 +88,13 @@ pub const CMD_TEARDOWN: u32 = 7;
 /// Copies discovered peers into `arg`: 32 bytes per entry, address[6], rssi,
 /// reserved, class_of_device[4], name[20], up to 8 entries. Returns the count.
 pub const CMD_SCAN_RESULTS: u32 = 8;
+/// Queries the adapter for the current peer's bond state and stores it in
+/// BOND_STATE. Needed because already-bonded devices never emit a bond-state
+/// change event, so the slot-9 callback alone always reads NONE.
+pub const CMD_QUERY_BOND: u32 = 9;
+/// Removes the current peer's bond (bt_remove_bond / device_request 95) so a
+/// fresh create_bond can run the pairing dialog again.
+pub const CMD_REMOVE_BOND: u32 = 10;
 
 // Service error codes from sdk/c/canopus_services.h; E_IDENTITY is local.
 pub const E_IDENTITY: i32 = -1;
@@ -159,7 +166,8 @@ mod device {
         DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
         SdpAvrcpControllerRecord, SdpSourceRecord, bt_adapter_get_instance, bt_adapter_get_state,
         bt_adapter_register, bt_adapter_unregister, bt_alloc, bt_create_bond, bt_discovery_start,
-        bt_discovery_stop, bt_l2cap_connect, configure_avctp_connect_request,
+        bt_discovery_stop, bt_get_bond_state, bt_l2cap_connect, bt_remove_bond,
+        configure_avctp_connect_request,
         configure_avdtp_connect_request, discovery_name, sdp_builder_create, sdp_commit,
         sdp_set_raw_attribute, sdp_unregister,
     };
@@ -307,6 +315,8 @@ mod device {
                 }
             }
             CMD_PAIR => pair(),
+            CMD_QUERY_BOND => query_bond(),
+            CMD_REMOVE_BOND => remove_bond(),
             CMD_REGISTER_SDP => register_sdp(),
             CMD_CONNECT => connect(),
             CMD_TEARDOWN => teardown(),
@@ -400,6 +410,33 @@ mod device {
             LAST_ERROR.store(rc, Ordering::Relaxed);
             return E_IO;
         }
+        ok(ST_IDLE)
+    }
+
+    /// Reads the adapter's bond state for the current peer. Bonds created in
+    /// an earlier session never emit a bond-state change event, so the slot-9
+    /// callback alone always leaves BOND_STATE at NONE.
+    fn query_bond() -> i32 {
+        let addr = peer_bytes();
+        if !has_peer(&addr) {
+            BOND_STATE.store(0, Ordering::Relaxed);
+            return ok(STATE.load(Ordering::Relaxed));
+        }
+        let state = unsafe { bt_get_bond_state(addr.as_ptr()) };
+        BOND_STATE.store(state, Ordering::Relaxed);
+        ok(STATE.load(Ordering::Relaxed))
+    }
+
+    /// Clears the current peer's bond so create_bond can run the pairing
+    /// dialog again (useful when the peer is already in the bonded table).
+    fn remove_bond() -> i32 {
+        let addr = peer_bytes();
+        if !has_peer(&addr) {
+            return fail(E_ARGUMENT, 0);
+        }
+        let rc = unsafe { bt_remove_bond(addr.as_ptr(), CLASSIC_TRANSPORT) };
+        LAST_PAIR_RC.store(rc, Ordering::Relaxed);
+        BOND_STATE.store(0, Ordering::Relaxed);
         ok(ST_IDLE)
     }
 
@@ -719,7 +756,8 @@ mod page {
     const EV_TEARDOWN: u32 = 5;
     const EV_PAIR_SECOND: u32 = 6;
     const EV_PAIR_THIRD: u32 = 7;
-    const EV_REFRESH: u32 = 8;
+    const EV_REFRESH: u32 = 8; // query the adapter's bond state + re-render
+    const EV_REMOVE_BOND: u32 = 9;
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -816,12 +854,16 @@ mod page {
     }
 
     fn bond_text(buf: &mut [u8]) -> u32 {
-        let name = match BOND_STATE.load(Ordering::Relaxed) {
-            1 => "配对中",
-            2 => "已配对",
-            _ => "未配对",
+        let v = BOND_STATE.load(Ordering::Relaxed);
+        let mut n = put_num(buf, v as i32) as usize;
+        let name = match v {
+            1 => " 配对中",
+            2 => " 已配对",
+            0 => " 未配对",
+            _ => " 未知",
         };
-        put_str(buf, name)
+        n += put_str(&mut buf[n..], name) as usize;
+        n as u32
     }
 
     fn peer_text(buf: &mut [u8]) -> u32 {
@@ -936,7 +978,7 @@ mod page {
             let n_state = state_text(&mut b_state);
             let mut b_err = [0u8; 28];
             let n_err = err_text(&mut b_err);
-            let mut b_bond = [0u8; 12];
+            let mut b_bond = [0u8; 20];
             let n_bond = bond_text(&mut b_bond);
             let mut b_peer = [0u8; 20];
             let n_peer = peer_text(&mut b_peer);
@@ -1037,7 +1079,10 @@ mod page {
                 rc = action_row(ui_obj, tree, 13, "复位", "释放适配器/SDP/L2CAP", EV_TEARDOWN);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 22, "刷新状态", "读取异步配对结果", EV_REFRESH);
+                rc = action_row(ui_obj, tree, 22, "刷新状态", "重新查询已配对状态", EV_REFRESH);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
             }
             if rc == UI_OK {
                 rc = (ui_obj.end)(tree); // section "操作"
@@ -1103,7 +1148,8 @@ mod page {
             EV_PAIR_FIRST => pair_first(),
             EV_PAIR_SECOND => pair_at(1),
             EV_PAIR_THIRD => pair_at(2),
-            EV_REFRESH => 0, // re-render only; read the async bond state
+            EV_REFRESH => ctl(CMD_QUERY_BOND, core::ptr::null()),
+            EV_REMOVE_BOND => ctl(CMD_REMOVE_BOND, core::ptr::null()),
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
             _ => 0,
         };
@@ -1156,8 +1202,8 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     abi_minor: ABI_MINOR,
     flags: 0,
     module_id: pack(b"headset_link_179"),
-    module_version: pack(b"0.8.0"),
-    build_id: pack(b"headset-link-179-0.8.0"),
+    module_version: pack(b"0.9.0"),
+    build_id: pack(b"headset-link-179-0.9.0"),
     target_id: pack(TARGET_ID.as_bytes()),
     prepare: Some(canopus_mod_prepare),
     activate: Some(canopus_mod_activate),
