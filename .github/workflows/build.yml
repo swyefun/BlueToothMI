@@ -85,3 +85,31 @@ jobs:
           name: headset-link-179-${{ github.sha }}
           path: out/
           if-no-files-found: error
+
+      - name: Publish artifacts to dist branch
+        if: success()
+        run: |
+          git config user.name "ci-dist"
+          git config user.email "ci-dist@users.noreply.github.com"
+          cp out/* .
+          git checkout -B dist-tmp
+          git rm -rf --quiet . || true
+          git add -A
+          git commit -m "dist: build ${{ github.sha }}"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/dist
+
+      - name: Unpack .canopus and publish inbox files
+        if: success()
+        run: |
+          mkdir -p unpack
+          pkg=$(find out -name '*.canopus' | head -1)
+          tar -tvf "$pkg"
+          tar -xf "$pkg" -C unpack
+          find unpack -type f | sort
+          cp unpack/artifacts/*/*/*.ko unpack/ 2>/dev/null || true
+          cp unpack/receipts/*.cmi unpack/ 2>/dev/null || true
+          ls -la unpack/ || true
+          echo "## Package contents" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tar -tf "$pkg" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
