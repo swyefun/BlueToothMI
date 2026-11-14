@@ -69,9 +69,33 @@ jobs:
           echo "--- staged installer watchface ---"
           find watchfaces/canopus-installer-prod/xiaomi-band-11 -type f | sort
 
+      - name: Build module installer watchface (.179)
+        working-directory: canopus
+        run: |
+          # The pinned generator has no product entry for this module; inject
+          # one (token matches the CMI2 receipt) and pack the inbox payload.
+          python3 - <<'EOF'
+          p = 'scripts/build_module_installer_prod.py'
+          s = open(p, encoding='utf-8').read()
+          old1 = "PRODUCTS = {\n    'resource-hook':"
+          new1 = "PRODUCTS = {\n    'headset-link': ('headset_link_179', 'Headset Link', 262144, []),\n    'resource-hook':"
+          old2 = "PRODUCT_TARGETS = {\n    'resource-hook':"
+          new2 = "PRODUCT_TARGETS = {\n    'headset-link': ['xiaomi-band-11-4.100.179'],\n    'resource-hook':"
+          assert old1 in s and old2 in s, 'generator anchors missing'
+          open(p, 'w', encoding='utf-8', newline='\n').write(
+              s.replace(old1, new1).replace(old2, new2))
+          EOF
+          mkdir -p build/payload/"$TARGET_ID" build/assets
+          cp inbox/"$MODULE_ID".ko.next   build/payload/"$TARGET_ID"/headset-link.elf
+          cp inbox/"$MODULE_ID".cmi.next  build/payload/"$TARGET_ID"/receipt.bin
+          python3 scripts/build_module_installer_prod.py \
+            --product headset-link --target "$TARGET_ID" \
+            --payload-dir build/payload --assets-dir build/assets \
+            --output-dir build/installer
+
       - name: Collect deliverables
         run: |
-          mkdir -p out inbox installer-watchface
+          mkdir -p out inbox installer-watchface module-installer-watchface
           cp canopus/modules/headset-link-179/dist/*.canopus out/ 2>/dev/null || \
             find canopus/modules/headset-link-179 -name '*.canopus' -exec cp {} out/ \;
           find canopus/modules/headset-link-179/build -name '*.elf' -exec cp {} out/headset_link_179.elf \;
@@ -80,14 +104,15 @@ jobs:
           cp out/receipts/*.cmi "inbox/${MODULE_ID}.cmi.next"
           cp out/artifacts/*/module.elf "inbox/${MODULE_ID}.ko.next"
           cp -r canopus/watchfaces/canopus-installer-prod/xiaomi-band-11/* installer-watchface/
+          cp -r canopus/build/installer/xiaomi-band-11/* module-installer-watchface/
           echo "--- deliverables ---"
-          find out inbox installer-watchface -type f | sort
+          find out inbox installer-watchface module-installer-watchface -type f | sort
 
       - name: Publish deliverables to dist branch
         if: success()
         run: |
           mkdir -p pub
-          cp -r out inbox installer-watchface pub/
+          cp -r out inbox installer-watchface module-installer-watchface pub/
           cd pub
           git init -q -b dist
           git config user.name "ci-dist"
