@@ -86,15 +86,15 @@ jobs:
       - name: Publish deliverables to dist branch
         if: success()
         run: |
+          mkdir -p pub
+          cp -r out inbox installer-watchface pub/
+          cd pub
+          git init -q -b dist
           git config user.name "ci-dist"
           git config user.email "ci-dist@users.noreply.github.com"
-          rm -rf canopus
-          cp -r out inbox installer-watchface .
-          git checkout -B dist-tmp
-          git rm -rf --quiet . || true
           git add -A
-          git commit -m "dist: build ${{ github.sha }}"
-          git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/dist
+          git commit -q -m "dist: build ${{ github.sha }}"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" dist
 
       - name: Push build log on failure
         if: failure()
