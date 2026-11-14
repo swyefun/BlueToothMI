@@ -175,7 +175,7 @@ mod device {
         DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
         SdpAvrcpControllerRecord, SdpSourceRecord, bt_adapter_get_instance, bt_adapter_get_state,
         bt_adapter_register, bt_adapter_unregister, bt_alloc, bt_create_bond, bt_discovery_start,
-        bt_discovery_stop, bt_get_bond_state, bt_l2cap_connect, bt_remove_bond,
+        bt_discovery_stop, bt_get_pairing_state, bt_l2cap_connect, bt_remove_bond,
         configure_avctp_connect_request,
         configure_avdtp_connect_request, discovery_name, sdp_builder_create, sdp_commit,
         sdp_set_raw_attribute, sdp_unregister,
@@ -440,18 +440,19 @@ mod device {
         ok(ST_IDLE)
     }
 
-    /// Queries the adapter for the current peer's Class of Device. The cmd83
-    /// response's state slot is actually the 24-bit COD (see BOND_COD), so
-    /// this never overwrites BOND_STATE - bond state only arrives via the
-    /// slot-9 callback while pairing runs.
+    /// Polls the pairing state via device_request(92) - `bt_get_pairing_state`.
+    /// The slot-9 callback never fires for BONDING/BONDED (0.9.5 device log:
+    /// a full successful pairing with cb count unchanged), and cmd83 returns
+    /// the remote COD regardless of bond state (0/2360324 survived an
+    /// unpair), so polling is the only working path on .179.
     fn query_bond() -> i32 {
         let addr = peer_bytes();
         if !has_peer(&addr) {
-            BOND_COD.store(0, Ordering::Relaxed);
+            BOND_STATE.store(0, Ordering::Relaxed);
             return ok(STATE.load(Ordering::Relaxed));
         }
-        let cod = unsafe { bt_get_bond_state(addr.as_ptr()) };
-        BOND_COD.store(cod as u32, Ordering::Relaxed);
+        let st = unsafe { bt_get_pairing_state(addr.as_ptr(), CLASSIC_TRANSPORT) };
+        BOND_STATE.store(st as u32, Ordering::Relaxed);
         ok(STATE.load(Ordering::Relaxed))
     }
 
@@ -892,16 +893,21 @@ mod page {
     }
 
     fn bond_text(buf: &mut [u8]) -> u32 {
-        // 0.9.5: r3 stayed 0 through a successful pairing (cb3 @BB07), so it
-        // is NOT the bond state. Show both callback words raw - if r2 reads
-        // 1/2 after pairing, the state lives in r2; if r2 reads the COD
-        // (240404 for the NPU), the state is elsewhere entirely.
-        let r3 = BOND_STATE.load(Ordering::Relaxed);
-        let r2 = BOND_COD.load(Ordering::Relaxed);
-        let mut n = put_num(buf, r3 as i32) as usize;
-        n += put_str(&mut buf[n..], "/") as usize;
-        n += put_num(&mut buf[n..], r2 as i32) as usize;
-        n += put_str(&mut buf[n..], " cb") as usize;
+        let v = BOND_STATE.load(Ordering::Relaxed);
+        let mut n = put_num(buf, v as i32) as usize;
+        let name = match v {
+            1 => " 配对中",
+            2 => " 已配对",
+            0 => " 未配对",
+            _ => "",
+        };
+        n += put_str(&mut buf[n..], name) as usize;
+        // Slot-9 diagnostics stay for one more build: count + last address.
+        if n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        n += put_str(&mut buf[n..], "cb") as usize;
         n += put_num(&mut buf[n..], CB_COUNT.load(Ordering::Relaxed) as i32) as usize;
         let a = CB_ADDR.load(Ordering::Relaxed);
         if a != 0 && n + 6 <= buf.len() {
