@@ -60,6 +60,9 @@
 
 #![no_std]
 
+#[cfg(feature = "device")]
+mod audio_dev;
+
 use canopus_abi::{ABI_MAJOR, ABI_MINOR, ContextV1, ModuleDescriptorV1, StatusWriterV1};
 use canopus_runtime::{status_put_u32, status_writer_publish};
 use core::ffi::c_void;
@@ -322,6 +325,12 @@ mod device {
 
     pub fn guard_ok() -> bool {
         canopus_target_private::canopus_identity_guard() == 0
+    }
+
+    /// Registers the `/dev/canopus_audio` character device (LyraPlayer
+    /// compatibility layer). Call once per activation.
+    pub fn audio_init() -> i32 {
+        audio_dev::init()
     }
 
     pub fn control(cmd: u32, arg: *const u8) -> i32 {
@@ -689,7 +698,15 @@ pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
         return -1;
     }
     STATE.store(ST_IDLE, Ordering::Relaxed);
-    page::register(ctx)
+    let rc = page::register(ctx);
+    #[cfg(feature = "device")]
+    if rc == 0 {
+        // LyraPlayer compatibility: expose /dev/canopus_audio (the paid
+        // BluetoothAudio module's character device) so the player talks to
+        // this module. Registration failure is non-fatal to the page.
+        let _ = device::audio_init();
+    }
+    rc
 }
 
 #[unsafe(no_mangle)]
