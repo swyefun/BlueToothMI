@@ -50,6 +50,11 @@ jobs:
 
       - name: Build module
         working-directory: canopus/modules/headset-link-179
+        env:
+          # rmp3 builds minimp3.c with bare-metal clang, which has no hosted
+          # stdlib.h / string.h. Scope CPATH to this step only so the later
+          # Supervisor C build keeps the real toolchain headers.
+          CPATH: ${{ github.workspace }}/canopus/modules/headset-link-179/src/cstub
         run: |
           set -o pipefail
           ../../target/release/canopus build 2>&1 | tee build-cli.log
