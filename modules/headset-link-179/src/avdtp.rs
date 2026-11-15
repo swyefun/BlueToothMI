@@ -213,7 +213,7 @@ pub unsafe fn send_l2cap_config_request(local_scid: u16) {
     let mtu = unsafe { *(channel.add(54).cast::<u16>()) };
     let conf_req: unsafe extern "C" fn(*mut u8, *mut u8, u16) =
         core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
-    unsafe { conf_req(link, channel, mtu) };
+    unsafe { conf_req(link as usize as *mut u8, channel, mtu) };
 }
 
 /// 150 ms after the configuration request: re-send DISCOVER once in case the
