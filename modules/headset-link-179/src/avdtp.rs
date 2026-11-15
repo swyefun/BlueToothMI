@@ -84,9 +84,12 @@ pub const PH_REJECT: u32 = 7;
 // Runtime-built firmware callables (XOR pattern keeps the ELF verifier from
 // classifying them as flash address constants; same trick as audio_dev.rs):
 //   sub_C86BD28  channel lookup by (link-or-0, local scid) -> channel or NULL
+//                callable 0x0C86BD29 = 0x0A86BD29 ^ 0x06000000. 0.10.22 shipped
+//                a typo (0x0A6BD29) that transmuted to 0x06A6BD29 - unmapped
+//                memory, bus fault, instant reboot (crash4/crash5, PC 06a6bd28).
 //   sub_C86C150  builds and sends the L2CAP configuration request (code 4)
 //                for a channel; used by the stack's own conf-rsp retry path.
-const L2CAP_FIND_CH_LO: u32 = 0x0A6B_D29;
+const L2CAP_FIND_CH_LO: u32 = 0x0A86_BD29;
 const L2CAP_FIND_CH_HI: u32 = 0x0600_0000;
 const L2CAP_CONF_REQ_LO: u32 = 0x0A6C_151;
 const L2CAP_CONF_REQ_HI: u32 = 0x0600_0000;
