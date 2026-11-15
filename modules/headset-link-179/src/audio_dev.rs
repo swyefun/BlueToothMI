@@ -382,6 +382,12 @@ fn fill_fops() {
 /// Registers `/dev/canopus_audio`. Call once after activation. Returns the
 /// firmware's register_driver result (0 on success), also stored in REG_RC.
 pub fn init() -> i32 {
+    // activate() runs on every page entry while the module is resident.
+    // register_driver() on an already-registered path fails and the player
+    // then sees a dead device; keep registration idempotent per generation.
+    if REG_RC.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
     fill_fops();
     let fops = addr_of!(FOPS).cast::<c_void>();
     let rc = unsafe {

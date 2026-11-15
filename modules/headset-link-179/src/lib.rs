@@ -144,7 +144,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v32";
+const BUILD_TAG: &str = "v33";
 /// IDA: the firmware's own headset_connect bridge (sub_C719878) accepts an
 /// explicit profile_id 0..3 (atoi + CMP #3), while 255 is the "all profiles"
 /// default. On the server, cmd62 case 39 -> sub_C471404: the non-255 branch
@@ -967,14 +967,20 @@ pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn canopus_mod_deactivate(ctx: *const ContextV1) -> i32 {
     page::unregister(ctx);
-    // This module is `resident-after-activation`: the page going away is NOT
-    // the end of the A2DP link. Device log 16 shows the NuttX mm_free.c:173
-    // assert firing right after a page pop / module deactivate while the
-    // AVDTP channel was still live - teardown(true) unregisters the SDP
-    // records and adapter callbacks underneath an active channel. Only
-    // canopus_mod_stop (explicit unload) and CMD_TEARDOWN release them.
-    let _ = ctx;
-    0
+    // 0.10.16 removed this teardown to protect a live AVDTP channel. That
+    // caused a real regression: the module was auto-rolled back to v31 with
+    // "music player failed to start" (the /dev/canopus_audio registration
+    // survives and the next activation re-registers an existing path).
+    // Restore the v31 lifecycle exactly. The log16 heap corruption is fixed
+    // by the event-7 ownership change in avdtp.rs, not by skipping teardown.
+    #[cfg(feature = "device")]
+    {
+        device::teardown(true)
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        0
+    }
 }
 
 #[unsafe(no_mangle)]
