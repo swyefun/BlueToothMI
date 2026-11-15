@@ -2,13 +2,13 @@ schema = 1
 
 [module]
 id = "headset_link_179"
-version = "0.10.14"
-version_code = 30
+version = "0.10.15"
+version_code = 31
 kind = "target"
 language = "rust"
 lifecycle = "resident-after-activation"
 canopus_abi = "2"
-description = "Band 11 4.100.179 headset link front-end: scan/pair/SDP/L2CAP; AVDTP media path not implemented"
+description = "Band 11 4.100.179 headset link front-end: scan/pair/SDP/L2CAP; minimal AVDTP Source signalling"
 
 [build]
 sources = ["Cargo.toml"]

@@ -9,13 +9,13 @@
 //!   and AVRCP controller SDP records -> queue AVDTP/AVCTP L2CAP connect
 //!   requests.
 //!
-//! It does **not** implement an A2DP source. Missing, and deliberately not
-//! faked: AVDTP signalling (DISCOVER / GET_CAPABILITIES / SET_CONFIGURATION /
-//! OPEN / START), SBC encoding and media packetisation, an audio data source,
-//! AVRCP command handling, and the L2CAP completion-event callback that owns
-//! and frees the connect request and the 120-byte completion event (see
-//! `docs/band11-bluetooth-139.md`). After CMD_CONNECT the state is
-//! `ST_CHANNELS_QUEUED` — requests submitted, not a playing audio link.
+//! As of 0.10.15 `CMD_A2DP_CONNECT` drives a minimal A2DP **Source**
+//! handshake (see `avdtp`): AVDTP DISCOVER / GET_CAPABILITIES /
+//! SET_CONFIGURATION / OPEN over PSM 0x19. That is enough for the headset to
+//! announce "connected"; it is **not** an audio link. Still missing, and
+//! deliberately not faked: START / SBC encoding / media packetisation, an
+//! audio data source, and AVRCP command handling. The firmware ships only an
+//! A2DP sink + HFP-AG profile, so this initiator side is ours.
 //!
 //! Discovery results ARE consumed as of this revision. `bt_adapter_register`
 //! (0xc46a302, IDA) is append-only: the registration at adapter+120 is an
@@ -32,10 +32,10 @@
 //! caller's task context. See `NOTES-ida-179.md` §7. CMD_SET_PEER remains
 //! the manual override.
 //!
-//! Because the completion callback is absent, the two 68-byte connect requests
-//! are not freed by this module. This is a known ownership gap, not an
-//! oversight in the firmware ABI. Do not treat a queued request as a connected
-//! channel.
+//! Callback payloads are not freed: event 2 owns the module's connect request,
+//! events 3/7 own firmware-allocated objects whose allocator is unproven on
+//! `.179`. A few hundred leaked bytes per connection is the safe side of an
+//! unverified free. Do not treat a queued request as a connected channel.
 //!
 //! IDA cross-check on the patched `band11std` `vela_ap.bin` (base 0x0C0C0000)
 //! found a stronger constraint: `bt_l2cap_connect` (0xc86d468) only submits a
@@ -44,12 +44,13 @@
 //! (0xc86bd54), writes the CID back to request+0 and invokes the callback as
 //! `(2, request)` (CONFIRM). When request+12 is zero the firmware falls back
 //! to `sub_C867C80(PSM, ...)`, i.e. it expects an already-registered PSM
-//! handler for AVDTP (0x19) / AVCTP (0x17). `queue_connect` below zeroes +12
-//! and registers no PSM handler, so CMD_CONNECT is an UNVERIFIED path that
-//! may dereference a null callback. Boot residency is now declared through
-//! `lifecycle = "resident-after-activation"`; the PSM-handler gap remains.
-//! Do not run CMD_CONNECT on hardware until that point is resolved. See
-//! `NOTES-ida-179.md` for the address evidence and the build hand-off.
+//! handler for AVDTP (0x19) / AVCTP (0x17) only when request+12 is zero.
+//! `queue_connect` now installs the callback at +12 (0.10.5); the firmware
+//! stores it at channel+20 and invokes it for CONFIRM(2) / COMPLETE(3) /
+//! DATA(7), so no separate PSM handler is required. Boot residency is
+//! declared through `lifecycle = "resident-after-activation"`. The legacy
+//! CMD_CONNECT (PSM 1 ACL-hold test) remains unverified on hardware; the
+//! A2DP path is the one under test. See `NOTES-ida-179.md` for addresses.
 //!
 //! All firmware calls are exact-target full-trust absolute addresses. `.179`
 //! symbols remain restricted/PENDING with `capabilities = []`
@@ -62,6 +63,8 @@
 
 #[cfg(feature = "device")]
 mod audio_dev;
+#[cfg(feature = "device")]
+mod avdtp;
 
 use canopus_abi::{ABI_MAJOR, ABI_MINOR, ContextV1, ModuleDescriptorV1, StatusWriterV1};
 use canopus_runtime::{status_put_u32, status_writer_publish};
@@ -102,6 +105,9 @@ pub const CMD_REMOVE_BOND: u32 = 10;
 /// PSM, so the callback-0 fallback in `bt_l2cap_connect` resolves instead of
 /// null-dereferencing; holding the channel keeps the ACL link up.
 pub const CMD_CONNECT_ACL: u32 = 11;
+/// Originates the AVDTP signalling channel and drives DISCOVER ->
+/// GET_CAPABILITIES -> SET_CONFIGURATION -> OPEN (see `avdtp`).
+pub const CMD_A2DP_CONNECT: u32 = 12;
 
 // Service error codes from sdk/c/canopus_services.h; E_IDENTITY is local.
 pub const E_IDENTITY: i32 = -1;
@@ -138,7 +144,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v30";
+const BUILD_TAG: &str = "v31";
 /// IDA: the firmware's own headset_connect bridge (sub_C719878) accepts an
 /// explicit profile_id 0..3 (atoi + CMP #3), while 255 is the "all profiles"
 /// default. On the server, cmd62 case 39 -> sub_C471404: the non-255 branch
@@ -400,6 +406,7 @@ mod device {
             CMD_REGISTER_SDP => register_sdp(),
             CMD_CONNECT => connect(),
             CMD_CONNECT_ACL => device::connect_profiles(),
+            CMD_A2DP_CONNECT => device::a2dp_connect(),
             CMD_TEARDOWN => teardown(false),
             CMD_SCAN_RESULTS => scan_results(arg),
             _ => fail(E_ARGUMENT, 0),
@@ -635,6 +642,7 @@ mod device {
         L2CAP_EVENT.store(event, Ordering::Relaxed);
         L2CAP_CID.store(cid as u32, Ordering::Relaxed);
         L2CAP_EVENTS.fetch_add(1, Ordering::Relaxed);
+        unsafe { crate::avdtp::handle_event(event, request) };
     }
 
     /// Queues one 68-byte L2CAP connect request with the completion callback
@@ -813,6 +821,30 @@ mod device {
             return true;
         }
         false
+    }
+
+    /// Establishes the AVDTP signalling channel and drives the A2DP Source
+    /// handshake. IDA: `bt_l2cap_connect` -> sub_C86F9B0 -> sub_C86BC18
+    /// originates the ACL itself, so cmd 62's pairing round-trip (which the
+    /// firmware tears down after 2s with reason 0x16) is not needed here.
+    pub fn a2dp_connect() -> i32 {
+        let addr = peer_bytes();
+        if !has_peer(&addr) && !restore_peer() {
+            return fail(E_ARGUMENT, 0);
+        }
+        let addr = peer_bytes();
+        if SDP_SOURCE.load(Ordering::Relaxed) == 0 {
+            let rc = register_sdp();
+            if SDP_SOURCE.load(Ordering::Relaxed) == 0 {
+                return rc;
+            }
+        }
+        crate::avdtp::reset();
+        let rc = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE) };
+        if rc != 0 {
+            return fail(rc, 0);
+        }
+        ok(ST_CHANNELS_QUEUED)
     }
 
     /// Asks the adapter service to connect ALL of the peer's profiles
@@ -1040,6 +1072,8 @@ mod page {
     /// must advance exactly once, so remember the last event type seen for
     /// this button and skip only the paired VALUE_CHANGED.
     static LAST_CONNECT_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+    const EV_A2DP: u32 = 11;
+    static LAST_A2DP_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -1094,6 +1128,17 @@ mod page {
 
     fn state_text(buf: &mut [u8]) -> u32 {
         if STATE.load(Ordering::Relaxed) == ST_CHANNELS_QUEUED {
+            let phase = crate::avdtp::PHASE.load(Ordering::Relaxed);
+            if phase != crate::avdtp::PH_IDLE {
+                // A<phase>e<last event>r<accept count>; 6 = OPEN accepted.
+                let mut m = put_str(buf, "A") as usize;
+                m += put_num(&mut buf[m..], phase as i32) as usize;
+                m += put_str(&mut buf[m..], "e") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::LAST_EVENT.load(Ordering::Relaxed) as i32) as usize;
+                m += put_str(&mut buf[m..], "r") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::RESPONSES.load(Ordering::Relaxed) as i32) as usize;
+                return m as u32;
+            }
             // Show which firmware profile id was used and the IPC result, so
             // one tap reports both facts on the device.
             let mut n = put_str(buf, "P") as usize;
@@ -1460,7 +1505,10 @@ mod page {
                 rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端配对状态", EV_REFRESH);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 24, "连接耳机", "每次点轮换 profile 1/3/0/2/255，看状态行", EV_CONNECT_ACL);
+                rc = action_row(ui_obj, tree, 25, "A2DP 连接", "AVDTP DISCOVER→CAP→CFG→OPEN，状态行看 A<阶段>", EV_A2DP);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 24, "ACL 连接(旧)", "cmd62 profile 轮换诊断", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
@@ -1537,6 +1585,14 @@ mod page {
                     UI_OK
                 } else {
                     ctl(CMD_CONNECT_ACL, core::ptr::null())
+                }
+            }
+            EV_A2DP => {
+                let prev = LAST_A2DP_EV.swap(event.type_, Ordering::Relaxed);
+                if event.type_ == UI_EVENT_VALUE_CHANGED && prev == UI_EVENT_ACTIVATE {
+                    UI_OK
+                } else {
+                    ctl(CMD_A2DP_CONNECT, core::ptr::null())
                 }
             }
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
