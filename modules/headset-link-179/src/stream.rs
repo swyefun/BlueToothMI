@@ -321,7 +321,9 @@ pub fn reset() {
     }
     st.dec.write(RawDecoder::new());
     match SbcEncoder::new(params) {
-        Ok(encoder) => st.enc.write(encoder),
+        Ok(encoder) => {
+            st.enc.write(encoder);
+        }
         Err(_) => {
             LAST_ERR.store(-1, Ordering::Relaxed);
             unlock();
