@@ -57,10 +57,12 @@ const SIG_GET_CAPABILITIES: u8 = 0x02;
 const SIG_SET_CONFIGURATION: u8 = 0x03;
 const SIG_OPEN: u8 = 0x06;
 
-/// Generic, widely accepted SBC configuration: 44.1 kHz / joint stereo,
-/// 16 blocks, 8 subbands, loudness allocation, bitpool 2..53. Replaced with
-/// the peer's advertised capabilities after GET_CAPABILITIES succeeds.
-const DEFAULT_SBC: u32 = u32::from_le_bytes([0x21, 0x15, 0x02, 0x35]);
+/// SBC configuration used by the phase-1 test tone, pre-encoded on the host
+/// with ffmpeg: 44.1 kHz / stereo, 16 blocks, 8 subbands, loudness,
+/// min bitpool 2 / max bitpool 36 (156-byte frames). Kept fixed rather than
+/// echoing GET_CAPABILITIES: a capabilities bitmap is NOT a selected config,
+/// and the precomputed frames must match exactly what we negotiate.
+const DEFAULT_SBC: u32 = u32::from_le_bytes([0x22, 0x15, 0x02, 0x24]);
 
 pub static PHASE: AtomicU32 = AtomicU32::new(PH_IDLE);
 pub static CID: AtomicU32 = AtomicU32::new(0);
@@ -73,7 +75,7 @@ pub static LAST_RC: AtomicI32 = AtomicI32::new(0);
 pub static FREED: AtomicU32 = AtomicU32::new(0);
 
 static LABEL: AtomicU32 = AtomicU32::new(0);
-static SEID: AtomicU32 = AtomicU32::new(0);
+pub static SEID: AtomicU32 = AtomicU32::new(0);
 static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 
 pub fn reset() {
@@ -119,6 +121,11 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
     rc
 }
 
+/// Sends on the signalling CID (used by the media module for AVDTP START).
+pub unsafe fn send_on_signalling(signal: u8, params: &[u8]) -> i32 {
+    unsafe { send(signal, params) }
+}
+
 fn send_discover() {
     let _ = unsafe { send(SIG_DISCOVER, &[]) };
 }
@@ -162,18 +169,11 @@ unsafe fn parse_capabilities(data: *const u8, length: usize) {
             break;
         }
         if category == 0x02 && losc >= 6 {
-            let info = unsafe { data.add(offset + 2) };
-            // info[0] = media type, info[1] = codec type (0 = SBC),
-            // info[2..6] = sampling/channel, block/subband/alloc, bitpools.
-            if unsafe { *info.add(1) } == 0x00 {
-                let bytes = [
-                    unsafe { *info.add(2) },
-                    unsafe { *info.add(3) },
-                    unsafe { *info.add(4) },
-                    unsafe { *info.add(5) },
-                ];
-                SBC_CFG.store(u32::from_le_bytes(bytes), Ordering::Relaxed);
-            }
+            // Media codec capability. Do NOT copy this bitmap into SBC_CFG:
+            // the phase-1 frames are precomputed for DEFAULT_SBC and an
+            // advertised capability set is not a selected configuration.
+            // Re-enable a codec choice here when real MP3 decoding lands.
+            let _codec = unsafe { *data.add(offset + 3) };
         }
         offset += 2 + losc;
     }
@@ -186,24 +186,30 @@ unsafe fn handle_data(buffer: *mut u8) {
     if total <= offset || total - offset < 2 {
         return;
     }
-    let phase = PHASE.load(Ordering::Relaxed);
-    if phase == PH_DONE || phase == PH_REJECT {
-        // OPEN is terminal. The headset keeps sending keep-alive / AVRCP
-        // traffic; consuming it here would re-enter the state machine and
-        // originate new SDUs from a callback context indefinitely.
-        LAST_EVENT.store(7, Ordering::Relaxed);
-        RESPONSES.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
     let length = total - offset;
     let payload = unsafe { stock_buffer_payload(stock) };
     let header = unsafe { *payload };
     let signal = unsafe { *payload.add(1) };
     LAST_SIGNAL.store(signal as u32, Ordering::Relaxed);
     RESPONSES.fetch_add(1, Ordering::Relaxed);
+    let accepted = (header & 0x03) == 2;
+    let phase = PHASE.load(Ordering::Relaxed);
+
+    if phase == PH_DONE {
+        // OPEN is terminal. Only an AVDTP START accept is still interesting:
+        // it starts the media timer. Everything else (keep-alive, AVRCP) is
+        // counted and dropped so the callback never originates new SDUs.
+        LAST_EVENT.store(7, Ordering::Relaxed);
+        let _ = crate::media::on_signal_data(signal, accepted);
+        return;
+    }
+    if phase == PH_REJECT {
+        LAST_EVENT.store(7, Ordering::Relaxed);
+        return;
+    }
 
     // message type 2 = accept; 1 = general reject, 3 = reject.
-    if (header & 0x03) != 2 {
+    if !accepted {
         PHASE.store(PH_REJECT, Ordering::Relaxed);
         return;
     }
@@ -231,6 +237,9 @@ unsafe fn handle_data(buffer: *mut u8) {
         }
         PH_OPEN if signal == SIG_OPEN => {
             PHASE.store(PH_DONE, Ordering::Relaxed);
+            // AVDTP transport session: a SECOND L2CAP channel on PSM 0x19
+            // carries media. Queue it from here; its callback sends START.
+            let _ = crate::device::open_media_channel();
         }
         _ => {}
     }

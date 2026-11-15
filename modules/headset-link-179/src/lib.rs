@@ -65,6 +65,8 @@
 mod audio_dev;
 #[cfg(feature = "device")]
 mod avdtp;
+#[cfg(feature = "device")]
+mod media;
 
 use canopus_abi::{ABI_MAJOR, ABI_MINOR, ContextV1, ModuleDescriptorV1, StatusWriterV1};
 use canopus_runtime::{status_put_u32, status_writer_publish};
@@ -161,6 +163,8 @@ static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SDP_AVRCP: AtomicU32 = AtomicU32::new(0);
 static AVDTP_NODE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+/// Queue node for the SECOND PSM 0x19 channel (AVDTP media transport).
+static MEDIA_NODE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static AVCTP_NODE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static PEER: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
 
@@ -647,6 +651,34 @@ mod device {
         unsafe { crate::avdtp::handle_event(event, request) }
     }
 
+    fn signalling_cb() -> u32 {
+        on_l2cap_event as *const () as usize as u32 | THUMB
+    }
+
+    /// Queues the AVDTP media (transport) channel after OPEN. It uses the
+    /// same PSM 0x19 request layout but installs `media::on_media_event`, so
+    /// media-channel CONFIRM/COMPLETE/DATA events never disturb the
+    /// signalling state machine's CID.
+    pub fn open_media_channel() -> i32 {
+        let addr = peer_bytes();
+        if !has_peer(&addr) {
+            return fail(E_ARGUMENT, 0);
+        }
+        let rc = unsafe {
+            queue_connect(
+                configure_avdtp_connect_request,
+                &addr,
+                &MEDIA_NODE,
+                crate::media::callback(),
+            )
+        };
+        if rc != 0 {
+            fail(rc, 0)
+        } else {
+            0
+        }
+    }
+
     /// Queues one 68-byte L2CAP connect request with the completion callback
     /// installed. `bt_l2cap_connect` returns the accepted queue node, 0 when
     /// rejected.
@@ -654,6 +686,7 @@ mod device {
         configure: unsafe fn(*mut u8),
         addr: &[u8; 6],
         node: &AtomicPtr<c_void>,
+        callback: u32,
     ) -> i32 {
         let raw = unsafe { bt_alloc(CONNECT_REQUEST_SIZE as u32) };
         if raw.is_null() {
@@ -674,7 +707,7 @@ mod device {
             // it as cb(event=2 CONFIRM, request) with the CID at request+0.
             core::ptr::write_unaligned(
                 request.add(CONNECT_CALLBACK_OFFSET).cast::<u32>(),
-                on_l2cap_event as *const () as usize as u32 | THUMB,
+                callback,
             );
         }
         let queued = unsafe { bt_l2cap_connect(request.cast()) };
@@ -698,11 +731,11 @@ mod device {
         if SDP_SOURCE.load(Ordering::Relaxed) == 0 {
             return fail(E_STATE, 0);
         }
-        let avdtp = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE) };
+        let avdtp = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE, signalling_cb()) };
         if avdtp != 0 {
             return fail(avdtp, 0);
         }
-        let avctp = unsafe { queue_connect(configure_avctp_connect_request, &addr, &AVCTP_NODE) };
+        let avctp = unsafe { queue_connect(configure_avctp_connect_request, &addr, &AVCTP_NODE, signalling_cb()) };
         if avctp != 0 {
             return fail(avctp, 0);
         }
@@ -842,7 +875,8 @@ mod device {
             }
         }
         crate::avdtp::reset();
-        let rc = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE) };
+        crate::media::reset();
+        let rc = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE, signalling_cb()) };
         if rc != 0 {
             return fail(rc, 0);
         }
@@ -967,20 +1001,14 @@ pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn canopus_mod_deactivate(ctx: *const ContextV1) -> i32 {
     page::unregister(ctx);
-    // 0.10.16 removed this teardown to protect a live AVDTP channel. That
-    // caused a real regression: the module was auto-rolled back to v31 with
-    // "music player failed to start" (the /dev/canopus_audio registration
-    // survives and the next activation re-registers an existing path).
-    // Restore the v31 lifecycle exactly. The log16 heap corruption is fixed
-    // by the event-7 ownership change in avdtp.rs, not by skipping teardown.
-    #[cfg(feature = "device")]
-    {
-        device::teardown(true)
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        0
-    }
+    // This module is `resident-after-activation`: the page going away is NOT
+    // the end of the A2DP link. Device log 16 shows the NuttX mm_free.c:173
+    // assert firing right after a page pop / module deactivate while the
+    // AVDTP channel was still live - teardown(true) unregisters the SDP
+    // records and adapter callbacks underneath an active channel. Only
+    // canopus_mod_stop (explicit unload) and CMD_TEARDOWN release them.
+    let _ = ctx;
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -1136,6 +1164,18 @@ mod page {
 
     fn state_text(buf: &mut [u8]) -> u32 {
         if STATE.load(Ordering::Relaxed) == ST_CHANNELS_QUEUED {
+            if crate::avdtp::PHASE.load(Ordering::Relaxed) == crate::avdtp::PH_DONE {
+                // m<media CID>p<packets sent>t<timer ticks>s<START accept>
+                let mut n = put_str(buf, "m") as usize;
+                n += put_num(&mut buf[n..], crate::media::MEDIA_CID.load(Ordering::Relaxed) as i32) as usize;
+                n += put_str(&mut buf[n..], "p") as usize;
+                n += put_num(&mut buf[n..], crate::media::PACKETS.load(Ordering::Relaxed) as i32) as usize;
+                n += put_str(&mut buf[n..], "t") as usize;
+                n += put_num(&mut buf[n..], crate::media::TICKS.load(Ordering::Relaxed) as i32) as usize;
+                n += put_str(&mut buf[n..], "s") as usize;
+                n += put_num(&mut buf[n..], crate::media::START_ACCEPTED.load(Ordering::Relaxed) as i32) as usize;
+                return n as u32;
+            }
             let phase = crate::avdtp::PHASE.load(Ordering::Relaxed);
             if phase != crate::avdtp::PH_IDLE {
                 // A<phase>e<last event>f<freed buffers>r<responses>;
