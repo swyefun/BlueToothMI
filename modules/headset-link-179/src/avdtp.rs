@@ -23,14 +23,24 @@
 //!   Event 3 = channel complete (CID+108), event 7 = received StockBuffer
 //!   (CID+4, payload = base+4+offset, length = total-offset).
 //!
-//! Callback payloads are deliberately not freed: event 2 owns the module's
-//! connect request, events 3/7 own firmware-allocated objects whose allocator
-//! is not proven on `.179`. A few hundred leaked bytes per connection is the
-//! safe side of an unverified free.
+//! Ownership, verified on `.179` after device log 16 (NuttX mm_free.c:173
+//! assert / reboot a few seconds after the headset announced "connected"):
+//! - sub_C869764 (L2CAP receive reassembly) calls the channel callback with
+//!   event 7 and the StockBuffer, then sets its own pointer to zero WITHOUT
+//!   freeing it. The callback therefore OWNS that buffer and must bt_free it.
+//!   Leaking it leaves stale blocks in the heap whose metadata is later
+//!   merged by mm_free -> "preceding size mismatch" assertion at line 173.
+//! - sub_C86FA54 / sub_C86F9B0 (control events 13 / 2) do NOT free the
+//!   connect request either, but the same request may be delivered more than
+//!   once; keep those unverified and accept the small one-shot leak.
+//! - sub_C86CC50 (stock send handler) already bt_free's every submitted SDU.
+//! Control payloads (2/3/6/13) stay unfreed; only event 7 is released, and
+//! after OPEN the state machine is frozen so no further SDU is originated.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use canopus_target_private::{
-    bt_buffer_new, bt_l2cap_submit_cid, stock_buffer_payload, stock_buffer_payload_mut, StockBuffer,
+    bt_buffer_new, bt_free, bt_l2cap_submit_cid, stock_buffer_payload, stock_buffer_payload_mut,
+    StockBuffer,
 };
 
 pub const PH_IDLE: u32 = 0;
@@ -58,6 +68,9 @@ pub static RESPONSES: AtomicU32 = AtomicU32::new(0);
 pub static LAST_SIGNAL: AtomicU32 = AtomicU32::new(0);
 pub static LAST_EVENT: AtomicU32 = AtomicU32::new(0);
 pub static LAST_RC: AtomicI32 = AtomicI32::new(0);
+/// Number of event-7 StockBuffers released by the callback. A non-zero value
+/// on the status row proves the fixed ownership path is running.
+pub static FREED: AtomicU32 = AtomicU32::new(0);
 
 static LABEL: AtomicU32 = AtomicU32::new(0);
 static SEID: AtomicU32 = AtomicU32::new(0);
@@ -70,6 +83,7 @@ pub fn reset() {
     LAST_SIGNAL.store(0, Ordering::Relaxed);
     LAST_EVENT.store(0, Ordering::Relaxed);
     LAST_RC.store(0, Ordering::Relaxed);
+    FREED.store(0, Ordering::Relaxed);
     LABEL.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
@@ -85,7 +99,9 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
     }
     let label = (LABEL.fetch_add(1, Ordering::Relaxed) & 0x0F) as u8;
     let length = 2 + params.len();
-    let buffer = unsafe { bt_buffer_new(length as u16, 0) };
+    // headroom 4 leaves slack for the stock send handler, which writes its
+    // 4-byte L2CAP header immediately before the payload (sub_C86CC50).
+    let buffer = unsafe { bt_buffer_new(length as u16, 4) };
     if buffer.is_null() {
         return -2;
     }
@@ -170,6 +186,15 @@ unsafe fn handle_data(buffer: *mut u8) {
     if total <= offset || total - offset < 2 {
         return;
     }
+    let phase = PHASE.load(Ordering::Relaxed);
+    if phase == PH_DONE || phase == PH_REJECT {
+        // OPEN is terminal. The headset keeps sending keep-alive / AVRCP
+        // traffic; consuming it here would re-enter the state machine and
+        // originate new SDUs from a callback context indefinitely.
+        LAST_EVENT.store(7, Ordering::Relaxed);
+        RESPONSES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let length = total - offset;
     let payload = unsafe { stock_buffer_payload(stock) };
     let header = unsafe { *payload };
@@ -213,10 +238,12 @@ unsafe fn handle_data(buffer: *mut u8) {
 
 /// Installed as request+12; the firmware keeps it at channel+20 and calls it
 /// for every channel event: 2 CONFIRM, 3 COMPLETE, 6 DISCONNECT, 7 DATA.
-pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) {
+/// Returns 0 - the firmware ignores the value at every call site, but a
+/// defined r0 avoids an accidental ownership flag on the module side.
+pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
     LAST_EVENT.store(event as u32, Ordering::Relaxed);
     if argument.is_null() {
-        return;
+        return 0;
     }
     match event {
         2 => {
@@ -237,18 +264,21 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) {
             if cid != 0 && (known == 0 || cid == known) {
                 CID.store(cid, Ordering::Relaxed);
             }
-            // If event 2's SDU never got flushed, re-issue DISCOVER with a
-            // fresh label. A duplicate accept is harmless: PHASE has moved on.
-            if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
-                && RESPONSES.load(Ordering::Relaxed) == 0
-            {
-                send_discover();
-            }
+            // No re-issue here: event 2 already queued DISCOVER and the stock
+            // handler flushes it on COMPLETE. A second SDU from inside the
+            // callback races the credit queue (see log16 heap corruption).
         }
-        7 => unsafe { handle_data(argument) },
+        7 => {
+            unsafe { handle_data(argument) };
+            // sub_C869764 zeroes its reassembly pointer after this callback
+            // and never frees the StockBuffer -> ownership is ours.
+            unsafe { bt_free(argument.cast()) };
+            FREED.fetch_add(1, Ordering::Relaxed);
+        }
         6 => {
             PHASE.store(PH_REJECT, Ordering::Relaxed);
         }
         _ => {}
     }
+    0
 }

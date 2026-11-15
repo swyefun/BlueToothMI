@@ -32,10 +32,10 @@
 //! caller's task context. See `NOTES-ida-179.md` §7. CMD_SET_PEER remains
 //! the manual override.
 //!
-//! Callback payloads are not freed: event 2 owns the module's connect request,
-//! events 3/7 own firmware-allocated objects whose allocator is unproven on
-//! `.179`. A few hundred leaked bytes per connection is the safe side of an
-//! unverified free. Do not treat a queued request as a connected channel.
+//! Control-event payloads are not freed (the connect request may be delivered
+//! twice); event-7 DATA StockBuffers ARE released by the callback, which IDA
+//! shows owns them (sub_C869764). This was the log16 heap-corruption fix.
+//! Do not treat a queued request as a connected channel.
 //!
 //! IDA cross-check on the patched `band11std` `vela_ap.bin` (base 0x0C0C0000)
 //! found a stronger constraint: `bt_l2cap_connect` (0xc86d468) only submits a
@@ -144,7 +144,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v31";
+const BUILD_TAG: &str = "v32";
 /// IDA: the firmware's own headset_connect bridge (sub_C719878) accepts an
 /// explicit profile_id 0..3 (atoi + CMP #3), while 255 is the "all profiles"
 /// default. On the server, cmd62 case 39 -> sub_C471404: the non-255 branch
@@ -629,20 +629,22 @@ mod device {
     pub static L2CAP_EVENT: AtomicI32 = AtomicI32::new(0);
     pub static L2CAP_CID: AtomicU32 = AtomicU32::new(0);
 
-    /// Completion callback the firmware invokes as `cb(event, request)`;
-    /// event 2 = CONFIRM (channel open, CID written to request+0). Deliberately
-    /// leaks the request and the firmware's completion event: the callback owns
-    /// freeing them, but their full event-time layout is unverified and a
-    /// wrong free is a crash - a 188-byte leak per attempt is the safer side.
-    unsafe extern "C" fn on_l2cap_event(event: i32, request: *mut u8) {
+    /// Completion callback the firmware invokes as `cb(event, request)`.
+    /// Control-event payloads (2/3/6/13) are intentionally not freed: the
+    /// same connect request can be delivered from more than one dispatch site
+    /// (sub_C86FA54 event 13, sub_C86F9B0 event 2), so freeing it twice
+    /// corrupts the heap. Event 7 DATA payloads ARE owned by the callback
+    /// (sub_C869764 clears its pointer without freeing) and are released in
+    /// `avdtp::handle_event` - see the log16 mm_free.c:173 analysis.
+    unsafe extern "C" fn on_l2cap_event(event: i32, request: *mut u8) -> i32 {
         if request.is_null() {
-            return;
+            return 0;
         }
         let cid = unsafe { core::ptr::read_unaligned(request.cast::<u16>()) };
         L2CAP_EVENT.store(event, Ordering::Relaxed);
         L2CAP_CID.store(cid as u32, Ordering::Relaxed);
         L2CAP_EVENTS.fetch_add(1, Ordering::Relaxed);
-        unsafe { crate::avdtp::handle_event(event, request) };
+        unsafe { crate::avdtp::handle_event(event, request) }
     }
 
     /// Queues one 68-byte L2CAP connect request with the completion callback
@@ -965,14 +967,14 @@ pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn canopus_mod_deactivate(ctx: *const ContextV1) -> i32 {
     page::unregister(ctx);
-    #[cfg(feature = "device")]
-    {
-        device::teardown(true)
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        0
-    }
+    // This module is `resident-after-activation`: the page going away is NOT
+    // the end of the A2DP link. Device log 16 shows the NuttX mm_free.c:173
+    // assert firing right after a page pop / module deactivate while the
+    // AVDTP channel was still live - teardown(true) unregisters the SDP
+    // records and adapter callbacks underneath an active channel. Only
+    // canopus_mod_stop (explicit unload) and CMD_TEARDOWN release them.
+    let _ = ctx;
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -1130,11 +1132,14 @@ mod page {
         if STATE.load(Ordering::Relaxed) == ST_CHANNELS_QUEUED {
             let phase = crate::avdtp::PHASE.load(Ordering::Relaxed);
             if phase != crate::avdtp::PH_IDLE {
-                // A<phase>e<last event>r<accept count>; 6 = OPEN accepted.
+                // A<phase>e<last event>f<freed buffers>r<responses>;
+                // phase 6 = OPEN accepted, f>0 proves the fixed ownership.
                 let mut m = put_str(buf, "A") as usize;
                 m += put_num(&mut buf[m..], phase as i32) as usize;
                 m += put_str(&mut buf[m..], "e") as usize;
                 m += put_num(&mut buf[m..], crate::avdtp::LAST_EVENT.load(Ordering::Relaxed) as i32) as usize;
+                m += put_str(&mut buf[m..], "f") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::FREED.load(Ordering::Relaxed) as i32) as usize;
                 m += put_str(&mut buf[m..], "r") as usize;
                 m += put_num(&mut buf[m..], crate::avdtp::RESPONSES.load(Ordering::Relaxed) as i32) as usize;
                 return m as u32;
