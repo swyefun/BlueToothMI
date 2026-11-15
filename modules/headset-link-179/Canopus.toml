@@ -2,8 +2,8 @@ schema = 1
 
 [module]
 id = "headset_link_179"
-version = "0.10.11"
-version_code = 27
+version = "0.10.12"
+version_code = 28
 kind = "target"
 language = "rust"
 lifecycle = "resident-after-activation"

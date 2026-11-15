@@ -132,6 +132,13 @@ static BOND_COD: AtomicU32 = AtomicU32::new(0);
 /// status row. Verifies whether the .179 firmware ever fires this slot.
 static CB_COUNT: AtomicU32 = AtomicU32::new(0);
 static CB_ADDR: AtomicU32 = AtomicU32::new(0);
+/// Bond-restore diagnostics: entries enumerated by cmd45/46 and the first
+/// entry's leading bytes EXACTLY as the list carries them (no reorder), so a
+/// single glance at the peer row settles the list byte order on device.
+static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
+/// Build marker rendered on the peer row, so a stale install is visible.
+const BUILD_TAG: &str = "v28";
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SDP_AVRCP: AtomicU32 = AtomicU32::new(0);
@@ -768,6 +775,11 @@ mod device {
     pub fn restore_peer() -> bool {
         let mut addrs = [[0u8; 6]; 16];
         let count = bonded_list(&mut addrs);
+        RESTORE_COUNT.store(count as u32, Ordering::Relaxed);
+        if count > 0 {
+            let raw = (addrs[0][0] as u32) | ((addrs[0][1] as u32) << 8);
+            RESTORE_RAW2.store(raw, Ordering::Relaxed);
+        }
         let mut fallback: Option<[u8; 6]> = None;
         for i in 0..count {
             let mut addr = addrs[i];
@@ -1187,11 +1199,39 @@ mod page {
     }
 
     fn peer_text(buf: &mut [u8]) -> u32 {
-        let addr = peer_bytes();
-        if !has_peer(&addr) {
-            return put_str(buf, "未设置");
+        let mut n = put_str(buf, BUILD_TAG) as usize;
+        if n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
         }
-        addr_text(&addr, buf)
+        let addr = peer_bytes();
+        if has_peer(&addr) {
+            n += addr_text(&addr, &mut buf[n..]) as usize;
+            return n as u32;
+        }
+        let c = RESTORE_COUNT.load(Ordering::Relaxed);
+        if c > 0 {
+            // Enumeration ran but nothing matched: show the entry count and
+            // the first entry's leading bytes exactly as the list carries
+            // them (e.g. b3:BB07 => 3 entries, list order reversed).
+            n += put_str(&mut buf[n..], "b") as usize;
+            n += put_num(&mut buf[n..], c as i32) as usize;
+            let raw = RESTORE_RAW2.load(Ordering::Relaxed);
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            if n + 5 <= buf.len() {
+                buf[n] = b':';
+                n += 1;
+                for shift in [8, 0] {
+                    let byte = ((raw >> shift) & 0xFF) as u8;
+                    buf[n] = HEX[((byte >> 4) & 0xF) as usize];
+                    buf[n + 1] = HEX[(byte & 0xF) as usize];
+                    n += 2;
+                }
+            }
+            return n as u32;
+        }
+        n += put_str(&mut buf[n..], "未设置") as usize;
+        n as u32
     }
 
     fn addr_text(addr: &[u8], buf: &mut [u8]) -> u32 {
@@ -1300,7 +1340,7 @@ mod page {
             let n_err = err_text(&mut b_err);
             let mut b_bond = [0u8; 36];
             let n_bond = bond_text(&mut b_bond);
-            let mut b_peer = [0u8; 20];
+            let mut b_peer = [0u8; 28];
             let n_peer = peer_text(&mut b_peer);
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
             let mut scan = [0u8; 256];
