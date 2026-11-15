@@ -138,7 +138,19 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v29";
+const BUILD_TAG: &str = "v30";
+/// IDA: the firmware's own headset_connect bridge (sub_C719878) accepts an
+/// explicit profile_id 0..3 (atoi + CMP #3), while 255 is the "all profiles"
+/// default. On the server, cmd62 case 39 -> sub_C471404: the non-255 branch
+/// ALSO creates/updates a profile-manager node (sub_C87D074 / sub_C870BDC)
+/// before posting the connect work; the 255 branch skips that step. Device
+/// log 15 shows cmd62(255) built the ACL, paired and read NPU's UUIDs, then
+/// the band dropped the link locally (reason 0x16) with no audio profile.
+/// Rotate through the firmware-supported ids: one install identifies which
+/// profile actually brings the audio link up.
+const PROFILE_SEQ: [u8; 5] = [1, 3, 0, 2, 255];
+static PROFILE_IDX: AtomicU32 = AtomicU32::new(0);
+static LAST_PROFILE: AtomicU32 = AtomicU32::new(0);
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SDP_AVRCP: AtomicU32 = AtomicU32::new(0);
@@ -814,9 +826,12 @@ mod device {
             return fail(E_ARGUMENT, 0);
         }
         let addr = peer_bytes();
+        let idx = PROFILE_IDX.fetch_add(1, Ordering::Relaxed) % PROFILE_SEQ.len() as u32;
+        let pid = PROFILE_SEQ[idx as usize];
+        LAST_PROFILE.store(pid as u32, Ordering::Relaxed);
         let mut payload = [0u8; 7];
         payload[..6].copy_from_slice(&addr);
-        payload[6] = 255;
+        payload[6] = pid;
         let rc = unsafe { adapter_ipc(62, &payload) };
         LAST_PAIR_RC.store(rc, Ordering::Relaxed);
         if rc != 0 {
@@ -1021,6 +1036,10 @@ mod page {
     const EV_REFRESH: u32 = 8; // query the adapter's bond state + re-render
     const EV_REMOVE_BOND: u32 = 9;
     const EV_CONNECT_ACL: u32 = 10; // hold an ACL to the peer via PSM 1
+    /// The UI host emits ACTIVATE and VALUE_CHANGED for one tap. Rotation
+    /// must advance exactly once, so remember the last event type seen for
+    /// this button and skip only the paired VALUE_CHANGED.
+    static LAST_CONNECT_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -1074,6 +1093,19 @@ mod page {
     }
 
     fn state_text(buf: &mut [u8]) -> u32 {
+        if STATE.load(Ordering::Relaxed) == ST_CHANNELS_QUEUED {
+            // Show which firmware profile id was used and the IPC result, so
+            // one tap reports both facts on the device.
+            let mut n = put_str(buf, "P") as usize;
+            n += put_num(&mut buf[n..], LAST_PROFILE.load(Ordering::Relaxed) as i32) as usize;
+            if n < buf.len() {
+                buf[n] = b' ';
+                n += 1;
+            }
+            n += put_str(&mut buf[n..], "r") as usize;
+            n += put_num(&mut buf[n..], LAST_PAIR_RC.load(Ordering::Relaxed)) as usize;
+            return n as u32;
+        }
         let name = match STATE.load(Ordering::Relaxed) {
             ST_IDLE => "待机",
             ST_SCANNING => "扫描中",
@@ -1428,7 +1460,7 @@ mod page {
                 rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端配对状态", EV_REFRESH);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 24, "连接耳机", "从已配对设备自动选取并连接全部 profile", EV_CONNECT_ACL);
+                rc = action_row(ui_obj, tree, 24, "连接耳机", "每次点轮换 profile 1/3/0/2/255，看状态行", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
@@ -1499,7 +1531,14 @@ mod page {
             EV_PAIR_THIRD => pair_at(2),
             EV_REFRESH => ctl(CMD_QUERY_BOND, core::ptr::null()),
             EV_REMOVE_BOND => ctl(CMD_REMOVE_BOND, core::ptr::null()),
-            EV_CONNECT_ACL => ctl(CMD_CONNECT_ACL, core::ptr::null()),
+            EV_CONNECT_ACL => {
+                let prev = LAST_CONNECT_EV.swap(event.type_, Ordering::Relaxed);
+                if event.type_ == UI_EVENT_VALUE_CHANGED && prev == UI_EVENT_ACTIVATE {
+                    UI_OK
+                } else {
+                    ctl(CMD_CONNECT_ACL, core::ptr::null())
+                }
+            }
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
             _ => 0,
         };
