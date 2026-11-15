@@ -138,7 +138,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v28";
+const BUILD_TAG: &str = "v29";
 static ADAPTER: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static SDP_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SDP_AVRCP: AtomicU32 = AtomicU32::new(0);
@@ -764,14 +764,13 @@ mod device {
     /// The cmd45/46 list carries OTA-reversed addresses (same byte order as
     /// the slot-9 callback); PEER and every adapter IPC use display order, so
     /// each entry is reversed first. Returns true when PEER was set.
-    /// Restores PEER from the firmware's bond table without scanning. The
-    /// cmd45/46 list carries OTA-reversed addresses: device evidence - 0.10.8
-    /// copied list entries to PEER verbatim and the page showed BB:07...,
-    /// while scan-set PEERs (normal order) always display 1B:01.... The
-    /// records lookup is byte-order insensitive (0.10.8 resolved the COD for
-    /// a reversed address), so per-device calibration cannot detect the list
-    /// order - just reverse unconditionally, then classify by COD.
-    /// Returns true when PEER was set.
+    /// Restores PEER from the firmware's bond table without scanning.
+    /// IDA proof: the firmware's own cmd62 client (sub_C719878) converts a
+    /// display string via sub_C465538, which writes hex pairs backwards -
+    /// so every adapter IPC address is OTA order. The cmd45/46 list is the
+    /// same order; keep bytes verbatim for PEER (and thus cmd62/63/83/92),
+    /// and only flip for display in addr_text. Classify by COD to prefer
+    /// an audio device. Returns true when PEER was set.
     pub fn restore_peer() -> bool {
         let mut addrs = [[0u8; 6]; 16];
         let count = bonded_list(&mut addrs);
@@ -782,8 +781,7 @@ mod device {
         }
         let mut fallback: Option<[u8; 6]> = None;
         for i in 0..count {
-            let mut addr = addrs[i];
-            addr.reverse();
+            let addr = addrs[i];
             let cod = unsafe { bt_get_bond_state(addr.as_ptr()) } as u32;
             let major = (cod >> 8) & 0x1F;
             if major == 4 {
@@ -1237,7 +1235,11 @@ mod page {
     fn addr_text(addr: &[u8], buf: &mut [u8]) -> u32 {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         let mut n = 0usize;
-        for (i, byte) in addr.iter().enumerate() {
+        // Adapter IPC addresses are OTA byte order (IDA: the firmware's own
+        // cmd62 client converts "1B:01:..." via sub_C465538 which writes the
+        // first hex pair into out[5]). Render in reverse so the page shows
+        // the familiar display order; never flip PEER itself.
+        for (i, byte) in addr.iter().rev().enumerate() {
             if i > 0 && n < buf.len() {
                 buf[n] = b':';
                 n += 1;
