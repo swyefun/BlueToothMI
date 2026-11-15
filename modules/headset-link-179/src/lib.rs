@@ -754,22 +754,26 @@ mod device {
 
     /// Restores PEER from the firmware's bond table without scanning: prefer
     /// an audio/video device (COD major 4), else the first non-phone entry.
-    /// Returns true when PEER was set.
+    /// The cmd45/46 list carries OTA-reversed addresses (same byte order as
+    /// the slot-9 callback); PEER and every adapter IPC use display order, so
+    /// each entry is reversed first. Returns true when PEER was set.
     pub fn restore_peer() -> bool {
         let mut addrs = [[0u8; 6]; 16];
         let count = bonded_list(&mut addrs);
         let mut fallback: Option<[u8; 6]> = None;
         for i in 0..count {
-            let cod = unsafe { bt_get_bond_state(addrs[i].as_ptr()) } as u32;
+            let mut addr = addrs[i];
+            addr.reverse();
+            let cod = unsafe { bt_get_bond_state(addr.as_ptr()) } as u32;
             let major = (cod >> 8) & 0x1F;
             if major == 4 {
-                for (j, b) in addrs[i].iter().enumerate() {
+                for (j, b) in addr.iter().enumerate() {
                     PEER[j].store(*b, Ordering::Relaxed);
                 }
                 return true;
             }
             if major != 2 && fallback.is_none() {
-                fallback = Some(addrs[i]);
+                fallback = Some(addr);
             }
         }
         if let Some(a) = fallback {
