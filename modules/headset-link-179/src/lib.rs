@@ -67,6 +67,8 @@ mod audio_dev;
 mod avdtp;
 #[cfg(feature = "device")]
 mod media;
+/// MP3 decode + SBC encode dependency probe; no Bluetooth data-plane access.
+mod probe;
 
 use canopus_abi::{ABI_MAJOR, ABI_MINOR, ContextV1, ModuleDescriptorV1, StatusWriterV1};
 use canopus_runtime::{status_put_u32, status_writer_publish};
@@ -110,6 +112,8 @@ pub const CMD_CONNECT_ACL: u32 = 11;
 /// Originates the AVDTP signalling channel and drives DISCOVER ->
 /// GET_CAPABILITIES -> SET_CONFIGURATION -> OPEN (see `avdtp`).
 pub const CMD_A2DP_CONNECT: u32 = 12;
+/// Runs the offline MP3->PCM->SBC probe (see `probe`). No firmware calls.
+pub const CMD_MP3_PROBE: u32 = 13;
 
 // Service error codes from sdk/c/canopus_services.h; E_IDENTITY is local.
 pub const E_IDENTITY: i32 = -1;
@@ -146,7 +150,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v33";
+const BUILD_TAG: &str = "v34";
 /// IDA: the firmware's own headset_connect bridge (sub_C719878) accepts an
 /// explicit profile_id 0..3 (atoi + CMP #3), while 255 is the "all profiles"
 /// default. On the server, cmd62 case 39 -> sub_C471404: the non-255 branch
@@ -411,6 +415,10 @@ mod device {
             CMD_CONNECT => connect(),
             CMD_CONNECT_ACL => device::connect_profiles(),
             CMD_A2DP_CONNECT => device::a2dp_connect(),
+            CMD_MP3_PROBE => {
+                crate::probe::run();
+                0
+            }
             CMD_TEARDOWN => teardown(false),
             CMD_SCAN_RESULTS => scan_results(arg),
             _ => fail(E_ARGUMENT, 0),
@@ -1110,6 +1118,8 @@ mod page {
     static LAST_CONNECT_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
     const EV_A2DP: u32 = 11;
     static LAST_A2DP_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+    const EV_PROBE: u32 = 12;
+    static LAST_PROBE_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
 
@@ -1324,6 +1334,26 @@ mod page {
         n as u32
     }
 
+    /// d<mp3 frames>s<pcm samples>b<sbc frame len>k<encode ok>x<syncword>e<err>
+    fn probe_text(buf: &mut [u8]) -> u32 {
+        if crate::probe::RAN.load(Ordering::Relaxed) == 0 {
+            return put_str(buf, "待运行");
+        }
+        let mut n = put_str(buf, "d") as usize;
+        n += put_num(&mut buf[n..], crate::probe::FRAMES.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "s") as usize;
+        n += put_num(&mut buf[n..], crate::probe::SAMPLES.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "b") as usize;
+        n += put_num(&mut buf[n..], crate::probe::SBC_FRAME_LEN.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "k") as usize;
+        n += put_num(&mut buf[n..], crate::probe::SBC_OK.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "x") as usize;
+        n += put_num(&mut buf[n..], crate::probe::SBC_SYNC.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "e") as usize;
+        n += put_num(&mut buf[n..], crate::probe::LAST_ERR.load(Ordering::Relaxed)) as usize;
+        n as u32
+    }
+
     fn peer_text(buf: &mut [u8]) -> u32 {
         let mut n = put_str(buf, BUILD_TAG) as usize;
         if n < buf.len() {
@@ -1472,6 +1502,8 @@ mod page {
             let n_bond = bond_text(&mut b_bond);
             let mut b_peer = [0u8; 28];
             let n_peer = peer_text(&mut b_peer);
+            let mut b_probe = [0u8; 40];
+            let n_probe = probe_text(&mut b_probe);
             // CMD_SCAN_RESULTS writes into this buffer; it must be mutable.
             let mut scan = [0u8; 256];
             let found = ctl(CMD_SCAN_RESULTS, scan.as_mut_ptr());
@@ -1510,6 +1542,9 @@ mod page {
             }
             if rc == UI_OK {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
+            }
+            if rc == UI_OK {
+                rc = status_row(ui_obj, tree, 26, "MP3 探针", &b_probe[..n_probe as usize]);
             }
             for i in 0..shown {
                 if rc != UI_OK {
@@ -1560,6 +1595,9 @@ mod page {
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 24, "ACL 连接(旧)", "cmd62 profile 轮换诊断", EV_CONNECT_ACL);
+            }
+            if rc == UI_OK {
+                rc = action_row(ui_obj, tree, 27, "MP3 探针", "解码内置 MP3 并编码一帧 SBC，看探针行", EV_PROBE);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
@@ -1644,6 +1682,14 @@ mod page {
                     UI_OK
                 } else {
                     ctl(CMD_A2DP_CONNECT, core::ptr::null())
+                }
+            }
+            EV_PROBE => {
+                let prev = LAST_PROBE_EV.swap(event.type_, Ordering::Relaxed);
+                if event.type_ == UI_EVENT_VALUE_CHANGED && prev == UI_EVENT_ACTIVATE {
+                    UI_OK
+                } else {
+                    ctl(CMD_MP3_PROBE, core::ptr::null())
                 }
             }
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
