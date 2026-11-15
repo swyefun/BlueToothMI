@@ -184,7 +184,8 @@ mod device {
         CONNECT_PSM_OFFSET, CONNECT_REQUEST_SIZE, DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
         SdpAvrcpControllerRecord, SdpSourceRecord, AVDTP_LOCAL_RX_MTU, bt_adapter_get_instance,
         bt_adapter_get_state, bt_adapter_register, bt_adapter_unregister, bt_alloc,
-        bt_create_bond, bt_discovery_start, bt_discovery_stop, bt_get_pairing_state,
+        bt_create_bond, bt_discovery_start, bt_discovery_stop, bt_get_bond_state,
+        bt_get_pairing_state,
         bt_l2cap_connect, bt_remove_bond, configure_avctp_connect_request,
         configure_avdtp_connect_request, discovery_name, sdp_builder_create, sdp_commit,
         sdp_set_raw_attribute, sdp_unregister,
@@ -695,6 +696,15 @@ mod device {
     /// (IDA, case cmd-23=39/40): per-device node flags at +288 bit3 mean
     /// "connected" - connect requires it clear, disconnect requires it set.
     unsafe fn adapter_ipc(command: u32, payload: &[u8]) -> i32 {
+        let mut none = [0u8; 0];
+        unsafe { adapter_ipc_resp(command, payload, &mut none) }
+    }
+
+    /// Adapter IPC with a response-payload view. The dispatcher writes the
+    /// status byte to envelope offset 12 and command results into the payload
+    /// area (offset 60 onward), e.g. cmd 45/46 write the bonded-device count
+    /// at payload[0..4] followed by 6-byte address records.
+    unsafe fn adapter_ipc_resp(command: u32, payload: &[u8], resp: &mut [u8]) -> i32 {
         let adapter = unsafe { bt_adapter_get_instance() };
         if adapter.is_null() || payload.len() > 648 {
             return 7;
@@ -710,17 +720,78 @@ mod device {
         if rc != 0 {
             return rc;
         }
+        let n = resp.len().min(648);
+        resp[..n].copy_from_slice(&bytes[60..60 + n]);
         (request[3] & 255) as i32 // status byte at response offset 12
+    }
+
+    /// Lists bonded devices via the adapter's own enumeration (dispatcher
+    /// cases 22/23 = IPC cmd 45/46 -> sub_C8AA7B4). The list selector lives
+    /// at envelope offset 196; the reply carries a u32 count at payload[0]
+    /// followed by 6-byte addresses taken from each device node at +130.
+    /// Tries cmd 46 selector 0/1 then cmd 45 selector 0/1.
+    fn bonded_list(out: &mut [[u8; 6]; 16]) -> usize {
+        let mut resp = [0u8; 200];
+        for (cmd, sel) in [(46u32, 0u8), (46, 1), (45, 0), (45, 1)] {
+            let mut payload = [0u8; 137];
+            payload[136] = sel;
+            resp.fill(0);
+            let rc = unsafe { adapter_ipc_resp(cmd, &payload, &mut resp) };
+            if rc != 0 {
+                continue;
+            }
+            let count = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize;
+            let count = count.min(out.len()).min((resp.len() - 4) / 6);
+            if count > 0 {
+                for i in 0..count {
+                    out[i].copy_from_slice(&resp[4 + 6 * i..4 + 6 * i + 6]);
+                }
+                return count;
+            }
+        }
+        0
+    }
+
+    /// Restores PEER from the firmware's bond table without scanning: prefer
+    /// an audio/video device (COD major 4), else the first non-phone entry.
+    /// Returns true when PEER was set.
+    pub fn restore_peer() -> bool {
+        let mut addrs = [[0u8; 6]; 16];
+        let count = bonded_list(&mut addrs);
+        let mut fallback: Option<[u8; 6]> = None;
+        for i in 0..count {
+            let cod = unsafe { bt_get_bond_state(addrs[i].as_ptr()) } as u32;
+            let major = (cod >> 8) & 0x1F;
+            if major == 4 {
+                for (j, b) in addrs[i].iter().enumerate() {
+                    PEER[j].store(*b, Ordering::Relaxed);
+                }
+                return true;
+            }
+            if major != 2 && fallback.is_none() {
+                fallback = Some(addrs[i]);
+            }
+        }
+        if let Some(a) = fallback {
+            for (j, b) in a.iter().enumerate() {
+                PEER[j].store(*b, Ordering::Relaxed);
+            }
+            return true;
+        }
+        false
     }
 
     /// Asks the adapter service to connect ALL of the peer's profiles
     /// (profile_id 255). This is the firmware's own connect path - the same
-    /// one its headset service drives.
+    /// one its headset service drives. When PEER is unset (fresh install),
+    /// it is restored from the bond table first, so the flow works without
+    /// a prior scan.
     pub fn connect_profiles() -> i32 {
         let addr = peer_bytes();
-        if !has_peer(&addr) {
+        if !has_peer(&addr) && !restore_peer() {
             return fail(E_ARGUMENT, 0);
         }
+        let addr = peer_bytes();
         let mut payload = [0u8; 7];
         payload[..6].copy_from_slice(&addr);
         payload[6] = 255;
@@ -1303,7 +1374,7 @@ mod page {
                 rc = action_row(ui_obj, tree, 22, "刷新状态", "查询对端配对状态", EV_REFRESH);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 24, "连接测试", "IPC62 连接全部 profile", EV_CONNECT_ACL);
+                rc = action_row(ui_obj, tree, 24, "连接耳机", "从已配对设备自动选取并连接全部 profile", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
