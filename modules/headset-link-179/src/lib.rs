@@ -152,7 +152,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v36";
+const BUILD_TAG: &str = "v37";
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
@@ -1208,13 +1208,13 @@ mod page {
                 m += put_num(&mut buf[m..], crate::avdtp::FREED.load(Ordering::Relaxed) as i32) as usize;
                 m += put_str(&mut buf[m..], "r") as usize;
                 m += put_num(&mut buf[m..], crate::avdtp::RESPONSES.load(Ordering::Relaxed) as i32) as usize;
-                // q<last send rc>c<signalling CID>: -1 means the CID was
-                // still zero when the command was issued; 0 means the SDU
-                // was accepted by the stock send handler.
+                // q<send rc: -2/-1/0/1>c<remote dcid>: c0 means the sink's
+                // CID never arrived (connection response missing); c>0 is
+                // the value every command SDU is submitted with.
                 m += put_str(&mut buf[m..], "q") as usize;
                 m += put_num(&mut buf[m..], crate::avdtp::LAST_RC.load(Ordering::Relaxed)) as usize;
                 m += put_str(&mut buf[m..], "c") as usize;
-                m += put_num(&mut buf[m..], crate::avdtp::CID.load(Ordering::Relaxed) as i32) as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::TX_CID.load(Ordering::Relaxed) as i32) as usize;
                 return m as u32;
             }
             // Show which firmware profile id was used and the IPC result, so

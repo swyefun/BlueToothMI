@@ -15,14 +15,28 @@
 //! PSM 0x19 media channel, AVDTP START and RTP/SBC media packets produced by
 //! `stream` (on-device MP3 decode + SBC encode).
 //!
-//! ABI (docs/band11-bluetooth-139.md §"关键 ABI 修正", NOTES-ida-179.md §3):
-//!   bt_l2cap_connect queues a 68-byte request; its handler finds/creates the
-//!   BR/EDR peer, allocates a 124-byte channel, installs request+12 as the
-//!   channel callback at channel+20 and calls it with (2, request) where the
-//!   CID is at request+0. `bt_l2cap_connect` itself originates the ACL via
-//!   sub_C86BC18, so no cmd 62 pairing round-trip is needed.
-//!   Event 3 = channel complete (CID+108), event 7 = received StockBuffer
-//!   (CID+4, payload = base+4+offset, length = total-offset).
+//! ABI (docs/band11-bluetooth-139.md §"关键 ABI 修正", NOTES-ida-179.md §3,
+//! re-verified on .179 with IDA on 11/15 after status row A2e3f0r0):
+//!   bt_l2cap_connect queues a 68-byte request; its handler (sub_C86F9B0)
+//!   creates the 124-byte channel and assigns the LOCAL scid from a counter
+//!   starting at 0x40 (sub_C86BD54 -> channel+116), writes it to request+0,
+//!   calls the callback with event 2, THEN originates the ACL via
+//!   sub_C86BC18. So event 2 carries only the local scid - the peer's CID
+//!   does not exist yet.
+//!   The connection-response handler (sub_C8714C2) stores the response's
+//!   Destination CID - the sink's own CID - at channel+118, then fires
+//!   event 3 through sub_C86CF54, which allocates the 120-byte completion
+//!   event with +108 = local scid (channel+116) and +110 = remote dcid
+//!   (channel+118), sets the channel READY (+120 = 9, flushing SDUs queued
+//!   by the send path) BEFORE invoking the callback.
+//!   TX (sub_C86CC50) does NOT translate CIDs: the CID submitted in the
+//!   buffer is written verbatim as the packet's destination CID. Submitting
+//!   the local scid therefore produces a packet the sink cannot route - it
+//!   is dropped silently, which is exactly why every version up to 0.10.20
+//!   stayed at A2/r0 with zero responses. Commands must be submitted with
+//!   the remote dcid (TX_CID below), never with the local scid.
+//!   Event 7 = received StockBuffer (CID+4, payload = base+4+offset,
+//!   length = total-offset).
 //!
 //! Ownership, verified on `.179` after device log 16 (NuttX mm_free.c:173
 //! assert / reboot a few seconds after the headset announced "connected"):
@@ -71,6 +85,10 @@ const DEFAULT_SBC: u32 = u32::from_le_bytes([0x21, 0x15, 0x02, 0x35]);
 
 pub static PHASE: AtomicU32 = AtomicU32::new(PH_IDLE);
 pub static CID: AtomicU32 = AtomicU32::new(0);
+/// Remote dcid: the sink's own CID from the L2CAP connection response
+/// (channel+118, exported at completion-event +110). The ONLY valid
+/// destination for our command SDUs (see module ABI notes above).
+pub static TX_CID: AtomicU32 = AtomicU32::new(0);
 pub static RESPONSES: AtomicU32 = AtomicU32::new(0);
 pub static LAST_SIGNAL: AtomicU32 = AtomicU32::new(0);
 pub static LAST_EVENT: AtomicU32 = AtomicU32::new(0);
@@ -89,6 +107,7 @@ static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 pub fn reset() {
     PHASE.store(PH_CONNECTING, Ordering::Relaxed);
     CID.store(0, Ordering::Relaxed);
+    TX_CID.store(0, Ordering::Relaxed);
     RESPONSES.store(0, Ordering::Relaxed);
     LAST_SIGNAL.store(0, Ordering::Relaxed);
     LAST_EVENT.store(0, Ordering::Relaxed);
@@ -105,7 +124,10 @@ pub fn reset() {
 /// SDU itself; a channel that is not OPEN yet queues the buffer and the
 /// credit-queue flush releases it after event 3.
 unsafe fn send(signal: u8, params: &[u8]) -> i32 {
-    let cid = CID.load(Ordering::Relaxed) as u16;
+    // The remote dcid. sub_C86CC50 copies this value verbatim into the
+    // outgoing packet's destination-CID header field, so the local scid in
+    // `CID` is useless here (that was the 0.10.15-0.10.20 bug).
+    let cid = TX_CID.load(Ordering::Relaxed) as u16;
     if cid == 0 {
         LAST_RC.store(-1, Ordering::Relaxed);
         return -1;
@@ -129,7 +151,9 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
         }
     }
     let rc = unsafe { bt_l2cap_submit_cid(buffer, cid) };
-    LAST_RC.store(rc, Ordering::Relaxed);
+    // bt_l2cap_submit_cid returns the work-queue node pointer (sub_C86D514
+    // -> sub_C861768), not a status code; normalize for the status row.
+    LAST_RC.store(if rc == 0 { 0 } else { 1 }, Ordering::Relaxed);
     rc
 }
 
@@ -280,37 +304,31 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             }
             if PHASE.load(Ordering::Relaxed) == PH_CONNECTING {
                 PHASE.store(PH_DISCOVER, Ordering::Relaxed);
-                // CONFIRM can arrive before request+0 holds the final CID.
-                // send() drops a zero CID silently, so only try when it is
-                // real; COMPLETE below is the reliable path.
-                if CID.load(Ordering::Relaxed) != 0 && DISCOVER_SENT.load(Ordering::Relaxed) == 0 {
-                    DISCOVER_SENT.store(1, Ordering::Relaxed);
-                    send_discover();
-                }
+                // request+0 is the LOCAL scid, assigned before the ACL was
+                // even originated; the remote dcid does not exist yet, so
+                // nothing can be sent from here. Event 3 below is the only
+                // send point.
             }
         }
         3 => {
-            let cid = unsafe { core::ptr::read_unaligned(argument.add(108).cast::<u16>()) } as u32;
-            let known = CID.load(Ordering::Relaxed);
-            if cid != 0 && (known == 0 || cid == known) {
-                CID.store(cid, Ordering::Relaxed);
+            // Completion event layout (sub_C86CF54): +108 = local scid,
+            // +110 = remote dcid. Store both; only +110 can be transmitted.
+            let local = unsafe { core::ptr::read_unaligned(argument.add(108).cast::<u16>()) } as u32;
+            let remote = unsafe { core::ptr::read_unaligned(argument.add(110).cast::<u16>()) } as u32;
+            if local != 0 {
+                CID.store(local, Ordering::Relaxed);
             }
-            // Device evidence (status row A2e3f0r0, c0000): DISCOVER never
-            // reached the sink. 0.10.16 removed this re-issue while fixing
-            // the log16 heap corruption, but the corruption was the leaked
-            // event-7 buffers, not a duplicate 2-byte command. COMPLETE
-            // carries the authoritative CID at +108 - use it and send once.
-            // A duplicate DISCOVER is harmless: the extra accept arrives
-            // while PHASE is PH_GETCAP and falls through the match.
-            if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
-                && RESPONSES.load(Ordering::Relaxed) == 0
-                && DISCOVER_SENT.load(Ordering::Relaxed) < 2
-            {
-                if cid != 0 {
-                    CID.store(cid, Ordering::Relaxed);
+            if remote != 0 {
+                TX_CID.store(remote, Ordering::Relaxed);
+                // First send point with a routable destination. DISCOVER_SENT
+                // guards against a stray second completion.
+                if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
+                    && RESPONSES.load(Ordering::Relaxed) == 0
+                    && DISCOVER_SENT.load(Ordering::Relaxed) == 0
+                {
+                    DISCOVER_SENT.store(1, Ordering::Relaxed);
+                    send_discover();
                 }
-                DISCOVER_SENT.fetch_add(1, Ordering::Relaxed);
-                send_discover();
             }
         }
         7 => {

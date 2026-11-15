@@ -47,6 +47,10 @@ const SBC_MEDIA_HEADER: u8 = 0x60 | FRAMES_PER_PACKET as u8;
 const SIG_START: u8 = 0x07;
 
 pub static MEDIA_CID: AtomicU32 = AtomicU32::new(0);
+/// Remote dcid of the media channel (completion event +110). The stock TX
+/// writes the submitted CID verbatim as the packet destination, so RTP
+/// packets must be submitted with this, never with MEDIA_CID (local scid).
+pub static MEDIA_TX_CID: AtomicU32 = AtomicU32::new(0);
 pub static PACKETS: AtomicU32 = AtomicU32::new(0);
 pub static TICKS: AtomicU32 = AtomicU32::new(0);
 pub static START_SENT: AtomicU32 = AtomicU32::new(0);
@@ -61,6 +65,7 @@ static TIMER_HANDLE: AtomicU32 = AtomicU32::new(0);
 
 pub fn reset() {
     MEDIA_CID.store(0, Ordering::Relaxed);
+    MEDIA_TX_CID.store(0, Ordering::Relaxed);
     PACKETS.store(0, Ordering::Relaxed);
     TICKS.store(0, Ordering::Relaxed);
     START_SENT.store(0, Ordering::Relaxed);
@@ -90,7 +95,7 @@ unsafe fn write_be32(p: *mut u8, v: u32) {
 /// One RTP packet: 12-byte RTP header, 1-byte SBC media header, N SBC frames.
 /// The stock send handler segments an oversized SDU and frees the buffer.
 unsafe fn send_packet() {
-    let cid = MEDIA_CID.load(Ordering::Relaxed) as u16;
+    let cid = MEDIA_TX_CID.load(Ordering::Relaxed) as u16;
     if cid == 0 {
         return;
     }
@@ -116,8 +121,10 @@ unsafe fn send_packet() {
         crate::stream::fill_packet(media);
     }
     let rc = unsafe { bt_l2cap_submit_cid(buffer, cid) };
-    LAST_RC.store(rc, Ordering::Relaxed);
-    if rc == 0 {
+    // Returns the work-queue node pointer, not a status code; nonzero means
+    // the SDU was enqueued for the stock send handler.
+    LAST_RC.store(if rc == 0 { 0 } else { 1 }, Ordering::Relaxed);
+    if rc != 0 {
         PACKETS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -127,7 +134,7 @@ unsafe fn send_packet() {
 pub unsafe extern "C" fn tick(_arg: *mut core::ffi::c_void) {
     TICKS.fetch_add(1, Ordering::Relaxed);
     if PACKETS.load(Ordering::Relaxed) >= MAX_PACKETS
-        || MEDIA_CID.load(Ordering::Relaxed) == 0
+        || MEDIA_TX_CID.load(Ordering::Relaxed) == 0
         || STREAMING.load(Ordering::Relaxed) == 0
     {
         STREAMING.store(0, Ordering::Relaxed);
@@ -189,7 +196,7 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
         2 => {
             let cid = unsafe { core::ptr::read_unaligned(argument.cast::<u16>()) } as u32;
             if cid != 0 {
-                MEDIA_CID.store(cid, Ordering::Relaxed);
+                MEDIA_CID.store(cid, Ordering::Relaxed); // local scid, diagnostics only
             }
             // Try on CONFIRM too: the media channel may never emit a separate
             // COMPLETE. A duplicate START is harmless - the sink rejects the
@@ -201,10 +208,16 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
             }
         }
         3 => {
+            // Completion event: +108 = local scid, +110 = remote dcid.
             let cid =
                 unsafe { core::ptr::read_unaligned(argument.add(108).cast::<u16>()) } as u32;
             if cid != 0 {
                 MEDIA_CID.store(cid, Ordering::Relaxed);
+            }
+            let remote =
+                unsafe { core::ptr::read_unaligned(argument.add(110).cast::<u16>()) } as u32;
+            if remote != 0 {
+                MEDIA_TX_CID.store(remote, Ordering::Relaxed);
             }
             if START_ACCEPTED.load(Ordering::Relaxed) == 0
                 && START_SENT.load(Ordering::Relaxed) < 2
