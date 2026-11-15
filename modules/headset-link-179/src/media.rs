@@ -95,7 +95,7 @@ unsafe fn write_be32(p: *mut u8, v: u32) {
 /// One RTP packet: 12-byte RTP header, 1-byte SBC media header, N SBC frames.
 /// The stock send handler segments an oversized SDU and frees the buffer.
 unsafe fn send_packet() {
-    let cid = MEDIA_TX_CID.load(Ordering::Relaxed) as u16;
+    let cid = MEDIA_CID.load(Ordering::Relaxed) as u16;
     if cid == 0 {
         return;
     }
@@ -134,7 +134,7 @@ unsafe fn send_packet() {
 pub unsafe extern "C" fn tick(_arg: *mut core::ffi::c_void) {
     TICKS.fetch_add(1, Ordering::Relaxed);
     if PACKETS.load(Ordering::Relaxed) >= MAX_PACKETS
-        || MEDIA_TX_CID.load(Ordering::Relaxed) == 0
+        || MEDIA_CID.load(Ordering::Relaxed) == 0
         || STREAMING.load(Ordering::Relaxed) == 0
     {
         STREAMING.store(0, Ordering::Relaxed);
@@ -218,6 +218,12 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
                 unsafe { core::ptr::read_unaligned(argument.add(110).cast::<u16>()) } as u32;
             if remote != 0 {
                 MEDIA_TX_CID.store(remote, Ordering::Relaxed);
+            }
+            // Same fix as the signalling channel: the stock outgoing path
+            // never configures, so the sink's media channel would sit in
+            // CONFIG and drop every RTP packet.
+            if cid != 0 {
+                unsafe { crate::avdtp::send_l2cap_config_request(cid as u16) };
             }
             if START_ACCEPTED.load(Ordering::Relaxed) == 0
                 && START_SENT.load(Ordering::Relaxed) < 2

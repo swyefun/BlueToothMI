@@ -29,12 +29,24 @@
 //!   event with +108 = local scid (channel+116) and +110 = remote dcid
 //!   (channel+118), sets the channel READY (+120 = 9, flushing SDUs queued
 //!   by the send path) BEFORE invoking the callback.
-//!   TX (sub_C86CC50) does NOT translate CIDs: the CID submitted in the
-//!   buffer is written verbatim as the packet's destination CID. Submitting
-//!   the local scid therefore produces a packet the sink cannot route - it
-//!   is dropped silently, which is exactly why every version up to 0.10.20
-//!   stayed at A2/r0 with zero responses. Commands must be submitted with
-//!   the remote dcid (TX_CID below), never with the local scid.
+//!   TX (sub_C86CC50) DOES translate: the submitted CID is only the lookup
+//!   key against channel+116 (the local scid); the packet's destination-CID
+//!   header field is written from channel+118 (the sink's dcid). Submitting
+//!   anything but the local scid makes the lookup fail and the buffer is
+//!   freed silently - 0.10.21's first attempt did exactly that.
+//!   BUT the sink-side channel never becomes ready on its own: its incoming
+//!   path replies to our connection response, parks the channel in state 8
+//!   and only reaches READY when OUR L2CAP configuration request arrives
+//!   (symmetric to the band's own incoming handler at 0xc86d020, which
+//!   replies and completes on the peer's request). The band's OUTGOING path
+//!   jumps straight to READY(9) at the connection response and its config
+//!   request sender (sub_C871706, state 8 only) is never invoked - so the
+//!   sink holds our channel in CONFIG forever and drops every AVDTP SDU
+//!   silently. That is why every version up to 0.10.21 stayed at A2/r0.
+//!   Fix: at completion (event 3) we call the firmware's config-request
+//!   builder sub_C86C150 ourselves (same call the conf-rsp retry path
+//!   uses), then send DISCOVER immediately and again from a 150 ms timer
+//!   in case the sink drops rather than queues pre-config data.
 //!   Event 7 = received StockBuffer (CID+4, payload = base+4+offset,
 //!   length = total-offset).
 //!
@@ -53,10 +65,11 @@
 //! After OPEN the signalling state machine is frozen: it still recognises a
 //! START accept, but never originates another command SDU.
 
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use canopus_target_private::{
-    bt_buffer_new, bt_free, bt_l2cap_submit_cid, stock_buffer_payload, stock_buffer_payload_mut,
-    StockBuffer,
+    bt_buffer_new, bt_free, bt_l2cap_owner, bt_l2cap_submit_cid, bt_timer_add,
+    stock_buffer_payload, stock_buffer_payload_mut, StockBuffer,
 };
 
 pub const PH_IDLE: u32 = 0;
@@ -67,6 +80,18 @@ pub const PH_SETCFG: u32 = 4;
 pub const PH_OPEN: u32 = 5;
 pub const PH_DONE: u32 = 6;
 pub const PH_REJECT: u32 = 7;
+
+// Runtime-built firmware callables (XOR pattern keeps the ELF verifier from
+// classifying them as flash address constants; same trick as audio_dev.rs):
+//   sub_C86BD28  channel lookup by (link-or-0, local scid) -> channel or NULL
+//   sub_C86C150  builds and sends the L2CAP configuration request (code 4)
+//                for a channel; used by the stack's own conf-rsp retry path.
+const L2CAP_FIND_CH_LO: u32 = 0x0A6B_D29;
+const L2CAP_FIND_CH_HI: u32 = 0x0600_0000;
+const L2CAP_CONF_REQ_LO: u32 = 0x0A6C_151;
+const L2CAP_CONF_REQ_HI: u32 = 0x0600_0000;
+/// One-shot re-send delay for DISCOVER after the configuration request.
+const DISCOVER_RETRY_MS: u32 = 150;
 
 const SIG_DISCOVER: u8 = 0x01;
 const SIG_GET_CAPABILITIES: u8 = 0x02;
@@ -98,9 +123,11 @@ pub static LAST_RC: AtomicI32 = AtomicI32::new(0);
 pub static FREED: AtomicU32 = AtomicU32::new(0);
 
 static LABEL: AtomicU32 = AtomicU32::new(0);
-/// Number of DISCOVER commands issued. CONFIRM may race the final CID, so
-/// COMPLETE re-issues once; cap at 2 to avoid a credit-queue storm.
+/// Number of DISCOVER commands issued: one at completion, one from the
+/// 150 ms retry timer if the sink dropped the pre-config copy.
 static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
+/// Guards double-arming the retry timer (one completion per channel).
+static RETRY_ARMED: AtomicU32 = AtomicU32::new(0);
 pub static SEID: AtomicU32 = AtomicU32::new(0);
 static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 
@@ -115,6 +142,7 @@ pub fn reset() {
     FREED.store(0, Ordering::Relaxed);
     LABEL.store(0, Ordering::Relaxed);
     DISCOVER_SENT.store(0, Ordering::Relaxed);
+    RETRY_ARMED.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
     crate::CAP_WORD.store(0, Ordering::Relaxed);
@@ -124,10 +152,11 @@ pub fn reset() {
 /// SDU itself; a channel that is not OPEN yet queues the buffer and the
 /// credit-queue flush releases it after event 3.
 unsafe fn send(signal: u8, params: &[u8]) -> i32 {
-    // The remote dcid. sub_C86CC50 copies this value verbatim into the
-    // outgoing packet's destination-CID header field, so the local scid in
-    // `CID` is useless here (that was the 0.10.15-0.10.20 bug).
-    let cid = TX_CID.load(Ordering::Relaxed) as u16;
+    // sub_C86CC50 looks the channel up by this value against channel+116
+    // (the LOCAL scid) and writes the destination header from channel+118
+    // (the sink's dcid). The local scid is therefore the ONLY valid lookup
+    // key; TX_CID is diagnostics for the status row.
+    let cid = CID.load(Ordering::Relaxed) as u16;
     if cid == 0 {
         LAST_RC.store(-1, Ordering::Relaxed);
         return -1;
@@ -160,6 +189,44 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
 /// Sends on the signalling CID (used by the media module for AVDTP START).
 pub unsafe fn send_on_signalling(signal: u8, params: &[u8]) -> i32 {
     unsafe { send(signal, params) }
+}
+
+/// Drives the firmware's L2CAP configuration-request builder (sub_C86C150)
+/// for OUR side of an outgoing channel. The stock outgoing path never sends
+/// it (see module notes), so the sink's channel stays in CONFIG and drops
+/// every SDU we submit. Same call the stack's conf-rsp retry path makes:
+/// channel = sub_C86BD28(0, local scid), link = channel+0, mtu = channel+54.
+pub unsafe fn send_l2cap_config_request(local_scid: u16) {
+    if local_scid == 0 {
+        return;
+    }
+    let find_ch: unsafe extern "C" fn(u32, u32) -> *mut u8 =
+        core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
+    let channel = unsafe { find_ch(0, local_scid as u32) };
+    if channel.is_null() {
+        return;
+    }
+    let link = unsafe { *(channel.cast::<u32>()) };
+    if link == 0 {
+        return;
+    }
+    let mtu = unsafe { *(channel.add(54).cast::<u16>()) };
+    let conf_req: unsafe extern "C" fn(*mut u8, *mut u8, u16) =
+        core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
+    unsafe { conf_req(link, channel, mtu) };
+}
+
+/// 150 ms after the configuration request: re-send DISCOVER once in case the
+/// sink dropped the pre-config copy instead of queueing it.
+unsafe extern "C" fn discover_retry(_arg: *mut c_void) {
+    if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
+        && RESPONSES.load(Ordering::Relaxed) == 0
+        && TX_CID.load(Ordering::Relaxed) != 0
+        && DISCOVER_SENT.load(Ordering::Relaxed) < 3
+    {
+        DISCOVER_SENT.fetch_add(1, Ordering::Relaxed);
+        send_discover();
+    }
 }
 
 fn send_discover() {
@@ -312,7 +379,7 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
         }
         3 => {
             // Completion event layout (sub_C86CF54): +108 = local scid,
-            // +110 = remote dcid. Store both; only +110 can be transmitted.
+            // +110 = remote dcid.
             let local = unsafe { core::ptr::read_unaligned(argument.add(108).cast::<u16>()) } as u32;
             let remote = unsafe { core::ptr::read_unaligned(argument.add(110).cast::<u16>()) } as u32;
             if local != 0 {
@@ -320,14 +387,32 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             }
             if remote != 0 {
                 TX_CID.store(remote, Ordering::Relaxed);
-                // First send point with a routable destination. DISCOVER_SENT
-                // guards against a stray second completion.
+                // The stock outgoing path never sends the L2CAP config
+                // request, so the sink's channel sits in CONFIG and drops
+                // our SDUs. Send it ourselves first (harmless if the sink
+                // already configures), then DISCOVER immediately plus one
+                // timer retry for sinks that drop pre-config data.
+                unsafe { send_l2cap_config_request(local as u16) };
                 if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
                     && RESPONSES.load(Ordering::Relaxed) == 0
                     && DISCOVER_SENT.load(Ordering::Relaxed) == 0
                 {
                     DISCOVER_SENT.store(1, Ordering::Relaxed);
                     send_discover();
+                }
+                if RETRY_ARMED.swap(1, Ordering::Relaxed) == 0 {
+                    let handle = unsafe {
+                        bt_timer_add(
+                            bt_l2cap_owner(),
+                            DISCOVER_RETRY_MS,
+                            1,
+                            discover_retry as *const () as usize as *mut c_void,
+                            core::ptr::null_mut(),
+                            core::ptr::null(),
+                            1,
+                        )
+                    };
+                    let _ = handle;
                 }
             }
         }
