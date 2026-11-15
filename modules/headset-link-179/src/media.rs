@@ -187,11 +187,17 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
     }
     match event {
         2 => {
-            // CONFIRM only reports the CID. The channel is still in L2CAP
-            // CONFIG here, so sending START now can race the credit queue.
             let cid = unsafe { core::ptr::read_unaligned(argument.cast::<u16>()) } as u32;
             if cid != 0 {
                 MEDIA_CID.store(cid, Ordering::Relaxed);
+            }
+            // Try on CONFIRM too: the media channel may never emit a separate
+            // COMPLETE. A duplicate START is harmless - the sink rejects the
+            // second one and on_signal_data only reacts to accepts.
+            if START_SENT.load(Ordering::Relaxed) == 0 {
+                START_SENT.store(1, Ordering::Relaxed);
+                let seid = crate::avdtp::SEID.load(Ordering::Relaxed);
+                unsafe { crate::avdtp::send_on_signalling(SIG_START, &[(seid << 2) as u8]) };
             }
         }
         3 => {
@@ -200,7 +206,10 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
             if cid != 0 {
                 MEDIA_CID.store(cid, Ordering::Relaxed);
             }
-            if START_SENT.swap(1, Ordering::Relaxed) == 0 {
+            if START_ACCEPTED.load(Ordering::Relaxed) == 0
+                && START_SENT.load(Ordering::Relaxed) < 2
+            {
+                START_SENT.fetch_add(1, Ordering::Relaxed);
                 let seid = crate::avdtp::SEID.load(Ordering::Relaxed);
                 unsafe { crate::avdtp::send_on_signalling(SIG_START, &[(seid << 2) as u8]) };
             }

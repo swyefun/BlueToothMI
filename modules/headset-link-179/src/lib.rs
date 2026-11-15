@@ -1208,6 +1208,13 @@ mod page {
                 m += put_num(&mut buf[m..], crate::avdtp::FREED.load(Ordering::Relaxed) as i32) as usize;
                 m += put_str(&mut buf[m..], "r") as usize;
                 m += put_num(&mut buf[m..], crate::avdtp::RESPONSES.load(Ordering::Relaxed) as i32) as usize;
+                // q<last send rc>c<signalling CID>: -1 means the CID was
+                // still zero when the command was issued; 0 means the SDU
+                // was accepted by the stock send handler.
+                m += put_str(&mut buf[m..], "q") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::LAST_RC.load(Ordering::Relaxed)) as usize;
+                m += put_str(&mut buf[m..], "c") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::CID.load(Ordering::Relaxed) as i32) as usize;
                 return m as u32;
             }
             // Show which firmware profile id was used and the IPC result, so
@@ -1517,7 +1524,7 @@ mod page {
             };
             rc = (ui_obj.navigation_page)(tree, 1, &page as *const UiNavigationPagePropsV1 as *const c_void);
 
-            let mut b_state = [0u8; 16];
+            let mut b_state = [0u8; 24];
             let n_state = state_text(&mut b_state);
             let mut b_err = [0u8; 28];
             let n_err = err_text(&mut b_err);

@@ -80,6 +80,9 @@ pub static LAST_RC: AtomicI32 = AtomicI32::new(0);
 pub static FREED: AtomicU32 = AtomicU32::new(0);
 
 static LABEL: AtomicU32 = AtomicU32::new(0);
+/// Number of DISCOVER commands issued. CONFIRM may race the final CID, so
+/// COMPLETE re-issues once; cap at 2 to avoid a credit-queue storm.
+static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
 pub static SEID: AtomicU32 = AtomicU32::new(0);
 static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 
@@ -92,6 +95,7 @@ pub fn reset() {
     LAST_RC.store(0, Ordering::Relaxed);
     FREED.store(0, Ordering::Relaxed);
     LABEL.store(0, Ordering::Relaxed);
+    DISCOVER_SENT.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
     crate::CAP_WORD.store(0, Ordering::Relaxed);
@@ -103,6 +107,7 @@ pub fn reset() {
 unsafe fn send(signal: u8, params: &[u8]) -> i32 {
     let cid = CID.load(Ordering::Relaxed) as u16;
     if cid == 0 {
+        LAST_RC.store(-1, Ordering::Relaxed);
         return -1;
     }
     let label = (LABEL.fetch_add(1, Ordering::Relaxed) & 0x0F) as u8;
@@ -111,6 +116,7 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
     // 4-byte L2CAP header immediately before the payload (sub_C86CC50).
     let buffer = unsafe { bt_buffer_new(length as u16, 4) };
     if buffer.is_null() {
+        LAST_RC.store(-2, Ordering::Relaxed);
         return -2;
     }
     let payload = unsafe { stock_buffer_payload_mut(buffer) };
@@ -274,9 +280,13 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             }
             if PHASE.load(Ordering::Relaxed) == PH_CONNECTING {
                 PHASE.store(PH_DISCOVER, Ordering::Relaxed);
-                // The channel may still be CONFIG state; the stock send
-                // handler queues this SDU and flushes it on event 3.
-                send_discover();
+                // CONFIRM can arrive before request+0 holds the final CID.
+                // send() drops a zero CID silently, so only try when it is
+                // real; COMPLETE below is the reliable path.
+                if CID.load(Ordering::Relaxed) != 0 && DISCOVER_SENT.load(Ordering::Relaxed) == 0 {
+                    DISCOVER_SENT.store(1, Ordering::Relaxed);
+                    send_discover();
+                }
             }
         }
         3 => {
@@ -285,9 +295,23 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             if cid != 0 && (known == 0 || cid == known) {
                 CID.store(cid, Ordering::Relaxed);
             }
-            // No re-issue here: event 2 already queued DISCOVER and the stock
-            // handler flushes it on COMPLETE. A second SDU from inside the
-            // callback races the credit queue (see log16 heap corruption).
+            // Device evidence (status row A2e3f0r0, c0000): DISCOVER never
+            // reached the sink. 0.10.16 removed this re-issue while fixing
+            // the log16 heap corruption, but the corruption was the leaked
+            // event-7 buffers, not a duplicate 2-byte command. COMPLETE
+            // carries the authoritative CID at +108 - use it and send once.
+            // A duplicate DISCOVER is harmless: the extra accept arrives
+            // while PHASE is PH_GETCAP and falls through the match.
+            if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
+                && RESPONSES.load(Ordering::Relaxed) == 0
+                && DISCOVER_SENT.load(Ordering::Relaxed) < 2
+            {
+                if cid != 0 {
+                    CID.store(cid, Ordering::Relaxed);
+                }
+                DISCOVER_SENT.fetch_add(1, Ordering::Relaxed);
+                send_discover();
+            }
         }
         7 => {
             unsafe { handle_data(argument) };
