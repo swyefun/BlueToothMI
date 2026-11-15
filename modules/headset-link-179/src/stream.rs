@@ -30,7 +30,9 @@
 //!
 //! A trivial non-blocking lock guards the ring: UI callbacks and Bluelet
 //! callbacks run on different threads. A failed try_lock is harmless - the
-//! caller just gets silence frames for that one packet.
+//! caller just gets silence frames for that one packet. State initialisation
+//! is lazy: the first pump()/fill_packet() builds the decoder and encoder,
+//! so no caller has to go through a2dp_connect() first.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -223,6 +225,13 @@ pub fn pump(slices: u32) {
     PUMPS.fetch_add(1, Ordering::Relaxed);
     let st = unsafe { &mut *STATE.0.get() };
     if !st.ready {
+        // First use may be the UI "decode one slice" button, which has never
+        // gone through a2dp_connect(). Initialise here instead of returning
+        // zeros - 0.10.19 only called reset() from the connect path, so the
+        // button showed d0f0z0b0k0x0e0 until a connection was attempted.
+        init_locked(st);
+    }
+    if !st.ready {
         unlock();
         return;
     }
@@ -261,6 +270,9 @@ pub fn fill_packet(dst: &mut [u8]) {
         return;
     }
     let st = unsafe { &mut *STATE.0.get() };
+    if !st.ready {
+        init_locked(st);
+    }
     if st.ready && st.count < LOW_WATER {
         if st.pcm_len < st.frame_samples {
             fill_pcm(st);
@@ -283,12 +295,7 @@ pub fn fill_packet(dst: &mut [u8]) {
     unlock();
 }
 
-/// Resets the pipeline for a fresh A2DP connection. Cheap: de-nibbles the
-/// 8 KiB sample and encodes ONE silence frame; no bulk decoding here.
-pub fn reset() {
-    if !try_lock() {
-        return;
-    }
+fn clear_counters() {
     DECODED.store(0, Ordering::Relaxed);
     SAMPLES.store(0, Ordering::Relaxed);
     SBC_FRAMES.store(0, Ordering::Relaxed);
@@ -297,8 +304,13 @@ pub fn reset() {
     SBC_OK.store(0, Ordering::Relaxed);
     SBC_SYNC.store(0, Ordering::Relaxed);
     LAST_ERR.store(0, Ordering::Relaxed);
+}
 
-    let st = unsafe { &mut *STATE.0.get() };
+/// Initialises `State` while the caller already holds LOCK. Cheap: de-nibbles
+/// the 8 KiB sample, builds the decoder/encoder and encodes ONE silence
+/// frame. No bulk decoding, so it is safe from a UI callback or a firmware
+/// callback. `st.ready` is false on any failure and LAST_ERR says why.
+fn init_locked(st: &mut State) {
     denibble(st);
     st.mp3_pos = 0;
     st.pcm_pos = 0;
@@ -316,7 +328,6 @@ pub fn reset() {
         || st.frame_samples > MAX_SAMPLES_PER_FRAME
     {
         LAST_ERR.store(-2, Ordering::Relaxed);
-        unlock();
         return;
     }
     st.dec.write(RawDecoder::new());
@@ -326,7 +337,6 @@ pub fn reset() {
         }
         Err(_) => {
             LAST_ERR.store(-1, Ordering::Relaxed);
-            unlock();
             return;
         }
     }
@@ -344,11 +354,21 @@ pub fn reset() {
     st.pcm_pos = 0;
     st.pcm_len = 0;
     st.ready = true;
+}
+
+/// Resets the pipeline for a fresh A2DP connection.
+pub fn reset() {
+    if !try_lock() {
+        return;
+    }
+    clear_counters();
+    let st = unsafe { &mut *STATE.0.get() };
+    init_locked(st);
     unlock();
 }
 
-/// UI helper: decode exactly one slice. Kept so the "one tap" latency can be
-/// compared against 0.10.18, which decoded the whole clip in one tap.
+/// UI helper: decode exactly one slice. Self-initialising, so tapping it
+/// straight after installing the module is a valid test.
 pub fn step_once() {
     pump(1);
 }
