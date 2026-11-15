@@ -757,14 +757,42 @@ mod device {
     /// The cmd45/46 list carries OTA-reversed addresses (same byte order as
     /// the slot-9 callback); PEER and every adapter IPC use display order, so
     /// each entry is reversed first. Returns true when PEER was set.
+    /// Queries the peer's COD trying BOTH byte orders. The records lookup is
+    /// a raw memcmp (sub_C466678) with no normalization, and the bond list's
+    /// storage order is not documented - so calibrate per device: return the
+    /// first order that resolves a record, and report which one worked via
+    /// `worked_reversed`. PEER must end up in the records-accepted order,
+    /// since the profile-connect work resolves records with the same bytes.
+    fn cod_both_orders(addr: [u8; 6], worked_reversed: &mut bool) -> u32 {
+        let cod = unsafe { bt_get_bond_state(addr.as_ptr()) } as u32;
+        if cod != 0 {
+            *worked_reversed = false;
+            return cod;
+        }
+        let mut flip = addr;
+        flip.reverse();
+        let cod = unsafe { bt_get_bond_state(flip.as_ptr()) } as u32;
+        if cod != 0 {
+            *worked_reversed = true;
+            return cod;
+        }
+        0
+    }
+
     pub fn restore_peer() -> bool {
         let mut addrs = [[0u8; 6]; 16];
         let count = bonded_list(&mut addrs);
         let mut fallback: Option<[u8; 6]> = None;
         for i in 0..count {
+            let mut reversed = false;
+            let cod = cod_both_orders(addrs[i], &mut reversed);
+            if cod == 0 {
+                continue; // no record under either order - skip
+            }
             let mut addr = addrs[i];
-            addr.reverse();
-            let cod = unsafe { bt_get_bond_state(addr.as_ptr()) } as u32;
+            if reversed {
+                addr.reverse();
+            }
             let major = (cod >> 8) & 0x1F;
             if major == 4 {
                 for (j, b) in addr.iter().enumerate() {
