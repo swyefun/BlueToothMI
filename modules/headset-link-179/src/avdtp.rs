@@ -91,7 +91,7 @@ pub const PH_REJECT: u32 = 7;
 //                for a channel; used by the stack's own conf-rsp retry path.
 const L2CAP_FIND_CH_LO: u32 = 0x0A86_BD29;
 const L2CAP_FIND_CH_HI: u32 = 0x0600_0000;
-const L2CAP_CONF_REQ_LO: u32 = 0x0A6C_151;
+const L2CAP_CONF_REQ_LO: u32 = 0x0A86_C151;
 const L2CAP_CONF_REQ_HI: u32 = 0x0600_0000;
 /// One-shot re-send delay for DISCOVER after the configuration request.
 const DISCOVER_RETRY_MS: u32 = 150;
