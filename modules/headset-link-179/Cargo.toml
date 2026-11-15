@@ -24,11 +24,14 @@ canopus-runtime = { path = "../../sdk/rust/canopus-runtime" }
 canopus-target-private = { path = "../../sdk/rust/canopus-target-private", optional = true, default-features = false }
 
 # MP3 soft-decode (minimp3) + SBC encode dependency probe.
+# rmp3 is vendored: upstream depends on libc 0.2 for c_int / c_uchar, which
+# that crate does not export for thumbv8m.main-none-eabi. The vendored copy
+# shims those two types with core::ffi (see vendor/rmp3/src/ffi.rs).
 # rmp3's default `simd` feature must stay OFF: its build.rs only defines
 # MINIMP3_NO_SIMD when the feature is absent, and Cortex-M33 has no NEON.
 # `canopus build` already injects CC/AR/CFLAGS for thumbv8m.main-none-eabi
 # (cli/canopus/src/project.rs), so minimp3.c cross-compiles with clang.
-rmp3 = { version = "0.3.1", default-features = false }
+rmp3 = { path = "vendor/rmp3", default-features = false }
 nanoaudio-sbc = { version = "0.1.1", default-features = false }
 nanoaudio-core = { version = "0.1.1", default-features = false }
 
