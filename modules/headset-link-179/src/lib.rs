@@ -67,8 +67,10 @@ mod audio_dev;
 mod avdtp;
 #[cfg(feature = "device")]
 mod media;
-/// MP3 decode + SBC encode dependency probe; no Bluetooth data-plane access.
-mod probe;
+/// Sliced MP3 -> PCM -> SBC streaming pipeline feeding the AVDTP media
+/// channel. Verified on-device by 0.10.18's dependency probe; 0.10.19 makes
+/// it the real audio source and removes the synchronous full-clip decode.
+mod stream;
 
 use canopus_abi::{ABI_MAJOR, ABI_MINOR, ContextV1, ModuleDescriptorV1, StatusWriterV1};
 use canopus_runtime::{status_put_u32, status_writer_publish};
@@ -112,7 +114,7 @@ pub const CMD_CONNECT_ACL: u32 = 11;
 /// Originates the AVDTP signalling channel and drives DISCOVER ->
 /// GET_CAPABILITIES -> SET_CONFIGURATION -> OPEN (see `avdtp`).
 pub const CMD_A2DP_CONNECT: u32 = 12;
-/// Runs the offline MP3->PCM->SBC probe (see `probe`). No firmware calls.
+/// Decodes ONE MP3-frame-sized slice (see `stream`). No firmware calls.
 pub const CMD_MP3_PROBE: u32 = 13;
 
 // Service error codes from sdk/c/canopus_services.h; E_IDENTITY is local.
@@ -150,7 +152,11 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v34";
+const BUILD_TAG: &str = "v35";
+/// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
+/// on the audio-pipeline row. Declared at crate root so the page module can
+/// read it in host builds where the `device` feature is off.
+pub static CAP_WORD: AtomicU32 = AtomicU32::new(0);
 /// IDA: the firmware's own headset_connect bridge (sub_C719878) accepts an
 /// explicit profile_id 0..3 (atoi + CMP #3), while 255 is the "all profiles"
 /// default. On the server, cmd62 case 39 -> sub_C471404: the non-255 branch
@@ -416,7 +422,7 @@ mod device {
             CMD_CONNECT_ACL => device::connect_profiles(),
             CMD_A2DP_CONNECT => device::a2dp_connect(),
             CMD_MP3_PROBE => {
-                crate::probe::run();
+                crate::stream::step_once();
                 0
             }
             CMD_TEARDOWN => teardown(false),
@@ -884,6 +890,10 @@ mod device {
         }
         crate::avdtp::reset();
         crate::media::reset();
+        // Cheap: de-nibbles the sample and encodes one silence frame. No
+        // bulk decoding in the UI callback - slices come later from the
+        // signalling round trips and the media timer.
+        crate::stream::reset();
         let rc = unsafe { queue_connect(configure_avdtp_connect_request, &addr, &AVDTP_NODE, signalling_cb()) };
         if rc != 0 {
             return fail(rc, 0);
@@ -1335,22 +1345,35 @@ mod page {
     }
 
     /// d<mp3 frames>s<pcm samples>b<sbc frame len>k<encode ok>x<syncword>e<err>
+    /// d<mp3 frames>f<sbc frames>z<silence>b<frame len>k<encode ok>
+    /// x<syncword>e<err>c<peer capability low 16 bits, hex>
     fn probe_text(buf: &mut [u8]) -> u32 {
-        if crate::probe::RAN.load(Ordering::Relaxed) == 0 {
+        if crate::stream::PUMPS.load(Ordering::Relaxed) == 0 {
             return put_str(buf, "待运行");
         }
         let mut n = put_str(buf, "d") as usize;
-        n += put_num(&mut buf[n..], crate::probe::FRAMES.load(Ordering::Relaxed) as i32) as usize;
-        n += put_str(&mut buf[n..], "s") as usize;
-        n += put_num(&mut buf[n..], crate::probe::SAMPLES.load(Ordering::Relaxed) as i32) as usize;
+        n += put_num(&mut buf[n..], crate::stream::DECODED.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "f") as usize;
+        n += put_num(&mut buf[n..], crate::stream::SBC_FRAMES.load(Ordering::Relaxed) as i32) as usize;
+        n += put_str(&mut buf[n..], "z") as usize;
+        n += put_num(&mut buf[n..], crate::stream::SILENCE.load(Ordering::Relaxed) as i32) as usize;
         n += put_str(&mut buf[n..], "b") as usize;
-        n += put_num(&mut buf[n..], crate::probe::SBC_FRAME_LEN.load(Ordering::Relaxed) as i32) as usize;
+        n += put_num(&mut buf[n..], crate::stream::MEASURED_FRAME_LEN.load(Ordering::Relaxed) as i32) as usize;
         n += put_str(&mut buf[n..], "k") as usize;
-        n += put_num(&mut buf[n..], crate::probe::SBC_OK.load(Ordering::Relaxed) as i32) as usize;
+        n += put_num(&mut buf[n..], crate::stream::SBC_OK.load(Ordering::Relaxed) as i32) as usize;
         n += put_str(&mut buf[n..], "x") as usize;
-        n += put_num(&mut buf[n..], crate::probe::SBC_SYNC.load(Ordering::Relaxed) as i32) as usize;
+        n += put_num(&mut buf[n..], crate::stream::SBC_SYNC.load(Ordering::Relaxed) as i32) as usize;
         n += put_str(&mut buf[n..], "e") as usize;
-        n += put_num(&mut buf[n..], crate::probe::LAST_ERR.load(Ordering::Relaxed)) as usize;
+        n += put_num(&mut buf[n..], crate::stream::LAST_ERR.load(Ordering::Relaxed)) as usize;
+        let cap = crate::CAP_WORD.load(Ordering::Relaxed);
+        n += put_str(&mut buf[n..], "c") as usize;
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        if n + 4 <= buf.len() {
+            for shift in [12, 8, 4, 0] {
+                buf[n] = HEX[((cap >> shift) & 0xF) as usize];
+                n += 1;
+            }
+        }
         n as u32
     }
 
@@ -1544,7 +1567,7 @@ mod page {
                 rc = status_row(ui_obj, tree, 7, "扫描结果", &b_found[..n_found as usize]);
             }
             if rc == UI_OK {
-                rc = status_row(ui_obj, tree, 26, "MP3 探针", &b_probe[..n_probe as usize]);
+                rc = status_row(ui_obj, tree, 26, "音频流水线", &b_probe[..n_probe as usize]);
             }
             for i in 0..shown {
                 if rc != UI_OK {
@@ -1597,7 +1620,7 @@ mod page {
                 rc = action_row(ui_obj, tree, 24, "ACL 连接(旧)", "cmd62 profile 轮换诊断", EV_CONNECT_ACL);
             }
             if rc == UI_OK {
-                rc = action_row(ui_obj, tree, 27, "MP3 探针", "解码内置 MP3 并编码一帧 SBC，看探针行", EV_PROBE);
+                rc = action_row(ui_obj, tree, 27, "解码一片", "只解一帧 MP3，验证分片不卡；看音频流水线行", EV_PROBE);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);

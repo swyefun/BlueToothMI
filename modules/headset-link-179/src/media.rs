@@ -1,19 +1,24 @@
-//! Minimal AVDTP media transport (phase-1 test tone).
+//! AVDTP media transport (0.10.19): on-device MP3 -> PCM -> SBC -> RTP.
 //!
-//! This deliberately does NOT decode MP3 and does NOT encode SBC on device.
-//! A short 1 kHz tone was encoded on the host with ffmpeg's SBC encoder
-//! (44.1 kHz, stereo, 16 blocks, 8 subbands, loudness, bitpool 36 -> 156-byte
-//! frames) and is compiled in as `tone.sbc`. Every `0x0C` byte in that data
-//! was nudged to `0x0D` so no 4-byte window can look like a firmware address
-//! to the CAN-P1-011 ELF verifier (target range 0x0C000000..0x0CD00000).
-//! The change is a 1-LSB difference in eight audio bytes; inaudible.
+//! 0.10.17 shipped host-pre-encoded frames (stereo / bitpool 36, 156 bytes,
+//! 793-byte packets) which did NOT match the config NPU selected in the phone
+//! logcat (`21 15 02 35`, joint stereo / bitpool 53, 119-byte frames) and
+//! exceeded its 656-byte stream MTU. Those frames are gone. `stream` now
+//! encodes on device with `SbcParameters::HIGH_QUALITY`, which is exactly the
+//! negotiated configuration, so 5 frames + 13-byte RTP header = 608 bytes.
 //!
-//! Flow: after AVDTP OPEN, `begin()` queues a SECOND L2CAP channel on PSM
-//! 0x19 (the media/transport channel). On its CONFIRM we send AVDTP START
-//! on the signalling channel, and on the START accept `start_streaming()`
-//! arms a one-shot bt_timer that sends one RTP packet per tick and re-arms
-//! itself. Streaming stops after MAX_PACKETS so a timer bug cannot run
-//! forever.
+//! Flow: after AVDTP OPEN, `device::open_media_channel()` queues a SECOND
+//! L2CAP channel on PSM 0x19. On its COMPLETE (not CONFIRM - the channel is
+//! still in CONFIG at CONFIRM) we send AVDTP START on the signalling channel;
+//! the START accept arms a one-shot bt_timer that emits one RTP packet per
+//! tick and re-arms itself. The phone logcat confirms 640 samples per packet
+//! (5 x 128) and RTP payload type 0x60.
+//!
+//! IDA: `sub_C869720` calls the firmware's bt_timer_add with event = 1
+//! (owner, 10*flush_timeout, 1, callback, 0, 1). 0.10.17 used 3.
+//! When MP3 data runs out, `stream` substitutes a pre-encoded silence SBC
+//! frame; the link is never idle, which avoids the local reason-0x16
+//! disconnect seen in device log 15.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
@@ -22,17 +27,18 @@ use canopus_target_private::{
     stock_buffer_payload_mut,
 };
 
-const SBC_FRAME_LEN: usize = 156;
-const FRAMES_PER_PACKET: usize = 5;
-const SAMPLES_PER_PACKET: u32 = (FRAMES_PER_PACKET * 128) as u32;
+const SBC_FRAME_LEN: usize = crate::stream::SBC_FRAME_LEN; // 119
+const FRAMES_PER_PACKET: usize = crate::stream::FRAMES_PER_PACKET; // 5
+const SAMPLES_PER_PACKET: u32 = (FRAMES_PER_PACKET * 128) as u32; // 640
+/// 13 + 5*119 = 608 bytes, under the NPU's 656-byte stream MTU.
 const PACKET_LEN: usize = 13 + FRAMES_PER_PACKET * SBC_FRAME_LEN;
-const TONE: &[u8] = include_bytes!("tone.sbc");
-const TONE_FRAMES: usize = TONE.len() / SBC_FRAME_LEN;
-/// 200 packets * 14.5 ms ~= 2.9 s of tone. Bounded so a stray timer cannot
-/// spin indefinitely (the .179 heap assert in log 16 is a fresh memory).
-const MAX_PACKETS: u32 = 200;
+/// 3 s of MP3 at 640 samples/packet needs ~207 packets. Bounded so a stray
+/// timer cannot spin indefinitely.
+const MAX_PACKETS: u32 = 240;
+/// 640 samples / 44100 Hz = 14.5 ms of audio per packet.
 const TIMER_MS: u32 = 15;
-const TIMER_EVENT: u8 = 3;
+/// Firmware-native timer event (sub_C869720 passes 1), not 3.
+const TIMER_EVENT: u8 = 1;
 const TIMER_FLAGS: u32 = 1;
 const THUMB: u32 = 1;
 /// SBC media payload header: F=0, S=1, L=1, 5 frames. If the sink stays
@@ -49,7 +55,6 @@ pub static STREAMING: AtomicU32 = AtomicU32::new(0);
 pub static LAST_EVENT: AtomicU32 = AtomicU32::new(0);
 pub static LAST_RC: AtomicI32 = AtomicI32::new(0);
 
-static FRAME_POS: AtomicU32 = AtomicU32::new(0);
 static SEQ: AtomicU32 = AtomicU32::new(0);
 static TIMESTAMP: AtomicU32 = AtomicU32::new(0);
 static TIMER_HANDLE: AtomicU32 = AtomicU32::new(0);
@@ -63,7 +68,6 @@ pub fn reset() {
     STREAMING.store(0, Ordering::Relaxed);
     LAST_EVENT.store(0, Ordering::Relaxed);
     LAST_RC.store(0, Ordering::Relaxed);
-    FRAME_POS.store(0, Ordering::Relaxed);
     SEQ.store(0, Ordering::Relaxed);
     TIMESTAMP.store(0, Ordering::Relaxed);
     TIMER_HANDLE.store(0, Ordering::Relaxed);
@@ -106,15 +110,10 @@ unsafe fn send_packet() {
         write_be32(p.add(4), ts);
         write_be32(p.add(8), 1); // SSRC
         *p.add(12) = SBC_MEDIA_HEADER;
-        for k in 0..FRAMES_PER_PACKET {
-            let idx = (FRAME_POS.fetch_add(1, Ordering::Relaxed) as usize % TONE_FRAMES)
-                * SBC_FRAME_LEN;
-            core::ptr::copy_nonoverlapping(
-                TONE.as_ptr().add(idx),
-                p.add(13 + k * SBC_FRAME_LEN),
-                SBC_FRAME_LEN,
-            );
-        }
+        let media = core::slice::from_raw_parts_mut(p.add(13), PACKET_LEN - 13);
+        // Fills 5 SBC frames. Decoding is sliced: at most one MP3 frame per
+        // call, and a failed lock yields silence frames rather than blocking.
+        crate::stream::fill_packet(media);
     }
     let rc = unsafe { bt_l2cap_submit_cid(buffer, cid) };
     LAST_RC.store(rc, Ordering::Relaxed);
@@ -188,13 +187,11 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
     }
     match event {
         2 => {
+            // CONFIRM only reports the CID. The channel is still in L2CAP
+            // CONFIG here, so sending START now can race the credit queue.
             let cid = unsafe { core::ptr::read_unaligned(argument.cast::<u16>()) } as u32;
             if cid != 0 {
                 MEDIA_CID.store(cid, Ordering::Relaxed);
-            }
-            if START_SENT.swap(1, Ordering::Relaxed) == 0 {
-                let seid = crate::avdtp::SEID.load(Ordering::Relaxed);
-                unsafe { crate::avdtp::send_on_signalling(SIG_START, &[(seid << 2) as u8]) };
             }
         }
         3 => {
@@ -202,6 +199,10 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
                 unsafe { core::ptr::read_unaligned(argument.add(108).cast::<u16>()) } as u32;
             if cid != 0 {
                 MEDIA_CID.store(cid, Ordering::Relaxed);
+            }
+            if START_SENT.swap(1, Ordering::Relaxed) == 0 {
+                let seid = crate::avdtp::SEID.load(Ordering::Relaxed);
+                unsafe { crate::avdtp::send_on_signalling(SIG_START, &[(seid << 2) as u8]) };
             }
         }
         7 => unsafe { bt_free(argument.cast()) },

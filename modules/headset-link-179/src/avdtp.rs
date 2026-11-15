@@ -10,9 +10,10 @@
 //!   -> SET_CONFIGURATION (SBC) -> OPEN -> STR_OPEN_OK (headset announces
 //!   "connected").
 //!
-//! This module implements exactly that initiator side, without SDP (the
-//! SEIDs come from AVDTP DISCOVER itself), without an audio source and
-//! without SBC encoding: OPEN is the terminal state.
+//! This module implements that initiator side without SDP (the SEIDs come
+//! from AVDTP DISCOVER itself). Since 0.10.19, OPEN is followed by a second
+//! PSM 0x19 media channel, AVDTP START and RTP/SBC media packets produced by
+//! `stream` (on-device MP3 decode + SBC encode).
 //!
 //! ABI (docs/band11-bluetooth-139.md §"关键 ABI 修正", NOTES-ida-179.md §3):
 //!   bt_l2cap_connect queues a 68-byte request; its handler finds/creates the
@@ -34,8 +35,9 @@
 //!   connect request either, but the same request may be delivered more than
 //!   once; keep those unverified and accept the small one-shot leak.
 //! - sub_C86CC50 (stock send handler) already bt_free's every submitted SDU.
-//! Control payloads (2/3/6/13) stay unfreed; only event 7 is released, and
-//! after OPEN the state machine is frozen so no further SDU is originated.
+//! Control payloads (2/3/6/13) stay unfreed; only event 7 is released.
+//! After OPEN the signalling state machine is frozen: it still recognises a
+//! START accept, but never originates another command SDU.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use canopus_target_private::{
@@ -57,12 +59,15 @@ const SIG_GET_CAPABILITIES: u8 = 0x02;
 const SIG_SET_CONFIGURATION: u8 = 0x03;
 const SIG_OPEN: u8 = 0x06;
 
-/// SBC configuration used by the phase-1 test tone, pre-encoded on the host
-/// with ffmpeg: 44.1 kHz / stereo, 16 blocks, 8 subbands, loudness,
-/// min bitpool 2 / max bitpool 36 (156-byte frames). Kept fixed rather than
-/// echoing GET_CAPABILITIES: a capabilities bitmap is NOT a selected config,
-/// and the precomputed frames must match exactly what we negotiate.
-const DEFAULT_SBC: u32 = u32::from_le_bytes([0x22, 0x15, 0x02, 0x24]);
+/// Exactly the configuration the NPU selected in the phone logcat:
+/// `codec_arry[3..6] = 21 15 02 35` (44.1 kHz, joint stereo / channel mode 3,
+/// 16 blocks, 8 subbands, loudness, bitpool 2..53, 328 kbps). The on-device
+/// encoder uses `SbcParameters::HIGH_QUALITY`, which is the same parameter
+/// set and produces 119-byte frames. Keeping this fixed (rather than echoing
+/// the peer's capability bitmap) guarantees the negotiated config and the
+/// actual media frames agree - 0.10.17 shipped pre-encoded stereo/bitpool-36
+/// frames and the sink stayed silent.
+const DEFAULT_SBC: u32 = u32::from_le_bytes([0x21, 0x15, 0x02, 0x35]);
 
 pub static PHASE: AtomicU32 = AtomicU32::new(PH_IDLE);
 pub static CID: AtomicU32 = AtomicU32::new(0);
@@ -89,6 +94,7 @@ pub fn reset() {
     LABEL.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
+    crate::CAP_WORD.store(0, Ordering::Relaxed);
 }
 
 /// Sends one single-packet AVDTP command. The stock send handler segments the
@@ -169,11 +175,17 @@ unsafe fn parse_capabilities(data: *const u8, length: usize) {
             break;
         }
         if category == 0x02 && losc >= 6 {
-            // Media codec capability. Do NOT copy this bitmap into SBC_CFG:
-            // the phase-1 frames are precomputed for DEFAULT_SBC and an
-            // advertised capability set is not a selected configuration.
-            // Re-enable a codec choice here when real MP3 decoding lands.
-            let _codec = unsafe { *data.add(offset + 3) };
+            // Record the advertised SBC capability for diagnostics. Do NOT
+            // copy it into SBC_CFG: a capability set is not a selected
+            // configuration, and the on-device encoder is fixed to
+            // HIGH_QUALITY (which matches DEFAULT_SBC above).
+            let bytes = [
+                unsafe { *data.add(offset + 2) },
+                unsafe { *data.add(offset + 3) },
+                unsafe { *data.add(offset + 4) },
+                unsafe { *data.add(offset + 5) },
+            ];
+            crate::CAP_WORD.store(u32::from_le_bytes(bytes), Ordering::Relaxed);
         }
         offset += 2 + losc;
     }
@@ -283,6 +295,11 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             // and never frees the StockBuffer -> ownership is ours.
             unsafe { bt_free(argument.cast()) };
             FREED.fetch_add(1, Ordering::Relaxed);
+            // Decode ONE MP3-frame-sized slice while we are between AVDTP
+            // round trips. This pre-fills the SBC ring before START and keeps
+            // any single firmware callback short (0.10.18's UI probe decoded
+            // all 19 frames at once and visibly hung the page).
+            crate::stream::pump(1);
         }
         6 => {
             PHASE.store(PH_REJECT, Ordering::Relaxed);
