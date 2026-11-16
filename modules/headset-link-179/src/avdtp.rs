@@ -304,6 +304,37 @@ unsafe extern "C" fn discover_retry(_arg: *mut c_void) {
     }
 }
 
+/// One-shot 50 ms timer: sends the NEXT signalling command for the current
+/// phase from the timer context. All AVDTP sends triggered by a response
+/// (event 7) go through here - a submit issued inside the RX callback sits
+/// in the work queue behind the very drain that is executing (0.10.28:
+/// GET_CAP never left the band, sink silent, e8, then idle teardown e6).
+unsafe extern "C" fn signal_kick(_arg: *mut c_void) {
+    let seid = SEID.load(Ordering::Relaxed);
+    match PHASE.load(Ordering::Relaxed) {
+        PH_GETCAP => send_get_capabilities(seid),
+        PH_SETCFG => send_set_configuration(seid),
+        PH_OPEN => send_open(seid),
+        _ => {}
+    }
+}
+
+/// Arms the one-shot signalling kick (50 ms).
+unsafe fn arm_signal_kick() {
+    let handle = unsafe {
+        bt_timer_add(
+            bt_l2cap_owner(),
+            50,
+            1,
+            signal_kick as *const () as usize as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            1,
+        )
+    };
+    let _ = handle;
+}
+
 /// 100 ms after the OPEN accept: queue the media L2CAP channel from the
 /// timer context, never from inside the RX dispatch.
 unsafe extern "C" fn media_open_kick(_arg: *mut c_void) {
@@ -449,17 +480,23 @@ unsafe fn handle_data(buffer: *mut u8) {
                 seid = 1;
             }
             SEID.store(seid, Ordering::Relaxed);
-            send_get_capabilities(seid);
             PHASE.store(PH_GETCAP, Ordering::Relaxed);
+            // Never submit from inside the RX callback. The DISCOVER accept
+            // is processed while the work-queue drain that delivered it is
+            // still active; 0.10.28's GET_CAP submitted from here never
+            // drained (no response, f stayed 1, then e8/e6). The kick timer
+            // sends from the timer context where 0.10.27's DISCOVER submit
+            // demonstrably drained.
+            unsafe { arm_signal_kick() };
         }
         PH_GETCAP if signal == SIG_GET_CAPABILITIES => {
             unsafe { parse_capabilities(payload.add(2), length - 2) };
-            send_set_configuration(SEID.load(Ordering::Relaxed));
             PHASE.store(PH_SETCFG, Ordering::Relaxed);
+            unsafe { arm_signal_kick() };
         }
         PH_SETCFG if signal == SIG_SET_CONFIGURATION => {
-            send_open(SEID.load(Ordering::Relaxed));
             PHASE.store(PH_OPEN, Ordering::Relaxed);
+            unsafe { arm_signal_kick() };
         }
         PH_OPEN if signal == SIG_OPEN => {
             PHASE.store(PH_DONE, Ordering::Relaxed);
@@ -536,14 +573,14 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             // and never frees the StockBuffer -> ownership is ours.
             unsafe { bt_free(argument.cast()) };
             FREED.fetch_add(1, Ordering::Relaxed);
-            // NO heavy work here. 0.10.27 crashed inside the RX dispatch
-            // (UsageFault, bluelet_thread, ~1 s after the ACL came up) while
-            // running the never-before-executed first-response flow; the
-            // crash stack had the RX dispatcher, submit_cid and a work-queue
-            // drain all active at once. Both 0.10.19-era habits are gone:
-            // no MP3 decode inside the RX callback (fill_packet pumps from
-            // the media tick instead) and no channel creation from inside
-            // the OPEN accept (deferred to the media_open_kick timer).
+            // NO heavy work and NO submits here. 0.10.27 crashed inside
+            // the RX dispatch (UsageFault) with the RX dispatcher,
+            // submit_cid and a work-queue drain all active at once; 0.10.28
+            // still submitted GET_CAP from here and it never drained (f
+            // stuck at 1, sink silent, e8, idle teardown). Everything the
+            // response processing wants to SEND is deferred: signalling
+            // commands via arm_signal_kick, the media channel via
+            // media_open_kick, decoding happens in fill_packet only.
         }
         6 => {
             PHASE.store(PH_REJECT, Ordering::Relaxed);
