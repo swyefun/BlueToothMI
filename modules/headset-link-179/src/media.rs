@@ -197,6 +197,9 @@ pub unsafe extern "C" fn on_media_event(event: i32, argument: *mut u8) -> i32 {
             let cid = unsafe { core::ptr::read_unaligned(argument.cast::<u16>()) } as u32;
             if cid != 0 {
                 MEDIA_CID.store(cid, Ordering::Relaxed); // local scid, diagnostics only
+                // Same MTU pre-fill as the signalling channel: the stock
+                // conf-req sender takes its values from channel+52/+54.
+                unsafe { crate::avdtp::prepare_channel_for_config(cid as u16) };
             }
             // Try on CONFIRM too: the media channel may never emit a separate
             // COMPLETE. A duplicate START is harmless - the sink rejects the

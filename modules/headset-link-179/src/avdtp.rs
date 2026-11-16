@@ -202,6 +202,36 @@ pub unsafe fn send_on_signalling(signal: u8, params: &[u8]) -> i32 {
     unsafe { send(signal, params) }
 }
 
+/// Pre-fills the channel's MTU fields BEFORE any config traffic can flow.
+/// The stock paths that transmit OUR config request (sub_C86CFD8 after the
+/// sink's own request, sub_C871706, and our event-3 backup) all take the MTU
+/// parameter from channel+54 and the option VALUE from channel+52 - both 0
+/// on a fresh channel. If the sink's request carries no MTU option, 0x6C
+/// stays 0 and the emitted request carries an invalid MTU=0 option; the sink
+/// rejects it, its channel stays in CONFIG, and every SDU we submit is
+/// dropped - the v39-v41 A2e3f0r0 signature. Storing the stack default 672
+/// in both fields makes C867D04 omit the option entirely (option-less =
+/// accept defaults, valid) or carry whatever valid value the sink
+/// announced. Call at CONFIRM (event 2), when the channel exists but the
+/// connection response has not been processed yet.
+pub unsafe fn prepare_channel_for_config(local_scid: u16) {
+    if local_scid == 0 {
+        return;
+    }
+    let find_ch: unsafe extern "C" fn(u32, u32) -> *mut u8 =
+        core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
+    let channel = unsafe { find_ch(0, local_scid as u32) };
+    if channel.is_null() {
+        return;
+    }
+    if unsafe { *(channel.add(52).cast::<u16>()) } == 0 {
+        unsafe { *(channel.add(52).cast::<u16>()) = 672 };
+    }
+    if unsafe { *(channel.add(54).cast::<u16>()) } == 0 {
+        unsafe { *(channel.add(54).cast::<u16>()) = 672 };
+    }
+}
+
 /// Drives the firmware's L2CAP configuration-request builder (sub_C86C150)
 /// for OUR side of an outgoing channel. The stock outgoing path never sends
 /// it (see module notes), so the sink's channel stays in CONFIG and drops
@@ -420,6 +450,9 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             let cid = unsafe { core::ptr::read_unaligned(argument.cast::<u16>()) } as u32;
             if cid != 0 {
                 CID.store(cid, Ordering::Relaxed);
+                // Pre-fill MTU fields before the connection response can
+                // trigger the config exchange (see prepare_channel_for_config).
+                unsafe { prepare_channel_for_config(cid as u16) };
             }
             if PHASE.load(Ordering::Relaxed) == PH_CONNECTING {
                 PHASE.store(PH_DISCOVER, Ordering::Relaxed);
