@@ -136,6 +136,8 @@ static LABEL: AtomicU32 = AtomicU32::new(0);
 pub static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
 /// Guards double-arming the retry timer (one completion per channel).
 static RETRY_ARMED: AtomicU32 = AtomicU32::new(0);
+/// Set once the OPEN accept deferred the media-channel kick.
+static MEDIA_KICK: AtomicU32 = AtomicU32::new(0);
 /// Config-request diagnostic for the status row:
 /// 0 never ran | 1 sent | 2 skipped (+114 bit2 already set) |
 /// 3 find_ch returned NULL | 4 link pointer zero.
@@ -156,6 +158,7 @@ pub fn reset() {
     DISCOVER_SENT.store(0, Ordering::Relaxed);
     RETRY_ARMED.store(0, Ordering::Relaxed);
     CONF_SENT.store(0, Ordering::Relaxed);
+    MEDIA_KICK.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
     crate::CAP_WORD.store(0, Ordering::Relaxed);
@@ -301,6 +304,30 @@ unsafe extern "C" fn discover_retry(_arg: *mut c_void) {
     }
 }
 
+/// 100 ms after the OPEN accept: queue the media L2CAP channel from the
+/// timer context, never from inside the RX dispatch.
+unsafe extern "C" fn media_open_kick(_arg: *mut c_void) {
+    if PHASE.load(Ordering::Relaxed) == PH_DONE {
+        let _ = crate::device::open_media_channel();
+    }
+}
+
+/// Arms the one-shot media-open kick (100 ms).
+unsafe fn arm_media_open_kick() {
+    let handle = unsafe {
+        bt_timer_add(
+            bt_l2cap_owner(),
+            100,
+            1,
+            media_open_kick as *const () as usize as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            1,
+        )
+    };
+    let _ = handle;
+}
+
 /// Arms the one-shot DISCOVER retry timer (150 ms). Safe to call repeatedly:
 /// each call creates a new one-shot; the DISCOVER_SENT/RESPONSES guards bound
 /// the total to 4 copies.
@@ -437,8 +464,13 @@ unsafe fn handle_data(buffer: *mut u8) {
         PH_OPEN if signal == SIG_OPEN => {
             PHASE.store(PH_DONE, Ordering::Relaxed);
             // AVDTP transport session: a SECOND L2CAP channel on PSM 0x19
-            // carries media. Queue it from here; its callback sends START.
-            let _ = crate::device::open_media_channel();
+            // carries media. Do NOT queue it from inside this RX callback:
+            // bt_l2cap_connect's work item can drain inline while the RX
+            // dispatcher frame is still active (0.10.27's crash shape).
+            // Kick it from a one-shot timer instead.
+            if MEDIA_KICK.swap(1, Ordering::Relaxed) == 0 {
+                unsafe { arm_media_open_kick() };
+            }
         }
         _ => {}
     }
@@ -504,11 +536,14 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             // and never frees the StockBuffer -> ownership is ours.
             unsafe { bt_free(argument.cast()) };
             FREED.fetch_add(1, Ordering::Relaxed);
-            // Decode ONE MP3-frame-sized slice while we are between AVDTP
-            // round trips. This pre-fills the SBC ring before START and keeps
-            // any single firmware callback short (0.10.18's UI probe decoded
-            // all 19 frames at once and visibly hung the page).
-            crate::stream::pump(1);
+            // NO heavy work here. 0.10.27 crashed inside the RX dispatch
+            // (UsageFault, bluelet_thread, ~1 s after the ACL came up) while
+            // running the never-before-executed first-response flow; the
+            // crash stack had the RX dispatcher, submit_cid and a work-queue
+            // drain all active at once. Both 0.10.19-era habits are gone:
+            // no MP3 decode inside the RX callback (fill_packet pumps from
+            // the media tick instead) and no channel creation from inside
+            // the OPEN accept (deferred to the media_open_kick timer).
         }
         6 => {
             PHASE.store(PH_REJECT, Ordering::Relaxed);
