@@ -129,11 +129,15 @@ pub static LAST_RC: AtomicI32 = AtomicI32::new(0);
 pub static FREED: AtomicU32 = AtomicU32::new(0);
 
 static LABEL: AtomicU32 = AtomicU32::new(0);
-/// Number of DISCOVER commands issued: one at completion, one from the
-/// 150 ms retry timer if the sink dropped the pre-config copy.
-static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
+/// Number of DISCOVER commands issued: one at completion, then re-sends
+/// from the self-re-arming 150 ms timer (max 4). Shown on the status row.
+pub static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
 /// Guards double-arming the retry timer (one completion per channel).
 static RETRY_ARMED: AtomicU32 = AtomicU32::new(0);
+/// Config-request diagnostic for the status row:
+/// 0 never ran | 1 sent | 2 skipped (+114 bit2 already set) |
+/// 3 find_ch returned NULL | 4 link pointer zero.
+pub static CONF_SENT: AtomicU32 = AtomicU32::new(0);
 pub static SEID: AtomicU32 = AtomicU32::new(0);
 static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 
@@ -149,6 +153,7 @@ pub fn reset() {
     LABEL.store(0, Ordering::Relaxed);
     DISCOVER_SENT.store(0, Ordering::Relaxed);
     RETRY_ARMED.store(0, Ordering::Relaxed);
+    CONF_SENT.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
     crate::CAP_WORD.store(0, Ordering::Relaxed);
@@ -210,15 +215,18 @@ pub unsafe fn send_l2cap_config_request(local_scid: u16) {
         core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
     let channel = unsafe { find_ch(0, local_scid as u32) };
     if channel.is_null() {
+        CONF_SENT.store(3, Ordering::Relaxed);
         return;
     }
     // C86C150 sets +114 bit2 itself after sending; skip a re-run (event 3 can
     // fire more than once, e.g. again after our own conf response).
     if unsafe { *(channel.add(114).cast::<u16>()) } & 4 != 0 {
+        CONF_SENT.store(2, Ordering::Relaxed);
         return;
     }
     let link = unsafe { *(channel.cast::<u32>()) };
     if link == 0 {
+        CONF_SENT.store(4, Ordering::Relaxed);
         return;
     }
     // sub_C867D04 includes an MTU option iff channel+52 != 672, and
@@ -236,6 +244,7 @@ pub unsafe fn send_l2cap_config_request(local_scid: u16) {
     let conf_req: unsafe extern "C" fn(*mut u8, *mut u8, u16) =
         core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
     unsafe { conf_req(link as usize as *mut u8, channel, mtu) };
+    CONF_SENT.store(1, Ordering::Relaxed);
 }
 
 /// 150 ms cadence: the sink's channel only OPENS after the config exchange

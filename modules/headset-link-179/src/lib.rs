@@ -152,7 +152,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v40";
+const BUILD_TAG: &str = "v41";
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
@@ -1215,6 +1215,11 @@ mod page {
                 m += put_num(&mut buf[m..], crate::avdtp::LAST_RC.load(Ordering::Relaxed)) as usize;
                 m += put_str(&mut buf[m..], "c") as usize;
                 m += put_num(&mut buf[m..], crate::avdtp::TX_CID.load(Ordering::Relaxed) as i32) as usize;
+                // d<DISCOVER copies sent>g<config request outcome>
+                m += put_str(&mut buf[m..], "d") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::DISCOVER_SENT.load(Ordering::Relaxed) as i32) as usize;
+                m += put_str(&mut buf[m..], "g") as usize;
+                m += put_num(&mut buf[m..], crate::avdtp::CONF_SENT.load(Ordering::Relaxed) as i32) as usize;
                 return m as u32;
             }
             // Show which firmware profile id was used and the IPC result, so
@@ -1524,7 +1529,7 @@ mod page {
             };
             rc = (ui_obj.navigation_page)(tree, 1, &page as *const UiNavigationPagePropsV1 as *const c_void);
 
-            let mut b_state = [0u8; 24];
+            let mut b_state = [0u8; 32];
             let n_state = state_text(&mut b_state);
             let mut b_err = [0u8; 28];
             let n_err = err_text(&mut b_err);
