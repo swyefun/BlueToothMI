@@ -99,7 +99,10 @@ unsafe fn send_packet() {
     if cid == 0 {
         return;
     }
-    let buffer = unsafe { bt_buffer_new(PACKET_LEN as u16, 4) };
+    // Headroom 12 (>= 8): see avdtp::send - sub_C86CC50 stamps a fixed
+    // preamble flag at buffer+10 which collided with the L2CAP header's
+    // destination-CID low byte at headroom 4, corrupting every packet.
+    let buffer = unsafe { bt_buffer_new(PACKET_LEN as u16, 12) };
     if buffer.is_null() {
         LAST_RC.store(-2, Ordering::Relaxed);
         return;

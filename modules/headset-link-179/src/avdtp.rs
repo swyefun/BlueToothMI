@@ -34,22 +34,24 @@
 //!   header field is written from channel+118 (the sink's dcid). Submitting
 //!   anything but the local scid makes the lookup fail and the buffer is
 //!   freed silently - 0.10.21's first attempt did exactly that.
-//!   BUT the sink-side channel never becomes ready on its own: its incoming
-//!   path replies to our connection response, parks the channel in state 8
-//!   and only reaches READY when OUR L2CAP configuration request arrives
-//!   (symmetric to the band's own incoming handler at 0xc86d020, which
-//!   replies and completes on the peer's request). The band's OUTGOING path
-//!   jumps straight to READY(9) at the connection response and its config
-//!   request sender (sub_C871706, state 8 only) is never invoked - so the
-//!   sink holds our channel in CONFIG forever and drops every AVDTP SDU
-//!   silently. That is why every version up to 0.10.21 stayed at A2/r0.
-//!   Fix: at completion (event 3) we call the firmware's config-request
-//!   builder sub_C86C150 ourselves (same call the conf-rsp retry path
-//!   uses), first storing the 672 default at channel+52 so the request
-//!   carries NO options (0.10.23 emitted an invalid MTU=0 option from the
-//!   fresh channel's zero and the sink's rejection loop tore the link down
-//!   after ~4 s), then send DISCOVER immediately and re-send it on a
-//!   self-re-arming 150 ms timer (up to 4 copies) until a response arrives.
+//!   Channel config truth (re-verified 0.10.27): sub_C86874C, which the
+//!   connect handler runs for every outgoing channel, sets endpoint-0 MTU
+//!   (channel+52) to the 672 stack default and channel+33 (mode) to 0 - so
+//!   outgoing channels are born fully valid and the stock auto-reply
+//!   (sub_C86CFD8) always emits a legal config request. The earlier MTU=0
+//!   theory (0.10.23-0.10.26) was wrong: +52 is never zero.
+//!   THE ACTUAL r0 ROOT CAUSE (0.10.15..0.10.26): bt_buffer_new headroom.
+//!   sub_C86CC50 stamps a fixed preamble flag 0x81 at buffer+10 AFTER
+//!   writing the 4-byte L2CAP header at [offset, offset+4). Stock buffers
+//!   use headroom 12 (header at +16..20, flag lands in spare bytes); our
+//!   headroom 4 put the header at +8..12, so the stamp overwrote the
+//!   destination-CID low byte - every module-sent packet left the band
+//!   addressed to CID 0x0081 and the sink dropped it silently. Stock-sent
+//!   conn/conf responses (headroom 12) always reached the sink, which is
+//!   why the channel came up but AVDTP never got an answer. Fix: allocate
+//!   TX buffers with headroom 12 in avdtp::send and media::send_packet.
+//!   DISCOVER is sent at completion and re-sent on a self-re-arming
+//!   150 ms timer (up to 4 copies) until a response arrives.
 //!   Event 7 = received StockBuffer (CID+4, payload = base+4+offset,
 //!   length = total-offset).
 //!
@@ -174,9 +176,15 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
     }
     let label = (LABEL.fetch_add(1, Ordering::Relaxed) & 0x0F) as u8;
     let length = 2 + params.len();
-    // headroom 4 leaves slack for the stock send handler, which writes its
-    // 4-byte L2CAP header immediately before the payload (sub_C86CC50).
-    let buffer = unsafe { bt_buffer_new(length as u16, 4) };
+    // Headroom MUST be >= 8 (stock uses 12): sub_C86CC50 writes the 4-byte
+    // L2CAP header at [offset, offset+4) and then stamps its fixed preamble
+    // flag at buffer+10 (0x81). With headroom 4 the header sits at +8..12 and
+    // the stamp overwrote the destination-CID LOW BYTE, so every packet left
+    // the band addressed to CID 0x0081 instead of the sink's dcid - the NPU
+    // dropped them all silently. That was the A2e3f0r0 signature of
+    // 0.10.15..0.10.26 (stock-sent conn/conf responses, allocated with
+    // headroom 12, always reached the sink; module-sent data never did).
+    let buffer = unsafe { bt_buffer_new(length as u16, 12) };
     if buffer.is_null() {
         LAST_RC.store(-2, Ordering::Relaxed);
         return -2;
