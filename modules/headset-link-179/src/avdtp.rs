@@ -45,8 +45,11 @@
 //!   silently. That is why every version up to 0.10.21 stayed at A2/r0.
 //!   Fix: at completion (event 3) we call the firmware's config-request
 //!   builder sub_C86C150 ourselves (same call the conf-rsp retry path
-//!   uses), then send DISCOVER immediately and again from a 150 ms timer
-//!   in case the sink drops rather than queues pre-config data.
+//!   uses), first storing the 672 default at channel+52 so the request
+//!   carries NO options (0.10.23 emitted an invalid MTU=0 option from the
+//!   fresh channel's zero and the sink's rejection loop tore the link down
+//!   after ~4 s), then send DISCOVER immediately and re-send it on a
+//!   self-re-arming 150 ms timer (up to 4 copies) until a response arrives.
 //!   Event 7 = received StockBuffer (CID+4, payload = base+4+offset,
 //!   length = total-offset).
 //!
@@ -209,27 +212,64 @@ pub unsafe fn send_l2cap_config_request(local_scid: u16) {
     if channel.is_null() {
         return;
     }
+    // C86C150 sets +114 bit2 itself after sending; skip a re-run (event 3 can
+    // fire more than once, e.g. again after our own conf response).
+    if unsafe { *(channel.add(114).cast::<u16>()) } & 4 != 0 {
+        return;
+    }
     let link = unsafe { *(channel.cast::<u32>()) };
     if link == 0 {
         return;
     }
-    let mtu = unsafe { *(channel.add(54).cast::<u16>()) };
+    // sub_C867D04 includes an MTU option iff channel+52 != 672, and
+    // sub_C867DE8 copies its VALUE from channel+52 - which is 0 on a fresh
+    // channel. 0.10.23 therefore emitted an MTU=0 option (invalid, spec min
+    // 48); the sink rejects it and the stock conf-rsp retry path re-sends the
+    // same garbage until the RTX timer tears the link down (~4 s, matching
+    // the 19:37:00 -> 19:37:04 disconnect). Storing the stack default 672
+    // suppresses the option entirely: an option-less config request simply
+    // accepts the sink's defaults, which is valid L2CAP.
+    if unsafe { *(channel.add(52).cast::<u16>()) } == 0 {
+        unsafe { *(channel.add(52).cast::<u16>()) = 672 };
+    }
+    let mtu = unsafe { *(channel.add(52).cast::<u16>()) };
     let conf_req: unsafe extern "C" fn(*mut u8, *mut u8, u16) =
         core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
     unsafe { conf_req(link as usize as *mut u8, channel, mtu) };
 }
 
-/// 150 ms after the configuration request: re-send DISCOVER once in case the
-/// sink dropped the pre-config copy instead of queueing it.
+/// 150 ms cadence: the sink's channel only OPENS after the config exchange
+/// completes, so the copies sent at completion may be dropped. Re-arm until
+/// an AVDTP response arrives or 4 copies are out; a one-shot timer that
+/// re-arms itself follows the media timer pattern.
 unsafe extern "C" fn discover_retry(_arg: *mut c_void) {
     if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
         && RESPONSES.load(Ordering::Relaxed) == 0
         && TX_CID.load(Ordering::Relaxed) != 0
-        && DISCOVER_SENT.load(Ordering::Relaxed) < 3
+        && DISCOVER_SENT.load(Ordering::Relaxed) < 4
     {
         DISCOVER_SENT.fetch_add(1, Ordering::Relaxed);
         send_discover();
+        unsafe { arm_discover_retry() };
     }
+}
+
+/// Arms the one-shot DISCOVER retry timer (150 ms). Safe to call repeatedly:
+/// each call creates a new one-shot; the DISCOVER_SENT/RESPONSES guards bound
+/// the total to 4 copies.
+unsafe fn arm_discover_retry() {
+    let handle = unsafe {
+        bt_timer_add(
+            bt_l2cap_owner(),
+            DISCOVER_RETRY_MS,
+            1,
+            discover_retry as *const () as usize as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            1,
+        )
+    };
+    let _ = handle;
 }
 
 fn send_discover() {
@@ -404,18 +444,7 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
                     send_discover();
                 }
                 if RETRY_ARMED.swap(1, Ordering::Relaxed) == 0 {
-                    let handle = unsafe {
-                        bt_timer_add(
-                            bt_l2cap_owner(),
-                            DISCOVER_RETRY_MS,
-                            1,
-                            discover_retry as *const () as usize as *mut c_void,
-                            core::ptr::null_mut(),
-                            core::ptr::null(),
-                            1,
-                        )
-                    };
-                    let _ = handle;
+                    unsafe { arm_discover_retry() };
                 }
             }
         }
