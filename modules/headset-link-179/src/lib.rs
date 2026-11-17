@@ -156,7 +156,27 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v52";
+const BUILD_TAG: &str = "v53";
+/// v53 EVENT RING: the last 40 events of the signalling state machine as
+/// 4-bit codes, shown hex-encoded on the probe row while decoding has not
+/// started. The phone's HCI capture cannot see the band<->NPU link, so this
+/// is the only way to reconstruct WHAT the NPU saw before its ~20 s
+/// hard-lock. Codes:
+///   1 ev2 CONFIRM   2 ev3 COMPLETE  3 ev6 DISCONNECT 4 ev7 DATA
+///   5 ev8           6 ev13          7 bond-state cb
+///   8 send DISCOVER 9 send GET_CAP A send SET_CFG    B send OPEN
+///   C send CONF_REQ D RX accept    E RX reject/other F send other
+pub static EV_RING: [core::sync::atomic::AtomicU8; 40] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; 40];
+pub static EV_POS: AtomicU32 = AtomicU32::new(0);
+/// Records one 4-bit event code. Never panics, never allocates.
+pub fn evlog(code: u8) {
+    if code > 0x0F {
+        return;
+    }
+    let pos = EV_POS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    EV_RING[(pos as usize) % 40].store(code & 0x0F, core::sync::atomic::Ordering::Relaxed);
+}
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
@@ -311,6 +331,7 @@ mod device {
         r2: i32,
         r3: i32,
     ) {
+        crate::evlog(0x07);
         if address.is_null() {
             return;
         }
@@ -1398,6 +1419,27 @@ mod page {
     /// d<mp3 frames>f<sbc frames>z<silence>b<frame len>k<encode ok>
     /// x<syncword>e<err>c<peer capability low 16 bits, hex>
     fn probe_text(buf: &mut [u8]) -> u32 {
+        // v53: while the audio pipeline is idle this row shows the event
+        // ring ("L" + 39 hex nibbles, oldest -> newest) - the only on-band
+        // trace of what happened before the NPU hard-locked. Once decoding
+        // has actually started the MP3 pipeline stats take the row back.
+        if crate::stream::PUMPS.load(Ordering::Relaxed) == 0 {
+            let pos = EV_POS.load(Ordering::Relaxed);
+            let have = (pos as usize).min(40);
+            let start = pos - have as u32;
+            let mut m = put_str(buf, "L") as usize;
+            for i in 0..39usize {
+                if m >= buf.len() {
+                    break;
+                }
+                let idx = ((start as usize) + i) % 40;
+                let code = EV_RING[idx].load(Ordering::Relaxed);
+                const HEXL: &[u8; 16] = b"0123456789ABCDEF";
+                buf[m] = HEXL[code as usize];
+                m += 1;
+            }
+            return m as u32;
+        }
         if crate::stream::PUMPS.load(Ordering::Relaxed) == 0 {
             return put_str(buf, "待运行");
         }

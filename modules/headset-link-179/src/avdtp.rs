@@ -208,6 +208,14 @@ unsafe fn send(signal: u8, params: &[u8]) -> i32 {
     }
     let label = (LABEL.fetch_add(1, Ordering::Relaxed) & 0x0F) as u8;
     let length = 2 + params.len();
+    // v53 event ring: 8 DISCOVER, 9 GET_CAP, A SET_CFG, B OPEN, F other
+    crate::evlog(match signal {
+        0x01 => 0x08,
+        0x02 => 0x09,
+        0x03 => 0x0A,
+        0x06 => 0x0B,
+        _ => 0x0F,
+    });
     // Headroom MUST be >= 8 (stock uses 12): sub_C86CC50 writes the 4-byte
     // L2CAP header at [offset, offset+4) and then stamps its fixed preamble
     // flag at buffer+10 (0x81). With headroom 4 the header sits at +8..12 and
@@ -323,6 +331,7 @@ pub unsafe fn send_l2cap_config_request(local_scid: u16) {
         core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
     unsafe { conf_req(link as usize as *mut u8, channel, mtu) };
     unsafe { *(channel.add(52).cast::<u16>()) = 672 };
+    crate::evlog(0x0C);
     CONF_SENT.store(1, Ordering::Relaxed);
 }
 
@@ -551,10 +560,13 @@ unsafe fn handle_data(buffer: *mut u8) {
     }
 
     // message type 2 = accept; 1 = general reject, 3 = reject.
+    // v53 event ring: D accept, E reject/other.
     if !accepted {
+        crate::evlog(0x0E);
         PHASE.store(PH_REJECT, Ordering::Relaxed);
         return;
     }
+    crate::evlog(0x0D);
 
     match PHASE.load(Ordering::Relaxed) {
         PH_DISCOVER if signal == SIG_DISCOVER && length >= 3 => {
@@ -656,6 +668,16 @@ unsafe fn handle_data(buffer: *mut u8) {
 /// defined r0 avoids an accidental ownership flag on the module side.
 pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
     LAST_EVENT.store(event as u32, Ordering::Relaxed);
+    // v53 event ring: 1 ev2, 2 ev3, 3 ev6, 4 ev7, 5 ev8, 6 ev13
+    crate::evlog(match event {
+        2 => 1,
+        3 => 2,
+        6 => 3,
+        7 => 4,
+        8 => 5,
+        13 => 6,
+        _ => 0x0F,
+    });
     if argument.is_null() {
         return 0;
     }
