@@ -549,8 +549,8 @@ unsafe fn handle_data(buffer: *mut u8) {
             //   [SEID<<2 | in_use<<1 | 0] [media_type<<4 | TSEP<<2 | 0]
             // v50: parse pairwise (the old byte-by-byte scan could eat a
             // TSEP byte as a SEID), prefer a FREE audio SINK (TSEP=1).
-            let raw0 = unsafe { *payload.add(2) } as u32;
-            let raw1 = if length >= 4 { unsafe { *payload.add(3) } as u32 } else { 0 };
+            let raw0 = (unsafe { *payload.add(2) }) as u32;
+            let raw1 = if length >= 4 { (unsafe { *payload.add(3) }) as u32 } else { 0 };
             let seps = (length - 2) / 2;
             let mut seid = 0u32;
             let mut k = 2usize;
