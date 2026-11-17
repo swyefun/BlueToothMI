@@ -341,6 +341,12 @@ unsafe extern "C" fn signal_kick(_arg: *mut c_void) {
     }
 }
 
+/// Manual trigger for the NPU-death experiment: sends the current phase's
+/// next signalling command from the timer context (never from RX).
+pub fn kick_next() {
+    unsafe { arm_signal_kick() };
+}
+
 /// Arms the one-shot signalling kick (100 ms).
 unsafe fn arm_signal_kick() {
     let handle = unsafe {
@@ -534,10 +540,17 @@ unsafe fn handle_data(buffer: *mut u8) {
             // send_set_configuration below.
             PHASE.store(PH_SETCFG, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            // Never submit from inside the RX callback - the kick timer
-            // sends from the timer context (0.10.27's DISCOVER submit
-            // demonstrably drained from there).
-            unsafe { arm_signal_kick() };
+            // NPU-DEATH EXPERIMENT (0.10.32): nothing is sent automatically.
+            // Every connect since 0.10.28 ended with the NPU's radio going
+            // silent ~20 s after connect (HCI reason 8 = supervision
+            // timeout, twice at exactly 20-21 s in the 11/17 logs) - the
+            // NPU hard-locks, and its BT-restart chime was audible in the
+            // 0.10.30 run. Either ANSWERING our DISCOVER kills it, or our
+            // SECOND command (GET_CAP in 0.10.28-30, SET_CFG in 0.10.31)
+            // does. This build sends NOTHING after DISCOVER: if the link
+            // now survives past 20 s, tap "发SET_CFG" - an instant reason-8
+            // teardown right after pinpoints the command as the trigger.
+            // Manual path: UI button -> CMD_NEXT_SIG -> kick_next().
         }
         PH_GETCAP if signal == SIG_GET_CAPABILITIES => {
             unsafe { parse_capabilities(payload.add(2), length - 2) };

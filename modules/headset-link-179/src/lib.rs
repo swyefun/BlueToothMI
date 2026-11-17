@@ -116,6 +116,10 @@ pub const CMD_CONNECT_ACL: u32 = 11;
 pub const CMD_A2DP_CONNECT: u32 = 12;
 /// Decodes ONE MP3-frame-sized slice (see `stream`). No firmware calls.
 pub const CMD_MP3_PROBE: u32 = 13;
+/// Manually sends the current phase's next AVDTP signalling command
+/// (NPU-death experiment: isolates whether our second command kills the
+/// sink, or merely answering DISCOVER does).
+pub const CMD_NEXT_SIG: u32 = 14;
 
 // Service error codes from sdk/c/canopus_services.h; E_IDENTITY is local.
 pub const E_IDENTITY: i32 = -1;
@@ -152,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v47";
+const BUILD_TAG: &str = "v48";
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
@@ -423,6 +427,10 @@ mod device {
             CMD_A2DP_CONNECT => device::a2dp_connect(),
             CMD_MP3_PROBE => {
                 crate::stream::step_once();
+                0
+            }
+            CMD_NEXT_SIG => {
+                crate::avdtp::kick_next();
                 0
             }
             CMD_TEARDOWN => teardown(false),
@@ -1129,6 +1137,7 @@ mod page {
     const EV_A2DP: u32 = 11;
     static LAST_A2DP_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
     const EV_PROBE: u32 = 12;
+    const EV_NEXT_SIG: u32 = 13;
     static LAST_PROBE_EV: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 
     const DEV_LABELS: [&str; 3] = ["设备 1", "设备 2", "设备 3"];
@@ -1645,6 +1654,7 @@ mod page {
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 27, "解码一片", "只解一帧 MP3，验证分片不卡；看音频流水线行", EV_PROBE);
+                rc = action_row(ui_obj, tree, 28, "发SET_CFG", "手动发下一条 AVDTP 信令；观察 NPU 是否立刻死机", EV_NEXT_SIG);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);
@@ -1739,6 +1749,7 @@ mod page {
                     ctl(CMD_MP3_PROBE, core::ptr::null())
                 }
             }
+            EV_NEXT_SIG => ctl(CMD_NEXT_SIG, core::ptr::null()),
             EV_TEARDOWN => ctl(CMD_TEARDOWN, core::ptr::null()),
             _ => 0,
         };
