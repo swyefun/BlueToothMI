@@ -141,7 +141,7 @@ static MEDIA_KICK: AtomicU32 = AtomicU32::new(0);
 /// Total signal_kick firings (status row k). Answers "did the kick timer
 /// actually run?" - 0.10.29 could not tell a dead timer from a sink that
 /// ignores GET_CAPABILITIES.
-static KICKS: AtomicU32 = AtomicU32::new(0);
+pub static KICKS: AtomicU32 = AtomicU32::new(0);
 /// Sends made within the CURRENT phase; reset on every phase advance. The
 /// kick re-arms until this reaches 3, mirroring the DISCOVER retry that
 /// proved necessary (v41: d4, the sink answered a later copy).
@@ -149,7 +149,7 @@ static PHASE_SENDS: AtomicU32 = AtomicU32::new(0);
 /// Raw first header byte of the last received signalling packet
 /// (label<<4 | packet_type<<2 | message_type). Status row h, 2 hex digits:
 /// message_type 2 = accept, 1 = general reject, 3 = reject.
-static LAST_HEADER: AtomicU32 = AtomicU32::new(0);
+pub static LAST_HEADER: AtomicU32 = AtomicU32::new(0);
 /// Config-request diagnostic for the status row:
 /// 0 never ran | 1 sent | 2 skipped (+114 bit2 already set) |
 /// 3 find_ch returned NULL | 4 link pointer zero.
