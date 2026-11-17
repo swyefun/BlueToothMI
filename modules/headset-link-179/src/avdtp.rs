@@ -590,7 +590,7 @@ unsafe fn handle_data(buffer: *mut u8) {
                 }
             }
             SEP_INFO.store(
-                raw0 | (raw1 << 8) | (seps << 16) | (seid << 24),
+                raw0 | (raw1 << 8) | ((seps as u32) << 16) | (seid << 24),
                 Ordering::Relaxed,
             );
             SEID.store(seid, Ordering::Relaxed);
