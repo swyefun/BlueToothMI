@@ -166,6 +166,14 @@ pub static SEID: AtomicU32 = AtomicU32::new(0);
 /// targeted a nonexistent endpoint - prime suspect for the instant NPU
 /// hard-lock on the 0.10.33 button test.
 pub static SEP_INFO: AtomicU32 = AtomicU32::new(0);
+/// v55 TX-path forensics: channel byte 33 (send-mode selector in
+/// sub_C86CC50) | byte 71 (queue type) | byte 120 (channel state)
+/// packed low-to-high. sub_C86CC50 only sends DIRECTLY when +33 == 0;
+/// any other value queues the SDU on the link's flow-control list and, if
+/// +71 == 3, waits for peer L2CAP credits that this NPU never grants -
+/// exactly the "first command ok, everything after vanishes, NPU locks
+/// ~20 s later" signature. Cleared at COMPLETE; keep the values visible.
+pub static CHSTAT: AtomicU32 = AtomicU32::new(0);
 static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 
 pub fn reset() {
@@ -708,6 +716,21 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
             }
             if remote != 0 {
                 TX_CID.store(remote, Ordering::Relaxed);
+                // v55: dump the channel TX-mode bytes and clear +33 so every
+                // later submit takes the DIRECT path in sub_C86CC50 instead
+                // of the credit queue the NPU never drains. See CHSTAT.
+                {
+                    let find_ch: unsafe extern "C" fn(u32, u32) -> *mut u8 =
+                        core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
+                    let ch = unsafe { find_ch(0, local as u32) };
+                    if !ch.is_null() {
+                        let f33 = unsafe { *ch.add(33) } as u32;
+                        let f71 = unsafe { *ch.add(71) } as u32;
+                        let f120 = unsafe { *ch.add(120) } as u32;
+                        CHSTAT.store(f33 | (f71 << 8) | (f120 << 16), Ordering::Relaxed);
+                        unsafe { *ch.add(33) = 0 };
+                    }
+                }
                 // The stock outgoing path never sends the L2CAP config
                 // request, so the sink's channel sits in CONFIG and drops
                 // our SDUs. Send it ourselves first (harmless if the sink

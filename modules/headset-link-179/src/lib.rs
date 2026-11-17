@@ -156,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v54";
+const BUILD_TAG: &str = "v55";
 /// v53 EVENT RING: the last 40 events of the signalling state machine as
 /// 4-bit codes, shown hex-encoded on the probe row while decoding has not
 /// started. The phone's HCI capture cannot see the band<->NPU link, so this
@@ -1278,6 +1278,20 @@ mod page {
                     buf[m + 2] = HEX[(b1 >> 4) as usize];
                     buf[m + 3] = HEX[(b1 & 0xF) as usize];
                     m += 4;
+                }
+                // t<+33 hex 2><+71 hex 2><+120 hex 2>: v55 TX-path bytes of
+                // the signalling channel at COMPLETE, read before +33 is
+                // cleared. +33 != 0 routes submits into the credit queue the
+                // NPU never drains - the 20 s hard-lock's smoking gun.
+                let chstat = crate::avdtp::CHSTAT.load(Ordering::Relaxed);
+                m += put_str(&mut buf[m..], "t") as usize;
+                if m + 6 <= buf.len() {
+                    for sh in [0, 8, 16].iter() {
+                        let b = ((chstat >> sh) & 0xFF) as u32;
+                        buf[m] = HEX[(b >> 4) as usize];
+                        buf[m + 1] = HEX[(b & 0xF) as usize];
+                        m += 2;
+                    }
                 }
                 return m as u32;
             }
