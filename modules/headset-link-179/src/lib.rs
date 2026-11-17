@@ -156,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v49";
+const BUILD_TAG: &str = "v50";
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
@@ -1240,6 +1240,23 @@ mod page {
                     buf[m] = HEX[((hdr >> 4) & 0xF) as usize];
                     buf[m + 1] = HEX[(hdr & 0xF) as usize];
                     m += 2;
+                }
+                // s<chosen SEID>b<DISCOVER response bytes 0-1, 4 hex>: v50
+                // forensics - proves which endpoint SET_CFG targets and what
+                // the sink actually advertised (byte0 = SEID<<2|in_use,
+                // byte1 = media<<4|TSEP<<2).
+                let sep_info = crate::avdtp::SEP_INFO.load(Ordering::Relaxed);
+                m += put_str(&mut buf[m..], "s") as usize;
+                m += put_num(&mut buf[m..], ((sep_info >> 24) & 0xFF) as i32) as usize;
+                m += put_str(&mut buf[m..], "b") as usize;
+                if m + 4 <= buf.len() {
+                    let b0 = (sep_info & 0xFF) as u32;
+                    let b1 = ((sep_info >> 8) & 0xFF) as u32;
+                    buf[m] = HEX[(b0 >> 4) as usize];
+                    buf[m + 1] = HEX[(b0 & 0xF) as usize];
+                    buf[m + 2] = HEX[(b1 >> 4) as usize];
+                    buf[m + 3] = HEX[(b1 & 0xF) as usize];
+                    m += 4;
                 }
                 return m as u32;
             }

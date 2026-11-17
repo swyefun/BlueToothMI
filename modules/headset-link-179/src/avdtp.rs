@@ -159,6 +159,13 @@ pub static LAST_HEADER: AtomicU32 = AtomicU32::new(0);
 /// 3 find_ch returned NULL | 4 link pointer zero.
 pub static CONF_SENT: AtomicU32 = AtomicU32::new(0);
 pub static SEID: AtomicU32 = AtomicU32::new(0);
+/// DISCOVER-response forensics (v50): [raw byte 0] | [raw byte 1]<<8 |
+/// [SEP count]<<16 | [chosen SEID]<<24. The pre-v50 parser scanned the
+/// response BYTE-BY-BYTE instead of in SEID/TSEP pairs, so with the first
+/// endpoint in use it read the media/TSEP byte as a SEID and SET_CFG then
+/// targeted a nonexistent endpoint - prime suspect for the instant NPU
+/// hard-lock on the 0.10.33 button test.
+pub static SEP_INFO: AtomicU32 = AtomicU32::new(0);
 static SBC_CFG: AtomicU32 = AtomicU32::new(DEFAULT_SBC);
 
 pub fn reset() {
@@ -181,6 +188,7 @@ pub fn reset() {
     WAITER_ARMED.store(0, Ordering::Relaxed);
     LAST_HEADER.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
+    SEP_INFO.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
     crate::CAP_WORD.store(0, Ordering::Relaxed);
 }
@@ -338,12 +346,25 @@ unsafe extern "C" fn sig_waiter(_arg: *mut c_void) {
             if KICK_REQ.swap(0, Ordering::Relaxed) == 1
                 && PHASE_SENDS.load(Ordering::Relaxed) < 3
             {
-                PHASE_SENDS.fetch_add(1, Ordering::Relaxed);
                 let seid = SEID.load(Ordering::Relaxed);
                 match phase {
-                    PH_GETCAP => send_get_capabilities(seid),
-                    PH_SETCFG => send_set_configuration(seid),
-                    _ => send_open(seid),
+                    PH_GETCAP => {
+                        PHASE_SENDS.fetch_add(1, Ordering::Relaxed);
+                        send_get_capabilities(seid);
+                    }
+                    PH_SETCFG => {
+                        // v50: single-shot. The 0.10.33 test showed the NPU
+                        // hard-locks instantly on SET_CFG; re-sending it two
+                        // more times at 250 ms adds a duplicate-command
+                        // variable we cannot afford while bisecting that.
+                        if PHASE_SENDS.swap(1, Ordering::Relaxed) == 0 {
+                            send_set_configuration(seid);
+                        }
+                    }
+                    _ => {
+                        PHASE_SENDS.fetch_add(1, Ordering::Relaxed);
+                        send_open(seid);
+                    }
                 }
             }
             unsafe { arm_sig_waiter() };
@@ -524,24 +545,54 @@ unsafe fn handle_data(buffer: *mut u8) {
 
     match PHASE.load(Ordering::Relaxed) {
         PH_DISCOVER if signal == SIG_DISCOVER && length >= 3 => {
-            // ACP SEID information: one byte per endpoint,
-            // SEID<<2 | in_use<<1 | media_type. Prefer a FREE endpoint: if
-            // the phone is currently streaming to the sink, taking the
-            // in-use SEID would only earn a later reject.
+            // ACP SEID information: the response is PAIRS of bytes -
+            //   [SEID<<2 | in_use<<1 | 0] [media_type<<4 | TSEP<<2 | 0]
+            // v50: parse pairwise (the old byte-by-byte scan could eat a
+            // TSEP byte as a SEID), prefer a FREE audio SINK (TSEP=1).
+            let raw0 = unsafe { *payload.add(2) } as u32;
+            let raw1 = if length >= 4 { unsafe { *payload.add(3) } as u32 } else { 0 };
+            let seps = (length - 2) / 2;
             let mut seid = 0u32;
             let mut k = 2usize;
-            while k < length {
-                let raw = unsafe { *payload.add(k) } as u32;
-                let candidate = (raw >> 2) & 0x3F;
-                if candidate != 0 && (raw >> 1) & 1 == 0 {
+            while k + 1 < length {
+                let sbyte = unsafe { *payload.add(k) } as u32;
+                let mbyte = unsafe { *payload.add(k + 1) } as u32;
+                let candidate = (sbyte >> 2) & 0x3F;
+                let media = (mbyte >> 4) & 0xF;
+                let tsep = (mbyte >> 2) & 0x3;
+                if candidate != 0
+                    && (sbyte >> 1) & 1 == 0
+                    && media == 0
+                    && tsep == 1
+                {
                     seid = candidate;
                     break;
                 }
-                k += 1;
+                k += 2;
             }
             if seid == 0 {
-                seid = ((unsafe { *payload.add(2) } >> 2) & 0x3F).max(1) as u32;
+                // Fallback: any free SEID on an even (pair-aligned) offset.
+                k = 2usize;
+                while k + 1 < length {
+                    let sbyte = unsafe { *payload.add(k) } as u32;
+                    let candidate = (sbyte >> 2) & 0x3F;
+                    if candidate != 0 && (sbyte >> 1) & 1 == 0 {
+                        seid = candidate;
+                        break;
+                    }
+                    k += 2;
+                }
             }
+            if seid == 0 {
+                seid = (raw0 >> 2) & 0x3F;
+                if seid == 0 {
+                    seid = 1;
+                }
+            }
+            SEP_INFO.store(
+                raw0 | (raw1 << 8) | (seps << 16) | (seid << 24),
+                Ordering::Relaxed,
+            );
             SEID.store(seid, Ordering::Relaxed);
             // GET_CAPABILITIES is SKIPPED: the NPU ignored it across every
             // submit context (0.10.28 inline RX, 0.10.29/0.10.30 timer with
