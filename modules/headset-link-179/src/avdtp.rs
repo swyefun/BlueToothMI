@@ -299,21 +299,30 @@ pub unsafe fn send_l2cap_config_request(local_scid: u16) {
         CONF_SENT.store(4, Ordering::Relaxed);
         return;
     }
-    // sub_C867D04 includes an MTU option iff channel+52 != 672, and
-    // sub_C867DE8 copies its VALUE from channel+52 - which is 0 on a fresh
-    // channel. 0.10.23 therefore emitted an MTU=0 option (invalid, spec min
-    // 48); the sink rejects it and the stock conf-rsp retry path re-sends the
-    // same garbage until the RTX timer tears the link down (~4 s, matching
-    // the 19:37:00 -> 19:37:04 disconnect). Storing the stack default 672
-    // suppresses the option entirely: an option-less config request simply
-    // accepts the sink's defaults, which is valid L2CAP.
+    // v52 PHONE-REPLICA CONFIG REQUEST. The 21:56 HCI capture (piliplus ->
+    // NPU, all accepted) shows the working phone's CONF_REQ to the AVDTP
+    // signalling channel ALWAYS carries an explicit MTU option:
+    //   04 0d 08 00 43 00 00 00 01 02 a0 02  (type=01 MTU, value 672)
+    // Our request has channel+52 == 672, which suppresses the option in
+    // sub_C867D04, leaving an option-less CONF_REQ. That is valid L2CAP,
+    // but it is the ONLY remaining L2CAP-level difference from the working
+    // phone - and the NPU hard-locks ~20 s after DISCOVER regardless of
+    // which AVDTP command follows (0.10.32 sent nothing, v51 sent GET_CAP;
+    // k78 = 78 x 250 ms ~= 19.5 s in the v51 capture), pointing at the
+    // config stage, not AVDTP. sub_C867DE8 copies the option VALUE from
+    // channel+52, and the option is emitted iff +52 != 672 - so stage 668
+    // (equally legal; the phone itself uses MTU 668 on its AVRCP channel)
+    // for the request, then restore 672 so every accept/bookkeeping path
+    // keeps its proven behaviour.
     if unsafe { *(channel.add(52).cast::<u16>()) } == 0 {
         unsafe { *(channel.add(52).cast::<u16>()) = 672 };
     }
+    unsafe { *(channel.add(52).cast::<u16>()) = 668 };
     let mtu = unsafe { *(channel.add(52).cast::<u16>()) };
     let conf_req: unsafe extern "C" fn(*mut u8, *mut u8, u16) =
         core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
     unsafe { conf_req(link as usize as *mut u8, channel, mtu) };
+    unsafe { *(channel.add(52).cast::<u16>()) = 672 };
     CONF_SENT.store(1, Ordering::Relaxed);
 }
 
