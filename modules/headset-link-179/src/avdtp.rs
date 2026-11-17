@@ -138,9 +138,13 @@ pub static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
 static RETRY_ARMED: AtomicU32 = AtomicU32::new(0);
 /// Set once the OPEN accept deferred the media-channel kick.
 static MEDIA_KICK: AtomicU32 = AtomicU32::new(0);
-/// Total signal_kick firings (status row k). Answers "did the kick timer
-/// actually run?" - 0.10.29 could not tell a dead timer from a sink that
-/// ignores GET_CAPABILITIES.
+/// Set by the UI button; consumed by the sig_waiter timer in the BT task.
+/// bt_timer_add itself must NEVER run in the UI task - 0.10.32's button
+/// called it there and the band crashed instantly.
+static KICK_REQ: AtomicU32 = AtomicU32::new(0);
+/// Guards double-arming the sig_waiter chain.
+static WAITER_ARMED: AtomicU32 = AtomicU32::new(0);
+/// Total sig_waiter firings (status row k).
 pub static KICKS: AtomicU32 = AtomicU32::new(0);
 /// Sends made within the CURRENT phase; reset on every phase advance. The
 /// kick re-arms until this reaches 3, mirroring the DISCOVER retry that
@@ -173,6 +177,8 @@ pub fn reset() {
     MEDIA_KICK.store(0, Ordering::Relaxed);
     KICKS.store(0, Ordering::Relaxed);
     PHASE_SENDS.store(0, Ordering::Relaxed);
+    KICK_REQ.store(0, Ordering::Relaxed);
+    WAITER_ARMED.store(0, Ordering::Relaxed);
     LAST_HEADER.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
@@ -319,48 +325,54 @@ unsafe extern "C" fn discover_retry(_arg: *mut c_void) {
     }
 }
 
-/// One-shot 50 ms timer: sends the NEXT signalling command for the current
-/// phase from the timer context. All AVDTP sends triggered by a response
-/// (event 7) go through here - a submit issued inside the RX callback sits
-/// in the work queue behind the very drain that is executing (0.10.28:
-/// GET_CAP never left the band, sink silent, e8, then idle teardown e6).
-unsafe extern "C" fn signal_kick(_arg: *mut c_void) {
+/// Self-re-arming 250 ms waiter, armed ONCE from the completion event (BT
+/// task). When the UI button sets KICK_REQ, the send happens HERE, in timer
+/// context: every firmware call the button path needs (bt_timer_add,
+/// bt_buffer_new, bt_l2cap_submit_cid) is only proven safe in the BT task,
+/// and 0.10.32 calling bt_timer_add from the UI task crashed the band.
+unsafe extern "C" fn sig_waiter(_arg: *mut c_void) {
     KICKS.fetch_add(1, Ordering::Relaxed);
-    let seid = SEID.load(Ordering::Relaxed);
     let phase = PHASE.load(Ordering::Relaxed);
-    let more = matches!(phase, PH_GETCAP | PH_SETCFG | PH_OPEN)
-        && PHASE_SENDS.load(Ordering::Relaxed) < 3;
-    if more {
-        PHASE_SENDS.fetch_add(1, Ordering::Relaxed);
-        match phase {
-            PH_GETCAP => send_get_capabilities(seid),
-            PH_SETCFG => send_set_configuration(seid),
-            _ => send_open(seid),
+    match phase {
+        PH_GETCAP | PH_SETCFG | PH_OPEN => {
+            if KICK_REQ.swap(0, Ordering::Relaxed) == 1
+                && PHASE_SENDS.load(Ordering::Relaxed) < 3
+            {
+                PHASE_SENDS.fetch_add(1, Ordering::Relaxed);
+                let seid = SEID.load(Ordering::Relaxed);
+                match phase {
+                    PH_GETCAP => send_get_capabilities(seid),
+                    PH_SETCFG => send_set_configuration(seid),
+                    _ => send_open(seid),
+                }
+            }
+            unsafe { arm_sig_waiter() };
         }
-        unsafe { arm_signal_kick() };
+        // DONE/REJECT/IDLE: the chain ends (media_open_kick owns DONE).
+        _ => {}
     }
 }
 
-/// Manual trigger for the NPU-death experiment: sends the current phase's
-/// next signalling command from the timer context (never from RX).
-pub fn kick_next() {
-    unsafe { arm_signal_kick() };
-}
-
-/// Arms the one-shot signalling kick (100 ms).
-unsafe fn arm_signal_kick() {
+/// Arms the self-re-arming signalling waiter (250 ms cadence).
+unsafe fn arm_sig_waiter() {
     let handle = unsafe {
         bt_timer_add(
             bt_l2cap_owner(),
-            100,
+            250,
             1,
-            signal_kick as *const () as usize as *mut c_void,
+            sig_waiter as *const () as usize as *mut c_void,
             core::ptr::null_mut(),
             core::ptr::null(),
             1,
         )
     };
     let _ = handle;
+}
+
+/// UI-safe trigger: sets a flag only. All firmware calls happen in
+/// sig_waiter, inside the BT task.
+pub fn kick_next() {
+    KICK_REQ.store(1, Ordering::Relaxed);
 }
 
 /// 100 ms after the OPEN accept: queue the media L2CAP channel from the
@@ -556,12 +568,12 @@ unsafe fn handle_data(buffer: *mut u8) {
             unsafe { parse_capabilities(payload.add(2), length - 2) };
             PHASE.store(PH_SETCFG, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            unsafe { arm_signal_kick() };
+            // Manual pacing: the next command waits for the UI button.
         }
         PH_SETCFG if signal == SIG_SET_CONFIGURATION => {
             PHASE.store(PH_OPEN, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            unsafe { arm_signal_kick() };
+            // Manual pacing: OPEN waits for the UI button too.
         }
         PH_OPEN if signal == SIG_OPEN => {
             PHASE.store(PH_DONE, Ordering::Relaxed);
@@ -629,6 +641,9 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
                 }
                 if RETRY_ARMED.swap(1, Ordering::Relaxed) == 0 {
                     unsafe { arm_discover_retry() };
+                }
+                if WAITER_ARMED.swap(1, Ordering::Relaxed) == 0 {
+                    unsafe { arm_sig_waiter() };
                 }
             }
         }

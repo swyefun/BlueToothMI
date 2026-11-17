@@ -156,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v48";
+const BUILD_TAG: &str = "v49";
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
