@@ -1,0 +1,227 @@
+[1m[33mwarning[0m[1m: `package.homepage` is redundant with `package.repository`[0m
+  [1m[94m--> [0mvendor/rmp3/Cargo.toml:20:12
+   [1m[94m|[0m
+[1m[94m20[0m [1m[94m|[0m homepage = "https://github.com/notviri/rmp3"
+   [1m[94m|[0m            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m23[0m [1m[94m|[0m repository = "https://github.com/notviri/rmp3"
+   [1m[94m|[0m              [1m[94m---------------------------------[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `cargo::redundant_homepage` is set to `warn` by default
+[1m[96mhelp[0m: consider removing `package.homepage`
+[1m[33mwarning[0m: `rmp3` (manifest) generated 1 warning
+[1m[92m    Updating[0m crates.io index
+[1m[92m     Locking[0m 11 packages to highest Rust 1.88 compatible versions
+[1m[92m      Adding[0m nanoaudio-core v0.1.1 [1m[91m(requires Rust 1.89)[0m
+[1m[92m      Adding[0m nanoaudio-sbc v0.1.1 [1m[91m(requires Rust 1.89)[0m
+[1m[92m      Adding[0m safe_arch v1.2.0 [1m[91m(requires Rust 1.89)[0m
+[1m[92m      Adding[0m wide v1.7.1 [1m[91m(requires Rust 1.89)[0m
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m nanoaudio-core v0.1.1
+[1m[92m  Downloaded[0m shlex v2.0.1
+[1m[92m  Downloaded[0m cc v1.11.2
+[1m[92m  Downloaded[0m nanoaudio-sbc v0.1.1
+[1m[92m  Downloaded[0m find-msvc-tools v0.1.15
+[1m[92m  Downloaded[0m bytemuck v1.25.2
+[1m[92m  Downloaded[0m safe_arch v1.2.0
+[1m[92m  Downloaded[0m wide v1.7.1
+[1m[92m   Compiling[0m find-msvc-tools v0.1.15
+[1m[92m   Compiling[0m shlex v2.0.1
+[1m[92m   Compiling[0m canopus-target-generated v0.2.1 (/home/runner/work/BlueToothMI/BlueToothMI/canopus/sdk/rust/canopus-target-generated)
+[1m[92m   Compiling[0m canopus-abi v0.2.1 (/home/runner/work/BlueToothMI/BlueToothMI/canopus/sdk/rust/canopus-abi)
+[1m[92m   Compiling[0m canopus-target-private v0.1.0 (/home/runner/work/BlueToothMI/BlueToothMI/canopus/sdk/rust/canopus-target-private)
+[1m[92m   Compiling[0m cc v1.11.2
+[1m[92m   Compiling[0m nanoaudio-sbc v0.1.1
+[1m[92m   Compiling[0m nanoaudio-core v0.1.1
+[1m[92m   Compiling[0m canopus-runtime v0.2.1 (/home/runner/work/BlueToothMI/BlueToothMI/canopus/sdk/rust/canopus-runtime)
+[1m[92m   Compiling[0m rmp3 v0.3.1 (/home/runner/work/BlueToothMI/BlueToothMI/canopus/modules/headset-link-179/vendor/rmp3)
+[1m[33mwarning[0m[1m: use of deprecated associated function `core::num::<impl i32>::max_value`: replaced by the `MAX` associated constant on this type[0m
+  [1m[94m--> [0mvendor/rmp3/src/lib.rs:54:20
+   [1m[94m|[0m
+[1m[94m54[0m [1m[94m|[0m     len.min(c_int::max_value() as usize) as c_int
+   [1m[94m|[0m                    [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(deprecated)]` on by default
+
+[1m[33mwarning[0m[1m: the type `mp3dec_frame_info_t` does not permit being left uninitialized[0m
+   [1m[94m--> [0mvendor/rmp3/src/lib.rs:407:28
+    [1m[94m|[0m
+[1m[94m407[0m [1m[94m|[0m             let mut info = MaybeUninit::uninit().assume_init();
+    [1m[94m|[0m                            [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m|[0m                            [1m[33m|[0m
+    [1m[94m|[0m                            [1m[33mthis code causes undefined behavior when executed[0m
+    [1m[94m|[0m                            [1m[33mhelp: use `MaybeUninit<T>` instead, and only call `assume_init` after initialization is done[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: integers must be initialized (in this struct field)
+   [1m[94m--> [0mvendor/rmp3/src/ffi.rs:13:5
+    [1m[94m|[0m
+[1m[94m 13[0m [1m[94m|[0m     pub frame_bytes: core::ffi::c_int,
+    [1m[94m|[0m     [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(invalid_value)]` on by default
+
+[1m[33mwarning[0m: `rmp3` (lib) generated 2 warnings
+[1m[92m   Compiling[0m headset_link_179 v0.1.0 (/home/runner/work/BlueToothMI/BlueToothMI/canopus/modules/headset-link-179)
+[1m[33mwarning[0m[1m: unused imports: `AVDTP_LOCAL_RX_MTU`, `CONNECT_CONFIG_OFFSET`, `CONNECT_OPTIONS_OFFSET`, `CONNECT_OPTION_LOCAL_MTU`, and `CONNECT_PSM_OFFSET`[0m
+   [1m[94m--> [0msrc/lib.rs:248:9
+    [1m[94m|[0m
+[1m[94m248[0m [1m[94m|[0m         CONNECT_CONFIG_OFFSET, CONNECT_OPTION_LOCAL_MTU, CONNECT_OPTIONS_OFFSET,
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^[0m  [1m[33m^^^^^^^^^^^^^^^^^^^^^^[0m
+[1m[94m249[0m [1m[94m|[0m         CONNECT_PSM_OFFSET, CONNECT_REQUEST_SIZE, DISCOVERY_TIMEOUT_SECONDS, DiscoveryResult,
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^[0m
+[1m[94m250[0m [1m[94m|[0m         SdpAvrcpControllerRecord, SdpSourceRecord, AVDTP_LOCAL_RX_MTU, bt_adapter_get_instance,
+    [1m[94m|[0m                                                    [1m[33m^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: unnecessary parentheses around block return value[0m
+    [1m[94m--> [0msrc/lib.rs:1580:9
+     [1m[94m|[0m
+[1m[94m1580[0m [1m[94m|[0m         (unsafe { (ui_obj.section)(tree, key, &props as *const UiSectionPropsV1 as *const c_void) })
+     [1m[94m|[0m         [1m[33m^[0m                                                                                          [1m[33m^[0m
+     [1m[94m|[0m
+     [1m[94m= [0m[1mnote[0m: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+[1m[96mhelp[0m: remove these parentheses
+     [1m[94m|[0m
+[1m[94m1580[0m [91m- [0m        [91m([0munsafe { (ui_obj.section)(tree, key, &props as *const UiSectionPropsV1 as *const c_void) }[91m)[0m
+[1m[94m1580[0m [92m+ [0m        unsafe { (ui_obj.section)(tree, key, &props as *const UiSectionPropsV1 as *const c_void) }
+     [1m[94m|[0m
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+  [1m[94m--> [0msrc/audio_dev.rs:79:49
+   [1m[94m|[0m
+[1m[94m79[0m [1m[94m|[0m     let f: unsafe extern "C" fn() -> *mut i32 = core::mem::transmute(addr);
+   [1m[94m|[0m                                                 [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+  [1m[94m--> [0msrc/audio_dev.rs:77:1
+   [1m[94m|[0m
+[1m[94m77[0m [1m[94m|[0m unsafe fn set_errno(value: i32) {
+   [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+   [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+   [1m[94m= [0m[1mnote[0m: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `audio_dev::set_errno` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/audio_dev.rs:160:9
+    [1m[94m|[0m
+[1m[94m160[0m [1m[94m|[0m         set_errno(EAGAIN);
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+   [1m[94m--> [0msrc/audio_dev.rs:158:1
+    [1m[94m|[0m
+[1m[94m158[0m [1m[94m|[0m unsafe extern "C" fn dev_read(_filep: *mut c_void, buf: *mut u8, len: u32) -> isize {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `audio_dev::set_errno` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/audio_dev.rs:166:9
+    [1m[94m|[0m
+[1m[94m166[0m [1m[94m|[0m         set_errno(EAGAIN);
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `audio_dev::set_errno` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/audio_dev.rs:197:5
+    [1m[94m|[0m
+[1m[94m197[0m [1m[94m|[0m     set_errno(ENOTTY);
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+   [1m[94m--> [0msrc/audio_dev.rs:194:1
+    [1m[94m|[0m
+[1m[94m194[0m [1m[94m|[0m unsafe extern "C" fn dev_seek(_filep: *mut c_void, _off: i64, _whence: i32) -> isize {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/avdtp.rs:278:9
+    [1m[94m|[0m
+[1m[94m278[0m [1m[94m|[0m         core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+   [1m[94m--> [0msrc/avdtp.rs:273:1
+    [1m[94m|[0m
+[1m[94m273[0m [1m[94m|[0m pub unsafe fn prepare_channel_for_config(local_scid: u16) {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/avdtp.rs:301:9
+    [1m[94m|[0m
+[1m[94m301[0m [1m[94m|[0m         core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+   [1m[94m--> [0msrc/avdtp.rs:296:1
+    [1m[94m|[0m
+[1m[94m296[0m [1m[94m|[0m pub unsafe fn send_l2cap_config_request(local_scid: u16) {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/avdtp.rs:339:9
+    [1m[94m|[0m
+[1m[94m339[0m [1m[94m|[0m         core::mem::transmute(L2CAP_CONF_REQ_LO ^ L2CAP_CONF_REQ_HI);
+    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/avdtp.rs:724:25
+    [1m[94m|[0m
+[1m[94m724[0m [1m[94m|[0m                         core::mem::transmute(L2CAP_FIND_CH_LO ^ L2CAP_FIND_CH_HI);
+    [1m[94m|[0m                         [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+   [1m[94m--> [0msrc/avdtp.rs:677:1
+    [1m[94m|[0m
+[1m[94m677[0m [1m[94m|[0m pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[91merror[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/lib.rs:778:13
+    [1m[94m|[0m
+[1m[94m778[0m [1m[94m|[0m             core::mem::transmute(SNOOP_ENABLE_LO ^ SNOOP_ENABLE_HI);
+    [1m[94m|[0m             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+
+[1m[33mwarning[E0133][0m[1m: call to unsafe function `core::intrinsics::transmute` is unsafe and requires unsafe block[0m
+   [1m[94m--> [0msrc/lib.rs:837:13
+    [1m[94m|[0m
+[1m[94m837[0m [1m[94m|[0m             core::mem::transmute(SENDRECV_LO ^ SENDRECV_HI);
+    [1m[94m|[0m             [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mcall to unsafe function[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: consult the function's documentation for information on how to avoid undefined behavior
+[1m[92mnote[0m: an unsafe function restricts its caller, but its body is safe by default
+   [1m[94m--> [0msrc/lib.rs:826:5
+    [1m[94m|[0m
+[1m[94m826[0m [1m[94m|[0m     unsafe fn adapter_ipc_resp(command: u32, payload: &[u8], resp: &mut [u8]) -> i32 {
+    [1m[94m|[0m     [1m[92m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+[1m[33mwarning[0m[1m: value assigned to `rc` is never read[0m
+    [1m[94m--> [0msrc/lib.rs:1746:17
+     [1m[94m|[0m
+[1m[94m1746[0m [1m[94m|[0m                 rc = action_row(ui_obj, tree, 27, "解码一片", "只解一帧 MP3，验证分片不卡；看音频流水线行", EV_PROBE);
+     [1m[94m|[0m                 [1m[33m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[33mthis value is reassigned later and never used[0m
+[1m[94m1747[0m [1m[94m|[0m                 rc = action_row(ui_obj, tree, 28, "推进信令", "手动补发下一条 AVDTP 命令（v51 自动推进，一般不用按）", EV_NEXT_SIG);
+     [1m[94m|[0m                 [1m[94m-------------------------------------------------------------------------------------------------------------------[0m [1m[94m`rc` is overwritten here before the previous value is read[0m
+     [1m[94m|[0m
+     [1m[94m= [0m[1mnote[0m: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+[1mFor more information about this error, try `rustc --explain E0133`.[0m
+[1m[33mwarning[0m: `headset_link_179` (lib) generated 12 warnings
+[1m[91merror[0m: could not compile `headset_link_179` (lib) due to 1 previous error; 12 warnings emitted
+error: `cargo` failed (exit status: 101) while building the Rust crate
