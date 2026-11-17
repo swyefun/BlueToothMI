@@ -156,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v53";
+const BUILD_TAG: &str = "v54";
 /// v53 EVENT RING: the last 40 events of the signalling state machine as
 /// 4-bit codes, shown hex-encoded on the probe row while decoding has not
 /// started. The phone's HCI capture cannot see the band<->NPU link, so this

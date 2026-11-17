@@ -711,18 +711,29 @@ pub unsafe extern "C" fn handle_event(event: i32, argument: *mut u8) -> i32 {
                 // The stock outgoing path never sends the L2CAP config
                 // request, so the sink's channel sits in CONFIG and drops
                 // our SDUs. Send it ourselves first (harmless if the sink
-                // already configures), then DISCOVER immediately plus one
-                // timer retry for sinks that drop pre-config data.
+                // already configures; +114 bit4 is normally already set by
+                // the stock sender, which is why g2 reads 2 and no "C" ever
+                // appears in the event ring).
                 unsafe { send_l2cap_config_request(local as u16) };
+                // v54 KILLER EXPERIMENT (from the 23:05 event ring): every
+                // round was DISCOVER -> instant accept -> GET_CAP x3 ALL
+                // IGNORED -> ~20 s disconnect. Make GET_CAP the FIRST
+                // command instead (SEID 1 hardcoded; the HCI capture shows
+                // this NPU always advertises SEIDs 1+2). If the NPU answers
+                // the first command instantly regardless of which command
+                // it is, its stack only processes ONE signalling command
+                // per channel and the 20 s lock is its state machine
+                // hanging after that. If GET_CAP as first command still
+                // gets ignored, the poison sits below AVDTP.
                 if PHASE.load(Ordering::Relaxed) == PH_DISCOVER
                     && RESPONSES.load(Ordering::Relaxed) == 0
                     && DISCOVER_SENT.load(Ordering::Relaxed) == 0
                 {
                     DISCOVER_SENT.store(1, Ordering::Relaxed);
-                    send_discover();
-                }
-                if RETRY_ARMED.swap(1, Ordering::Relaxed) == 0 {
-                    unsafe { arm_discover_retry() };
+                    SEID.store(1, Ordering::Relaxed);
+                    PHASE.store(PH_GETCAP, Ordering::Relaxed);
+                    PHASE_SENDS.store(1, Ordering::Relaxed);
+                    send_get_capabilities(1);
                 }
                 if WAITER_ARMED.swap(1, Ordering::Relaxed) == 0 {
                     unsafe { arm_sig_waiter() };
