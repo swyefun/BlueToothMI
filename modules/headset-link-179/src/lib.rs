@@ -156,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v50";
+const BUILD_TAG: &str = "v51";
 /// Peer SBC capability IE, written by `avdtp::parse_capabilities` and shown
 /// on the audio-pipeline row. Declared at crate root so the page module can
 /// read it in host builds where the `device` feature is off.
@@ -1671,7 +1671,7 @@ mod page {
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 27, "解码一片", "只解一帧 MP3，验证分片不卡；看音频流水线行", EV_PROBE);
-                rc = action_row(ui_obj, tree, 28, "发SET_CFG", "手动发下一条 AVDTP 信令；观察 NPU 是否立刻死机", EV_NEXT_SIG);
+                rc = action_row(ui_obj, tree, 28, "推进信令", "手动补发下一条 AVDTP 命令（v51 自动推进，一般不用按）", EV_NEXT_SIG);
             }
             if rc == UI_OK {
                 rc = action_row(ui_obj, tree, 23, "解除配对", "清除当前对端 bond，可重新配对", EV_REMOVE_BOND);

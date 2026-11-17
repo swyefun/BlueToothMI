@@ -343,9 +343,11 @@ unsafe extern "C" fn sig_waiter(_arg: *mut c_void) {
     let phase = PHASE.load(Ordering::Relaxed);
     match phase {
         PH_GETCAP | PH_SETCFG | PH_OPEN => {
-            if KICK_REQ.swap(0, Ordering::Relaxed) == 1
-                && PHASE_SENDS.load(Ordering::Relaxed) < 3
-            {
+            // v51: automatic retry while the phase is unanswered, at most 3
+            // sends per phase (the manual button just forces the same path).
+            // Each accept switches phase and resets PHASE_SENDS to 0, so the
+            // next command goes out on the following tick.
+            if PHASE_SENDS.load(Ordering::Relaxed) < 3 {
                 let seid = SEID.load(Ordering::Relaxed);
                 match phase {
                     PH_GETCAP => {
@@ -353,11 +355,13 @@ unsafe extern "C" fn sig_waiter(_arg: *mut c_void) {
                         send_get_capabilities(seid);
                     }
                     PH_SETCFG => {
-                        // v50: single-shot. The 0.10.33 test showed the NPU
-                        // hard-locks instantly on SET_CFG; re-sending it two
-                        // more times at 250 ms adds a duplicate-command
-                        // variable we cannot afford while bisecting that.
-                        if PHASE_SENDS.swap(1, Ordering::Relaxed) == 0 {
+                        // Single-shot: the 0.10.33 test showed the NPU
+                        // hard-locks instantly on SET_CFG; never re-send it
+                        // automatically. The UI button (KICK_REQ) may force
+                        // one explicit re-send for diagnostics.
+                        if PHASE_SENDS.swap(1, Ordering::Relaxed) == 0
+                            || KICK_REQ.swap(0, Ordering::Relaxed) == 1
+                        {
                             send_set_configuration(seid);
                         }
                     }
@@ -559,12 +563,12 @@ unsafe fn handle_data(buffer: *mut u8) {
                 let mbyte = unsafe { *payload.add(k + 1) } as u32;
                 let candidate = (sbyte >> 2) & 0x3F;
                 let media = (mbyte >> 4) & 0xF;
-                let tsep = (mbyte >> 2) & 0x3;
-                if candidate != 0
-                    && (sbyte >> 1) & 1 == 0
-                    && media == 0
-                    && tsep == 1
-                {
+                let _tsep = (mbyte >> 2) & 0x3;
+                // v51: the phone's HCI capture shows this NPU advertises
+                // TSEP bytes 0x08 (tsep field = 2, not the spec 1) - do NOT
+                // filter on tsep; just take the first free audio endpoint,
+                // exactly what the working phone did (it used SEID 1).
+                if candidate != 0 && (sbyte >> 1) & 1 == 0 && media == 0 {
                     seid = candidate;
                     break;
                 }
@@ -594,37 +598,33 @@ unsafe fn handle_data(buffer: *mut u8) {
                 Ordering::Relaxed,
             );
             SEID.store(seid, Ordering::Relaxed);
-            // GET_CAPABILITIES is SKIPPED: the NPU ignored it across every
-            // submit context (0.10.28 inline RX, 0.10.29/0.10.30 timer with
-            // 3 retries) while answering DISCOVER - its signaling stack is
-            // a minimal responder. GET_CAP is optional per AVDTP anyway,
-            // and the exact SBC capability the sink expects is known from
-            // the phone logcat (codec_arry) and hardcoded in
-            // send_set_configuration below.
-            PHASE.store(PH_SETCFG, Ordering::Relaxed);
+            // v51 PHONE-REPLICA FLOW (from the 21:56 HCI capture, piliplus
+            // -> NPU, every step accepted): DISCOVER -> GET_CAP(SEID) ->
+            // SET_CFG -> OPEN -> START. The phone ALWAYS sends GET_CAP
+            // before SET_CFG (it even queries both SEPs); the NPU's stack
+            // very likely needs that response to initialise SEP state, and
+            // a bare SET_CFG hard-locks it (our crash since 0.10.31). The
+            // old "NPU ignored GET_CAP" finding is from 0.10.28-30, before
+            // the signalling L2CAP channel was fully proven - so retry it
+            // in the flow again. Advance is automatic via KICK_REQ consumed
+            // by sig_waiter in BT timer context.
+            PHASE.store(PH_GETCAP, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            // NPU-DEATH EXPERIMENT (0.10.32): nothing is sent automatically.
-            // Every connect since 0.10.28 ended with the NPU's radio going
-            // silent ~20 s after connect (HCI reason 8 = supervision
-            // timeout, twice at exactly 20-21 s in the 11/17 logs) - the
-            // NPU hard-locks, and its BT-restart chime was audible in the
-            // 0.10.30 run. Either ANSWERING our DISCOVER kills it, or our
-            // SECOND command (GET_CAP in 0.10.28-30, SET_CFG in 0.10.31)
-            // does. This build sends NOTHING after DISCOVER: if the link
-            // now survives past 20 s, tap "发SET_CFG" - an instant reason-8
-            // teardown right after pinpoints the command as the trigger.
-            // Manual path: UI button -> CMD_NEXT_SIG -> kick_next().
+            // sig_waiter sends GET_CAP on its next tick automatically.
+            PHASE_SENDS.store(0, Ordering::Relaxed);
+            // v51: advance automatically (phone replica). KICK_REQ is
+            // consumed by sig_waiter in BT timer context.
         }
         PH_GETCAP if signal == SIG_GET_CAPABILITIES => {
             unsafe { parse_capabilities(payload.add(2), length - 2) };
             PHASE.store(PH_SETCFG, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            // Manual pacing: the next command waits for the UI button.
+            // SET_CFG follows on the next waiter tick (single-shot).
         }
         PH_SETCFG if signal == SIG_SET_CONFIGURATION => {
             PHASE.store(PH_OPEN, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            // Manual pacing: OPEN waits for the UI button too.
+            // OPEN follows on the next waiter tick.
         }
         PH_OPEN if signal == SIG_OPEN => {
             PHASE.store(PH_DONE, Ordering::Relaxed);
