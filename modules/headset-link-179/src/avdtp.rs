@@ -138,6 +138,18 @@ pub static DISCOVER_SENT: AtomicU32 = AtomicU32::new(0);
 static RETRY_ARMED: AtomicU32 = AtomicU32::new(0);
 /// Set once the OPEN accept deferred the media-channel kick.
 static MEDIA_KICK: AtomicU32 = AtomicU32::new(0);
+/// Total signal_kick firings (status row k). Answers "did the kick timer
+/// actually run?" - 0.10.29 could not tell a dead timer from a sink that
+/// ignores GET_CAPABILITIES.
+static KICKS: AtomicU32 = AtomicU32::new(0);
+/// Sends made within the CURRENT phase; reset on every phase advance. The
+/// kick re-arms until this reaches 3, mirroring the DISCOVER retry that
+/// proved necessary (v41: d4, the sink answered a later copy).
+static PHASE_SENDS: AtomicU32 = AtomicU32::new(0);
+/// Raw first header byte of the last received signalling packet
+/// (label<<4 | packet_type<<2 | message_type). Status row h, 2 hex digits:
+/// message_type 2 = accept, 1 = general reject, 3 = reject.
+static LAST_HEADER: AtomicU32 = AtomicU32::new(0);
 /// Config-request diagnostic for the status row:
 /// 0 never ran | 1 sent | 2 skipped (+114 bit2 already set) |
 /// 3 find_ch returned NULL | 4 link pointer zero.
@@ -159,6 +171,9 @@ pub fn reset() {
     RETRY_ARMED.store(0, Ordering::Relaxed);
     CONF_SENT.store(0, Ordering::Relaxed);
     MEDIA_KICK.store(0, Ordering::Relaxed);
+    KICKS.store(0, Ordering::Relaxed);
+    PHASE_SENDS.store(0, Ordering::Relaxed);
+    LAST_HEADER.store(0, Ordering::Relaxed);
     SEID.store(0, Ordering::Relaxed);
     SBC_CFG.store(DEFAULT_SBC, Ordering::Relaxed);
     crate::CAP_WORD.store(0, Ordering::Relaxed);
@@ -310,21 +325,28 @@ unsafe extern "C" fn discover_retry(_arg: *mut c_void) {
 /// in the work queue behind the very drain that is executing (0.10.28:
 /// GET_CAP never left the band, sink silent, e8, then idle teardown e6).
 unsafe extern "C" fn signal_kick(_arg: *mut c_void) {
+    KICKS.fetch_add(1, Ordering::Relaxed);
     let seid = SEID.load(Ordering::Relaxed);
-    match PHASE.load(Ordering::Relaxed) {
-        PH_GETCAP => send_get_capabilities(seid),
-        PH_SETCFG => send_set_configuration(seid),
-        PH_OPEN => send_open(seid),
-        _ => {}
+    let phase = PHASE.load(Ordering::Relaxed);
+    let more = matches!(phase, PH_GETCAP | PH_SETCFG | PH_OPEN)
+        && PHASE_SENDS.load(Ordering::Relaxed) < 3;
+    if more {
+        PHASE_SENDS.fetch_add(1, Ordering::Relaxed);
+        match phase {
+            PH_GETCAP => send_get_capabilities(seid),
+            PH_SETCFG => send_set_configuration(seid),
+            _ => send_open(seid),
+        }
+        unsafe { arm_signal_kick() };
     }
 }
 
-/// Arms the one-shot signalling kick (50 ms).
+/// Arms the one-shot signalling kick (100 ms).
 unsafe fn arm_signal_kick() {
     let handle = unsafe {
         bt_timer_add(
             bt_l2cap_owner(),
-            50,
+            100,
             1,
             signal_kick as *const () as usize as *mut c_void,
             core::ptr::null_mut(),
@@ -447,6 +469,7 @@ unsafe fn handle_data(buffer: *mut u8) {
     let payload = unsafe { stock_buffer_payload(stock) };
     let header = unsafe { *payload };
     let signal = unsafe { *payload.add(1) };
+    LAST_HEADER.store(header as u32, Ordering::Relaxed);
     LAST_SIGNAL.store(signal as u32, Ordering::Relaxed);
     RESPONSES.fetch_add(1, Ordering::Relaxed);
     let accepted = (header & 0x03) == 2;
@@ -473,14 +496,27 @@ unsafe fn handle_data(buffer: *mut u8) {
 
     match PHASE.load(Ordering::Relaxed) {
         PH_DISCOVER if signal == SIG_DISCOVER && length >= 3 => {
-            // First ACP SEID information: SEID<<2 | in_use<<1 | media_type.
-            let raw = unsafe { *payload.add(2) };
-            let mut seid = ((raw >> 2) & 0x3F) as u32;
+            // ACP SEID information: one byte per endpoint,
+            // SEID<<2 | in_use<<1 | media_type. Prefer a FREE endpoint: if
+            // the phone is currently streaming to the sink, taking the
+            // in-use SEID would only earn a later reject.
+            let mut seid = 0u32;
+            let mut k = 2usize;
+            while k < length {
+                let raw = unsafe { *payload.add(k) } as u32;
+                let candidate = (raw >> 2) & 0x3F;
+                if candidate != 0 && (raw >> 1) & 1 == 0 {
+                    seid = candidate;
+                    break;
+                }
+                k += 1;
+            }
             if seid == 0 {
-                seid = 1;
+                seid = ((unsafe { *payload.add(2) } >> 2) & 0x3F).max(1) as u32;
             }
             SEID.store(seid, Ordering::Relaxed);
             PHASE.store(PH_GETCAP, Ordering::Relaxed);
+            PHASE_SENDS.store(0, Ordering::Relaxed);
             // Never submit from inside the RX callback. The DISCOVER accept
             // is processed while the work-queue drain that delivered it is
             // still active; 0.10.28's GET_CAP submitted from here never
@@ -492,10 +528,12 @@ unsafe fn handle_data(buffer: *mut u8) {
         PH_GETCAP if signal == SIG_GET_CAPABILITIES => {
             unsafe { parse_capabilities(payload.add(2), length - 2) };
             PHASE.store(PH_SETCFG, Ordering::Relaxed);
+            PHASE_SENDS.store(0, Ordering::Relaxed);
             unsafe { arm_signal_kick() };
         }
         PH_SETCFG if signal == SIG_SET_CONFIGURATION => {
             PHASE.store(PH_OPEN, Ordering::Relaxed);
+            PHASE_SENDS.store(0, Ordering::Relaxed);
             unsafe { arm_signal_kick() };
         }
         PH_OPEN if signal == SIG_OPEN => {
