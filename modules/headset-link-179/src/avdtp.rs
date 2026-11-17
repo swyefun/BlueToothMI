@@ -409,13 +409,23 @@ fn send_get_capabilities(seid: u32) {
 
 fn send_set_configuration(seid: u32) {
     let sbc = SBC_CFG.load(Ordering::Relaxed).to_le_bytes();
-    // ACP SEID, INT SEID (our endpoint 1), Media Transport, Media Codec/SBC.
+    // ACP SEID, INT SEID (our endpoint 1), then the capabilities list.
+    // Verified byte-for-byte against the phone logcat (codec_arry, the
+    // Fluoride side's own print of the SBC codec capability it uses):
+    //   [0x01 0x00]                              Media Transport, no params
+    //   [0x07 0x06 0x00 0x00 0x21 0x15 0x02 0x35] Media Codec, LOSC 6:
+    //     media_type 0 (audio), codec_type 0 (SBC), then the SBC IE
+    //     21 15 02 35 = 44.1 kHz (b5), JOINT STEREO (b0), 16 blocks (b4),
+    //     8 subbands (b2), Loudness (b0), bitpool 2..53.
+    // 0.10.29 and earlier had category 0x02 (REPORTING!) here instead of
+    // 0x07 (MEDIA_CODEC) - the sink parsed a 6-byte reporting capability
+    // and the whole codec entry vanished from the configuration.
     let params = [
         (seid << 2) as u8,
         0x04,
         0x01,
         0x00,
-        0x02,
+        0x07,
         0x06,
         0x00,
         0x00,
@@ -515,14 +525,18 @@ unsafe fn handle_data(buffer: *mut u8) {
                 seid = ((unsafe { *payload.add(2) } >> 2) & 0x3F).max(1) as u32;
             }
             SEID.store(seid, Ordering::Relaxed);
-            PHASE.store(PH_GETCAP, Ordering::Relaxed);
+            // GET_CAPABILITIES is SKIPPED: the NPU ignored it across every
+            // submit context (0.10.28 inline RX, 0.10.29/0.10.30 timer with
+            // 3 retries) while answering DISCOVER - its signaling stack is
+            // a minimal responder. GET_CAP is optional per AVDTP anyway,
+            // and the exact SBC capability the sink expects is known from
+            // the phone logcat (codec_arry) and hardcoded in
+            // send_set_configuration below.
+            PHASE.store(PH_SETCFG, Ordering::Relaxed);
             PHASE_SENDS.store(0, Ordering::Relaxed);
-            // Never submit from inside the RX callback. The DISCOVER accept
-            // is processed while the work-queue drain that delivered it is
-            // still active; 0.10.28's GET_CAP submitted from here never
-            // drained (no response, f stayed 1, then e8/e6). The kick timer
-            // sends from the timer context where 0.10.27's DISCOVER submit
-            // demonstrably drained.
+            // Never submit from inside the RX callback - the kick timer
+            // sends from the timer context (0.10.27's DISCOVER submit
+            // demonstrably drained from there).
             unsafe { arm_signal_kick() };
         }
         PH_GETCAP if signal == SIG_GET_CAPABILITIES => {
