@@ -156,7 +156,7 @@ static CB_ADDR: AtomicU32 = AtomicU32::new(0);
 static RESTORE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESTORE_RAW2: AtomicU32 = AtomicU32::new(0);
 /// Build marker rendered on the peer row, so a stale install is visible.
-const BUILD_TAG: &str = "v55";
+const BUILD_TAG: &str = "v56";
 /// v53 EVENT RING: the last 40 events of the signalling state machine as
 /// 4-bit codes, shown hex-encoded on the probe row while decoding has not
 /// started. The phone's HCI capture cannot see the band<->NPU link, so this
@@ -169,6 +169,8 @@ const BUILD_TAG: &str = "v55";
 pub static EV_RING: [core::sync::atomic::AtomicU8; 40] =
     [const { core::sync::atomic::AtomicU8::new(0) }; 40];
 pub static EV_POS: AtomicU32 = AtomicU32::new(0);
+/// v56: return value of the firmware's "log enable snoop" entry (0 = armed).
+pub static SNOOP_RC: AtomicU32 = AtomicU32::new(0);
 /// Records one 4-bit event code. Never panics, never allocates.
 pub fn evlog(code: u8) {
     if code > 0x0F {
@@ -763,6 +765,18 @@ mod device {
     }
 
     fn connect() -> i32 {
+        // v56: enable the firmware's OWN btsnoop recorder before every
+        // connect. bttool "log enable snoop" runs sub_C477FF8 (0xC477FF8):
+        // it picks the newest /snoop_*.cfa, opens the next one, registers
+        // sub_C4704CC as the HCI write callback and sets the enabled flag
+        // at 0x200BE64C. Once armed, the log export archive carries the
+        // FULL band<->NPU HCI capture - tshark parses it like the phone's.
+        // Callable via the XOR trick (0x0C477FF9 ^ 0x06000000).
+        const SNOOP_ENABLE_LO: u32 = 0x0A27_7FF9;
+        const SNOOP_ENABLE_HI: u32 = 0x0600_0000;
+        let enable_snoop: unsafe extern "C" fn() -> i32 =
+            core::mem::transmute(SNOOP_ENABLE_LO ^ SNOOP_ENABLE_HI);
+        SNOOP_RC.store(unsafe { enable_snoop() } as u32, Ordering::Relaxed);
         let addr = peer_bytes();
         if !has_peer(&addr) {
             return fail(E_ARGUMENT, 0);
@@ -1293,6 +1307,9 @@ mod page {
                         m += 2;
                     }
                 }
+                // u<snoop enable rc>: v56 firmware btsnoop arm result.
+                m += put_str(&mut buf[m..], "u") as usize;
+                m += put_num(&mut buf[m..], SNOOP_RC.load(Ordering::Relaxed) as i32) as usize;
                 return m as u32;
             }
             // Show which firmware profile id was used and the IPC result, so
