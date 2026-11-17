@@ -775,7 +775,7 @@ mod device {
         const SNOOP_ENABLE_LO: u32 = 0x0A27_7FF9;
         const SNOOP_ENABLE_HI: u32 = 0x0600_0000;
         let enable_snoop: unsafe extern "C" fn() -> i32 =
-            core::mem::transmute(SNOOP_ENABLE_LO ^ SNOOP_ENABLE_HI);
+            unsafe { core::mem::transmute(SNOOP_ENABLE_LO ^ SNOOP_ENABLE_HI) };
         SNOOP_RC.store(unsafe { enable_snoop() } as u32, Ordering::Relaxed);
         let addr = peer_bytes();
         if !has_peer(&addr) {
