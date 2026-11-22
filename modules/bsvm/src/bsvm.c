@@ -288,15 +288,32 @@ static int      s_e1, s_e2;      /* errno of failed header reads */
 static uint32_t s_hdr_r;         /* bytes returned by first header read */
 static int32_t  s_open_e;        /* errno if even open failed */
 
+/* progress marker written through the FS service itself (no raw-VFS ops
+ * while a service fd is open). After a crash the file holds the last step
+ * attempted: 1 open, 2 size, 3 hdr read, 4 evt, 5 db, 6 dir, 7 parse, 8 done */
+static void ld_mark(const struct canopus_fs_obj *fs, int n)
+{
+    char buf[16];
+    if (fs == 0 || fs->write_all == 0) return;
+    buf[0] = 'M';
+    u32_to_dec(buf + 1, (uint32_t)n);
+    int len = 0;
+    while (buf[len]) len++;
+    fs->write_all(s_ctx, "/data/bsvm_ld.txt", buf, (uint32_t)len);
+}
+
 static int bsvm_load(void)
 {
     uint8_t hdr[38];
     const struct canopus_fs_obj *fs = (s_ctx != 0) ? s_ctx->fs : 0;
     if (fs == 0 || fs->open == 0 || fs->read == 0 || fs->seek == 0 || fs->size == 0 || fs->close == 0) return -9;
+    ld_mark(fs, 1);
     int32_t fd = fs->open(s_ctx, BIN_PATH_A, CANOPUS_FS_READ);
     if (fd < 0) { s_open_e = fd; return -1; }
+    ld_mark(fs, 2);
     int64_t fsize = fs->size(s_ctx, fd);
     s_probe_size = (fsize >= 0 && fsize <= 0x7FFFFFF0ll) ? (uint32_t)fsize : 0xFFFFFFFFu;
+    ld_mark(fs, 3);
     int r = fs->read(s_ctx, fd, hdr, 38);
     s_hdr_r = (uint32_t)r;
     if (r <= 0) {
@@ -315,6 +332,7 @@ static int bsvm_load(void)
         }
     }
     if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { fs->close(s_ctx, fd); return -3; }
+    ld_mark(fs, 4);
     s_str_off = rd32(hdr + 6);
     s_str_len = rd32(hdr + 10) - s_str_off;
     uint32_t evt_off = rd32(hdr + 14);
@@ -328,17 +346,13 @@ static int bsvm_load(void)
     uint32_t dir_len = dir_end - dir_off;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { fs->close(s_ctx, fd); return -4; }
 
-    log_kv("ld1", s_evt_len);
-    log_flush();
+    ld_mark(fs, 5);
     if (read_full(fs, fd, s_evt, s_evt_len) != (int)s_evt_len) { fs->close(s_ctx, fd); return -5; }
-    log_kv("ld2", s_db_len);
-    log_flush();
+    ld_mark(fs, 6);
     if (read_full(fs, fd, s_db, s_db_len) != (int)s_db_len) { fs->close(s_ctx, fd); return -6; }
-    log_kv("ld3", dir_len);
-    log_flush();
+    ld_mark(fs, 7);
     if (read_full(fs, fd, s_dir, dir_len) != (int)dir_len) { fs->close(s_ctx, fd); return -7; }
-    log_kv("ldok", dir_len);
-    log_flush();
+    ld_mark(fs, 8);
     /* keep fd open for string reads */
     s_fd = fd;
 
@@ -392,6 +406,7 @@ static int bsvm_load(void)
         }
     }
     s_total_entries = s_ce_n + s_pg_n + s_troop_pg_n;
+    ld_mark(fs, 9);
     return 0;
 }
 
@@ -828,7 +843,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.8",
+    "0.1.9",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
