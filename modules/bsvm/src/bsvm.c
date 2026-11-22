@@ -320,7 +320,10 @@ static int bsvm_load(void)
     uint32_t db_off = rd32(hdr + 22);
     s_db_len = rd32(hdr + 26) - db_off;
     uint32_t dir_off = rd32(hdr + 30);
-    uint32_t dir_len = rd32(hdr + 34) - dir_off;
+    uint32_t dir_end = rd32(hdr + 34);
+    /* older compiler builds wrote dir_end as 0; fall back to file end */
+    if (dir_end <= dir_off || dir_end > s_probe_size) dir_end = s_probe_size;
+    uint32_t dir_len = dir_end - dir_off;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { fs->close(s_ctx, fd); return -4; }
 
     if (read_full(fs, fd, s_evt, s_evt_len) != (int)s_evt_len) { fs->close(s_ctx, fd); return -5; }
@@ -811,7 +814,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.6",
+    "0.1.7",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
