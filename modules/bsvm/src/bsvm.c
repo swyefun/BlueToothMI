@@ -289,6 +289,7 @@ static int read_full(const struct canopus_fs_obj *fs, int32_t fd, uint8_t *buf, 
 
 /* ---------------- load ---------------- */
 static uint32_t s_probe_size;    /* size of the opened game-data file */
+static uint32_t s_strn_raw, s_mapn_raw, s_dir_len_v;  /* raw parse values for diagnostics */
 static int      s_e1, s_e2;      /* errno of failed header reads */
 static uint32_t s_hdr_r;         /* bytes returned by first header read */
 static int32_t  s_open_e;        /* errno if even open failed */
@@ -350,6 +351,7 @@ static int bsvm_load(void)
     /* older compiler builds wrote dir_end as 0; fall back to file end */
     if (dir_end <= dir_off || dir_end > s_probe_size) dir_end = s_probe_size;
     uint32_t dir_len = dir_end - dir_off;
+    s_dir_len_v = dir_len;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { fs->close(s_ctx, fd); return -4; }
 
     ld_mark(fs, 5);
@@ -372,6 +374,7 @@ static int bsvm_load(void)
     /* parse directory (bounds-checked; sub-markers pinpoint crashes) */
     uint32_t p = 0;
     s_strn = rd32(s_dir + p); p += 4;
+    s_strn_raw = s_strn;
     if (s_strn > STRN_MAX) s_strn = STRN_MAX;
     if ((p + s_strn * 4u + 4u) > dir_len) { log_kv("f1", p); log_kv("sn", s_strn); return -10; }
     for (uint32_t i = 0; i < s_strn; i++) { s_strtab[i] = rd32(s_dir + p); p += 4; }
@@ -387,6 +390,7 @@ static int bsvm_load(void)
     }
     ld_mark(fs, 12);
     uint32_t map_n = rd32(s_dir + p); p += 4;
+    s_mapn_raw = map_n;
     if (map_n > 512u) map_n = 512u;
     s_pg_n = 0;
     for (uint32_t m = 0; m < map_n; m++) {
@@ -741,14 +745,15 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         }
         log_line("LOAD-FAIL");
         log_kv("code", (uint32_t)(-rc));
-        log_kv("e1", (uint32_t)s_e1);
-        log_kv("e2", (uint32_t)s_e2);
-        log_kv("hdrr", s_hdr_r);
-        log_kv("bsize", s_probe_size);
-        log_kv("alt", (uint32_t)probe_size(BIN_PATH_B));
-        log_kv("koinbox", (uint32_t)probe_size("/data/canopus/inbox/bsvm.ko.next"));
-        log_kv("cmi", (uint32_t)probe_size("/data/canopus/inbox/bsvm.cmi.next"));
-        log_kv("opene", (uint32_t)s_open_e);
+        /* pool-content probes: expected d0=7195 dm=147 de=0 e0=21 b0=65873.
+         * d0==e0 => bss aliasing; d0 ok but dm wrong => chunked-read corruption */
+        log_kv("d0", rd32(s_dir));
+        log_kv("dm", rd32(s_dir + 31268u));
+        log_kv("de", rd32(s_dir + ((s_dir_len_v > 4u) ? (s_dir_len_v - 4u) : 0u)));
+        log_kv("e0", rd32(s_evt));
+        log_kv("b0", rd32(s_db));
+        log_kv("snr", s_strn_raw);
+        log_kv("mnr", s_mapn_raw);
         log_flush();
     }
     return 0;
@@ -873,7 +878,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.2.1",
+    "0.2.2",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
