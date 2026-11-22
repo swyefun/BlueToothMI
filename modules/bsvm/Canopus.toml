@@ -1,0 +1,21 @@
+schema = 1
+
+[module]
+id = "bsvm"
+version = "0.1.0"
+version_code = 1
+kind = "target"
+language = "c"
+lifecycle = "removable"
+canopus_abi = "2"
+description = "BlackSoul VM: native RMVA runtime app (Band 11 4.100.139) - headless validator v0.1"
+
+[build]
+sources = [
+  "src/bsvm.c",
+]
+
+[targets]
+include = [
+  "xiaomi-band-11-4.100.139",
+]

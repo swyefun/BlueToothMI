@@ -1,0 +1,709 @@
+/*
+ * bsvm.c — BlackSoul VM: RMVA events bytecode runtime for Band 11 (4.100.139).
+ *
+ * v0.1 HEADLESS: runs every event page (common events, all map pages, troop
+ * pages) in sequence with auto-advance (TEXT logged, CHOICE picks 0, BATTLE
+ * assumed won). Everything lands in /data/bsvm/play_log.txt. This validates
+ * file IO, decoding, memory and the interpreter on real hardware BEFORE any
+ * UI is attached.
+ *
+ * Verifier rules honored: no 64-bit division, no float math, firmware veneers
+ * XOR 0x06000000 (VENA), zero imports, fixed pools only, timer-sliced work.
+ */
+
+#include "canopus_module_entry.h"
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define BSVM_MODULE_ID "bsvm"
+
+/* ---------------- firmware veneers (139) ---------------- */
+#define FW_POSIX_OPEN   0x0c342c55u
+#define FW_POSIX_READ   0x0c33d785u
+#define FW_POSIX_WRITE  0xc33dc4fu
+#define FW_POSIX_CLOSE  0xc33818du
+#define FW_LSEEK        0x0c33d511u
+#define FW_LABEL_CREATE 0x0c3ab301u
+#define FW_LABEL_TEXT   0x0c3b3949u
+#define FW_TIMER_CREATE 0x0c3abd21u
+#define FW_TIMER_DEL    0x0c3abe71u
+#define FW_PAGE_GOTO    0x0c8ed781u
+
+#define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
+
+typedef int (*posix_open_fn)(const char *, int, ...);
+typedef int (*posix_read_fn)(int, void *, uint32_t);
+typedef int (*posix_write_fn)(int, const void *, uint32_t);
+typedef int (*posix_close_fn)(int);
+typedef int32_t (*posix_lseek_fn)(int, int32_t, int);
+
+#define O_RDONLY 0
+#define O_RDWR   2
+#define O_CREAT  4
+#define SEEK_SET 0
+#define SEEK_END 2
+
+static const char BIN_PATH[] = "/data/bsvm/bsvm.bin";
+static const char LOG_PATH[] = "/data/bsvm/play_log.txt";
+
+/* ---------------- static pools ---------------- */
+#define EVT_MAX 180000u
+#define DB_MAX  116000u
+#define DIR_MAX 160000u
+#define STRN_MAX 7200u
+#define STEPS_PER_ENTRY 120000u
+
+static uint8_t  s_evt[EVT_MAX];
+static uint32_t s_evt_len;
+static uint8_t  s_db[DB_MAX];
+static uint32_t s_db_len;
+static uint8_t  s_dir[DIR_MAX];
+static uint32_t s_dir_len;
+static uint32_t s_strtab[STRN_MAX];
+static uint32_t s_strn;
+
+static uint32_t s_str_off, s_str_len;
+static int      s_fd = -1;
+
+/* directory indices */
+static uint32_t s_ce_off[256];
+static uint16_t s_ce_len[256];
+static uint32_t s_ce_n;
+static uint32_t s_pg_off[7000];
+static uint32_t s_pg_n;          /* all map pages */
+static uint32_t s_troop_pg_off[1024];
+static uint32_t s_troop_pg_n;
+
+/* ---------------- VM state ---------------- */
+static uint8_t  s_switches[73];
+static int32_t  s_vars[104];
+static int32_t  s_gold;
+static uint16_t s_items[512];
+static uint8_t  s_party[8];
+static uint32_t s_party_n;
+static int32_t  s_battle_result;
+
+static uint32_t s_pc;
+static uint32_t s_ret[8];
+static uint32_t s_sp;
+static uint32_t s_steps;
+static uint32_t s_entry_idx;      /* scheduler cursor */
+static uint32_t s_runs_done, s_runs_bad;
+static uint8_t  s_ok_init;
+static uint32_t s_total_entries;
+
+/* ui */
+static void *s_label;
+static void *s_timer;
+static char  s_status[72];
+
+/* ---------------- helpers ---------------- */
+static void *vfn(uint32_t enc) { return (void *)(uintptr_t)VENA(enc); }
+
+static void u32_to_dec(char *b, uint32_t v)
+{
+    char t[12]; int i = 0, j = 0;
+    if (v == 0u) { b[0] = '0'; b[1] = '\0'; return; }
+    while (v > 0u) { t[i++] = (char)('0' + (v % 10u)); v /= 10u; }
+    while (i > 0) { b[j++] = t[--i]; }
+    b[j] = '\0';
+}
+
+static uint32_t udiv32(uint32_t n, uint32_t d)
+{
+    uint32_t q = 0u, r = 0u; int i;
+    if (d == 0u) return 0xFFFFFFFFu;
+    for (i = 31; i >= 0; i--) {
+        r = (r << 1) | ((n >> i) & 1u);
+        if (r >= d) { r -= d; q |= (1u << i); }
+    }
+    return q;
+}
+
+static int i16(const uint8_t *p)
+{
+    return (int)(int16_t)((uint16_t)(p[0] | (p[1] << 8)));
+}
+
+static int32_t i32(const uint8_t *p)
+{
+    return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+/* ---------------- logging ---------------- */
+static char s_logbuf[2048];
+static int  s_logn;
+
+static void log_flush(void)
+{
+    if (s_logn <= 0) return;
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(LOG_PATH, O_RDWR | O_CREAT, 0666);
+    if (fd >= 0) {
+        ((posix_lseek_fn)vfn(FW_LSEEK))(fd, 0, SEEK_END);
+        ((posix_write_fn)vfn(FW_POSIX_WRITE))(fd, s_logbuf, (uint32_t)s_logn);
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    }
+    s_logn = 0;
+}
+
+static void log_raw(const char *s, int n)
+{
+    if (n <= 0) { while (s && s[n]) n++; }
+    if (n > 512) n = 512;
+    if (s_logn + n > (int)sizeof(s_logbuf) - 2) log_flush();
+    for (int i = 0; i < n; i++) s_logbuf[s_logn++] = s[i];
+}
+
+static void log_kv(const char *k, uint32_t v)
+{
+    char vb[12]; int n = 0;
+    while (k[n]) n++;
+    log_raw(k, n);
+    u32_to_dec(vb, v);
+    n = 0; while (vb[n]) n++;
+    log_raw(vb, n);
+    log_raw("\r\n", 2);
+}
+
+static void log_text(const char *tag, uint32_t a, const char *txt)
+{
+    int n = 0;
+    while (tag[n]) n++;
+    log_raw(tag, n);
+    char vb[12];
+    u32_to_dec(vb, a);
+    n = 0; while (vb[n]) n++;
+    log_raw(vb, n);
+    log_raw(" ", 1);
+    n = 0; while (txt && txt[n]) n++;
+    log_raw(txt, n);
+    log_raw("\r\n", 2);
+}
+
+/* ---------------- string access ---------------- */
+static int str_get(uint32_t off, char *out, int max)
+{
+    uint32_t lo = 0, hi = s_strn;
+    if (s_fd < 0 || s_strn == 0u) return -1;
+    while (lo < hi) {
+        uint32_t mid = udiv32(lo + hi, 2u);
+        if (s_strtab[mid] < off) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo >= s_strn || s_strtab[lo] != off) return -1;
+    uint32_t end = (lo + 1u < s_strn) ? s_strtab[lo + 1u] : s_str_len;
+    uint32_t len = end - off;
+    if (len > (uint32_t)(max - 1)) len = (uint32_t)(max - 1);
+    ((posix_lseek_fn)vfn(FW_LSEEK))(s_fd, (int32_t)(s_str_off + off), SEEK_SET);
+    int n = ((posix_read_fn)vfn(FW_POSIX_READ))(s_fd, out, len);
+    if (n < 0) return -1;
+    out[n] = '\0';
+    return n;
+}
+
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t rd32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* ---------------- load ---------------- */
+static int bsvm_load(void)
+{
+    uint8_t hdr[38];
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH, O_RDONLY);
+    if (fd < 0) return -1;
+    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, hdr, 38) != 38) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -2; }
+    if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -3; }
+    s_str_off = rd32(hdr + 6);
+    s_str_len = rd32(hdr + 10) - s_str_off;
+    uint32_t evt_off = rd32(hdr + 14);
+    s_evt_len = rd32(hdr + 18) - evt_off;
+    uint32_t db_off = rd32(hdr + 22);
+    s_db_len = rd32(hdr + 26) - db_off;
+    uint32_t dir_off = rd32(hdr + 30);
+    uint32_t dir_len = rd32(hdr + 34) - dir_off;
+    if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -4; }
+
+    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_evt, s_evt_len) != (int)s_evt_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -5; }
+    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_db, s_db_len) != (int)s_db_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -6; }
+    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_dir, dir_len) != (int)dir_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -7; }
+    /* keep fd open for string reads */
+    s_fd = fd;
+
+    /* parse directory */
+    uint32_t p = 0;
+    s_strn = rd32(s_dir + p); p += 4;
+    if (s_strn > STRN_MAX) s_strn = STRN_MAX;
+    for (uint32_t i = 0; i < s_strn; i++) { s_strtab[i] = rd32(s_dir + p); p += 4; }
+    s_ce_n = rd32(s_dir + p); p += 4;
+    if (s_ce_n > 256u) s_ce_n = 256u;
+    for (uint32_t i = 0; i < s_ce_n; i++) {
+        uint32_t id = rd32(s_dir + p); p += 4;
+        s_ce_off[i] = rd32(s_dir + p); p += 4;
+        s_ce_len[i] = rd16(s_dir + p); p += 2;
+        (void)id;
+    }
+    uint32_t map_n = rd32(s_dir + p); p += 4;
+    s_pg_n = 0;
+    for (uint32_t m = 0; m < map_n; m++) {
+        uint32_t mid = rd16(s_dir + p); p += 2;
+        uint32_t evn = rd16(s_dir + p); p += 2;
+        p += 4; /* reserved u32 */
+        for (uint32_t e = 0; e < evn; e++) {
+            p += 4; /* eid u16 + page u16 */
+            uint32_t off = rd32(s_dir + p); p += 4;
+            p += 4; /* size */
+            if (s_pg_n < 7000u) s_pg_off[s_pg_n++] = off;
+            (void)mid;
+        }
+    }
+    /* db fields */
+    uint32_t skill_off = rd32(s_dir + p); p += 4;
+    uint32_t state_off = rd32(s_dir + p); p += 4;
+    uint32_t enemy_off = rd32(s_dir + p); p += 4;
+    uint32_t troop_off = rd32(s_dir + p); p += 4;
+    p += 16; /* class/actor/items/sz */
+    (void)skill_off; (void)state_off; (void)enemy_off;
+
+    /* troop pages: walk troop records in db */
+    s_troop_pg_n = 0;
+    uint32_t tp = troop_off;
+    uint32_t tn = rd16(s_db + tp); tp += 2;
+    for (uint32_t i = 0; i < tn && tp + 8 < s_db_len; i++) {
+        tp += 6;                                   /* id u16 + name u32 */
+        uint32_t nm = s_db[tp]; tp += 1 + nm * 6;
+        uint32_t np = rd16(s_db + tp); tp += 2;
+        for (uint32_t j = 0; j < np; j++) {
+            tp += 9;                               /* condition */
+            uint32_t off = rd32(s_db + tp); tp += 4;
+            if (s_troop_pg_n < 1024u) s_troop_pg_off[s_troop_pg_n++] = off;
+        }
+    }
+    s_total_entries = s_ce_n + s_pg_n + s_troop_pg_n;
+    return 0;
+}
+
+/* ---------------- interpreter ---------------- */
+static void vm_reset(void)
+{
+    for (uint32_t i = 0; i < 73; i++) s_switches[i] = 0;
+    for (uint32_t i = 0; i < 104; i++) s_vars[i] = 0;
+    s_gold = 0;
+    for (uint32_t i = 0; i < 512; i++) s_items[i] = 0;
+    s_party_n = 0;
+    s_sp = 0;
+    s_steps = 0;
+}
+
+static int vm_step(void)
+{
+    if (s_pc >= s_evt_len) return -1;
+    uint8_t op = s_evt[s_pc];
+    uint32_t a = s_pc + 1;
+    s_steps++;
+
+    switch (op) {
+    case 0x00: /* END */
+        if (s_sp == 0u) return 1;                    /* entry finished */
+        s_sp--;
+        s_pc = s_ret[s_sp];
+        return 0;
+    case 0x01: { /* TEXT */
+        char txt[240];
+        uint32_t idx = rd32(s_evt + a);
+        if (str_get(idx, txt, (int)sizeof(txt)) >= 0) {
+            log_text("T", 0u, txt);
+        } else {
+            log_kv("T?str", idx);
+        }
+        s_pc += 5;
+        return 0; }
+    case 0x02: { /* CHOICE: headless picks option 0 */
+        uint32_t n = s_evt[a];
+        uint32_t size = 1u + n * 6u + 2u;
+        s_pc += size;
+        return 0; }
+    case 0x03: { /* IF_SW: u16 sw, u8 val, s32 else_off */
+        uint32_t sw = rd16(s_evt + a);
+        uint32_t val = s_evt[a + 2];
+        int32_t eo = i32(s_evt + a + 3);
+        uint32_t bit = sw >> 3;
+        uint8_t cur = (bit < 73u) ? ((s_switches[bit] >> (sw & 7u)) & 1u) : 0u;
+        if (cur != val) s_pc = (uint32_t)((int32_t)(a + 3) + eo + 4);
+        else s_pc += 8;
+        return 0; }
+    case 0x04: { /* IF_VAR: u16 var, u8 op, u16 imm, s32 else_off */
+        uint32_t v = rd16(s_evt + a);
+        uint32_t o = s_evt[a + 2];
+        uint32_t imm = rd16(s_evt + a + 3);
+        int32_t eo = i32(s_evt + a + 5);
+        int32_t lhs = (v < 104u) ? s_vars[v] : 0;
+        int32_t rhs = (int32_t)imm;
+        int cond;
+        switch (o) {
+        case 0: cond = (lhs >  rhs); break;
+        case 1: cond = (lhs >= rhs); break;
+        case 2: cond = (lhs <  rhs); break;
+        case 3: cond = (lhs <= rhs); break;
+        case 4: cond = (lhs == rhs); break;
+        case 5: cond = (lhs != rhs); break;
+        default: cond = 0; break;
+        }
+        if (!cond) s_pc = (uint32_t)((int32_t)(a + 5) + eo + 4);
+        else s_pc += 10;
+        return 0; }
+    case 0x06: { /* JMP */
+        int32_t rel = i32(s_evt + a);
+        s_pc = (uint32_t)((int32_t)a + rel);
+        return 0; }
+    case 0x07: { /* SET_SW */
+        uint32_t sw = rd16(s_evt + a);
+        uint32_t val = s_evt[a + 2];
+        uint32_t bit = sw >> 3;
+        if (bit < 73u) {
+            if (val) s_switches[bit] |= (uint8_t)(1u << (sw & 7u));
+            else     s_switches[bit] &= (uint8_t)~(1u << (sw & 7u));
+        }
+        s_pc += 4;
+        return 0; }
+    case 0x08: { /* SET_VAR: u16 var, u8 op, u32 imm */
+        uint32_t v = rd16(s_evt + a);
+        uint32_t o = s_evt[a + 2];
+        int32_t imm = (int32_t)rd32(s_evt + a + 3);
+        if (v < 104u) {
+            switch (o) {
+            case 0: s_vars[v] = imm; break;
+            case 1: s_vars[v] += imm; break;
+            case 2: s_vars[v] -= imm; break;
+            case 3: s_vars[v] = (imm != 0) ? (int32_t)udiv32((uint32_t)s_vars[v], (uint32_t)imm) : 0; break;
+            case 4: s_vars[v] = (imm != 0) ? (int32_t)((uint32_t)s_vars[v] % (uint32_t)imm) : 0; break;
+            case 5: s_vars[v] = (int32_t)(udiv32(s_steps, 7u) & 0xFFFFu); break; /* rand placeholder */
+            case 6: s_vars[v] = imm; break;
+            default: s_vars[v] = imm; break;
+            }
+        }
+        s_pc += 8;
+        return 0; }
+    case 0x09: { /* ADD_ITEM: u8 kind, u16 id, u16 n */
+        uint32_t kind = s_evt[a];
+        uint32_t id = rd16(s_evt + a + 1);
+        int32_t n = i16(s_evt + a + 3);
+        uint32_t key = kind * 128u + (id % 128u);
+        if (key < 512u) {
+            int32_t cur = (int32_t)s_items[key] + n;
+            s_items[key] = (cur < 0) ? 0u : (cur > 999) ? 999u : (uint16_t)cur;
+        }
+        s_pc += 6;
+        return 0; }
+    case 0x0A: { /* CALL_CE */
+        uint32_t cid = rd16(s_evt + a);
+        if (cid < s_ce_n && s_sp < 7u) {
+            s_ret[s_sp++] = s_pc + 3;
+            s_pc = s_ce_off[cid];
+        } else {
+            s_pc += 3;
+        }
+        return 0; }
+    case 0x0B: { /* BATTLE: headless = always win */
+        s_battle_result = 0;
+        s_pc += 5;
+        return 0; }
+    case 0x0C: { /* PICTURE */
+        char name[96];
+        uint32_t idx = rd32(s_evt + a + 1);
+        str_get(idx, name, (int)sizeof(name));
+        s_pc += 8;
+        return 0; }
+    case 0x0D: s_pc += 4; return 0;  /* PIC_MOVE */
+    case 0x0E: s_pc += 2; return 0;  /* ERASE_PIC */
+    case 0x0F: s_pc += 2; return 0;  /* FADE */
+    case 0x10: s_pc += 3; return 0;  /* WAIT */
+    case 0x11: s_pc += 5; return 0;  /* TRANSFER */
+    case 0x12: s_pc += 3; return 0;  /* SELF_SW */
+    case 0x13: s_pc += 5; return 0;  /* HP */
+    case 0x14: s_pc += 5; return 0;  /* GOLD */
+    case 0x15: s_pc += 5; return 0;  /* SCRIPT (skipped) */
+    case 0x18: { /* IF_RES */
+        uint32_t want = s_evt[a];
+        int32_t eo = i32(s_evt + a + 1);
+        if (s_battle_result != (int32_t)want)
+            s_pc = (uint32_t)((int32_t)(a + 1) + eo + 4);
+        else s_pc += 6;
+        return 0; }
+    case 0x19: { /* PARTY */
+        uint32_t o = s_evt[a];
+        uint32_t id = rd16(s_evt + a + 1);
+        if (o == 0u && s_party_n < 8u) s_party[s_party_n++] = (uint8_t)id;
+        else if (o == 1u && s_party_n > 0u) s_party_n--;
+        else if (o == 2u) { s_party[0] = (uint8_t)id; s_party_n = 1u; }
+        s_pc += 4;
+        return 0; }
+    case 0x1B: s_pc += 3; return 0;  /* HEAL */
+    case 0x1C: s_pc += 4; return 0;  /* PIC_MOVE alt */
+    default:
+        log_kv("BADOP", op);
+        s_runs_bad++;
+        return -1;
+    }
+}
+
+/* ---------------- scheduler ---------------- */
+static uint32_t s_batch_pc;      /* current entry pc */
+static uint8_t  s_batch_active;
+
+static void next_entry(void)
+{
+    if (s_entry_idx >= s_total_entries) {
+        s_phase = 2u;
+        log_flush();
+        return;
+    }
+    uint32_t off;
+    if (s_entry_idx < s_ce_n) {
+        off = s_ce_off[s_entry_idx];
+    } else if (s_entry_idx < s_ce_n + s_pg_n) {
+        off = s_pg_off[s_entry_idx - s_ce_n];
+    } else {
+        off = s_troop_pg_off[s_entry_idx - s_ce_n - s_pg_n];
+    }
+    s_entry_idx++;
+    if (off >= s_evt_len) { s_runs_bad++; return; }
+    vm_reset();
+    s_pc = off;
+    s_steps = 0;
+    s_batch_active = 1u;
+    s_runs_done++;
+}
+
+static void run_slice(uint32_t budget)
+{
+    if (!s_ok_init || s_phase == 2u) return;
+    if (!s_batch_active) next_entry();
+    if (s_phase == 2u) return;
+    for (uint32_t i = 0; i < budget; i++) {
+        int r = vm_step();
+        if (r != 0) {
+            if (r < 0) log_kv("err-at", s_pc);
+            s_batch_active = 0u;
+            log_kv("END entry", s_entry_idx);
+            if (s_steps > STEPS_PER_ENTRY) log_kv("LONG", s_steps);
+            log_flush();
+            next_entry();
+            if (s_phase == 2u) return;
+            continue;
+        }
+        if (s_steps > STEPS_PER_ENTRY) {
+            s_batch_active = 0u;
+            log_kv("LIMIT entry", s_entry_idx);
+            next_entry();
+            if (s_phase == 2u) return;
+            break;
+        }
+    }
+    /* status line */
+    char vb[12];
+    s_status[0] = 'E'; s_status[1] = ' ';
+    u32_to_dec(vb, s_entry_idx);
+    int m = 2, n = 0;
+    while (vb[n]) s_status[m++] = vb[n++];
+    s_status[m++] = ' ';
+    s_status[m++] = 'B';
+    s_status[m++] = ' ';
+    u32_to_dec(vb, s_runs_bad);
+    n = 0; while (vb[n]) s_status[m++] = vb[n++];
+    s_status[m++] = ' ';
+    s_status[m++] = 'P';
+    s_status[m++] = ' ';
+    u32_to_dec(vb, s_pc);
+    n = 0; while (vb[n] && m < (int)sizeof(s_status) - 2) s_status[m++] = vb[n++];
+    s_status[m] = '\0';
+    if (s_label != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, s_status);
+    }
+}
+
+static void bsvm_tick(void *arg)
+{
+    (void)arg;
+    run_slice(400u);
+    if (s_phase == 2u && s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+        log_line("ALL-DONE");
+        log_flush();
+        if (s_label != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM done");
+        }
+    }
+}
+
+/* ---------------- page lifecycle (native-app-demo pattern) ---------------- */
+static int bsvm_on_create(void *page, void *root, void *start_data)
+{
+    (void)page; (void)start_data;
+    s_label = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
+    if (s_label != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM boot");
+    }
+    s_ok_init = 0;
+    int rc = bsvm_load();
+    if (rc == 0) {
+        s_ok_init = 1u;
+        log_line("BSVM headless start");
+        log_kv("entries", s_total_entries);
+        log_kv("evt", s_evt_len);
+        log_kv("db", s_db_len);
+        log_kv("dir", s_dir_len);
+        log_kv("strn", s_strn);
+        log_flush();
+        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+            bsvm_tick, 50u, 0);
+    } else {
+        char msg[32];
+        str_copy(msg, "BSVM load err ", sizeof(msg));
+        char vb[12];
+        u32_to_dec(vb, (uint32_t)(-rc));
+        int n = 0; while (vb[n]) n++;
+        str_copy(msg + 14, vb, sizeof(msg) - 14);
+        if (s_label != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, msg);
+        }
+    }
+    return 0;
+}
+
+static int bsvm_on_resume(void *page)
+{
+    (void)page;
+    if (s_ok_init && s_timer == 0 && s_phase != 2u) {
+        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+            bsvm_tick, 50u, 0);
+    }
+    return 0;
+}
+
+static int bsvm_on_pause(void *page)
+{
+    (void)page;
+    log_flush();
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    return 0;
+}
+
+static int bsvm_on_ui_destroy(void *page)
+{
+    (void)page;
+    log_flush();
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    return 0;
+}
+
+/* ---------------- module lifecycle ---------------- */
+static const struct canopus_context_v1 *s_ctx;
+static uint16_t s_app_id;
+static const char s_display_name[] = "BSVM";
+
+static int32_t bsvm_prepare(const struct canopus_context_v1 *ctx)
+{
+    s_ctx = ctx;
+    return 0;
+}
+
+static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
+{
+    s_ctx = ctx;
+    return 0;
+}
+
+static int32_t bsvm_deactivate(const struct canopus_context_v1 *ctx)
+{
+    (void)ctx;
+    return 0;
+}
+
+static int32_t bsvm_stop(const struct canopus_context_v1 *ctx)
+{
+    (void)ctx;
+    s_ctx = 0;
+    return 0;
+}
+
+static int32_t bsvm_query(struct canopus_status_writer_v1 *writer)
+{
+    (void)writer;
+    return 0;
+}
+
+static struct firmware_page_descriptor s_bsvm_page;
+
+static int32_t bsvm_publish_native_app_stage(const struct canopus_context_v1 *ctx,
+                                             uint32_t stage)
+{
+    if (stage == 1u) {
+        void *pages[1];
+        struct canopus_app_entry_v1 entry;
+        int32_t app_id;
+        if (!canopus_services_has(ctx, CANOPUS_SVC_LAUNCHER, 1) ||
+            ctx->launcher == 0 || ctx->launcher->register_app == 0) {
+            return CANOPUS_SVC_ERR_UNSUPPORTED;
+        }
+        if (s_app_id != 0u) return 0;
+
+        canopus_memset(&s_bsvm_page, 0, sizeof(s_bsvm_page));
+        s_bsvm_page.page_name = (void *)"bsvm_main";
+        s_bsvm_page.page_id = 0u;
+        s_bsvm_page.on_create = (void *)bsvm_on_create;
+        s_bsvm_page.on_resume = (void *)bsvm_on_resume;
+        s_bsvm_page.on_pause = (void *)bsvm_on_pause;
+        s_bsvm_page.on_ui_destroy = (void *)bsvm_on_ui_destroy;
+
+        pages[0] = &s_bsvm_page;
+        canopus_memset(&entry, 0, sizeof(entry));
+        entry.struct_size = sizeof(entry);
+        entry.label = s_display_name;
+        entry.icon = 0;
+        entry.pages = pages;
+        entry.page_count = 1u;
+        app_id = ctx->launcher->register_app(ctx, &entry);
+        if (app_id < 0) return app_id;
+        s_app_id = (uint16_t)app_id;
+        return 0;
+    }
+    if (stage == 2u) {
+        if (s_app_id == 0u) return CANOPUS_SVC_ERR_STATE;
+        (void)((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))(
+            uintptr_t)VENA(FW_PAGE_GOTO))((uint32_t)s_app_id << 16, 0u, 0u, 0u);
+        return 0;
+    }
+    return CANOPUS_SVC_ERR_ARGUMENT;
+}
+
+static const struct canopus_module_descriptor_v1 s_descriptor = {
+    sizeof(struct canopus_module_descriptor_v1),
+    CANOPUS_ABI_MAJOR,
+    CANOPUS_ABI_MINOR,
+    CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
+        CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
+    BSVM_MODULE_ID,
+    "0.1.0",
+    "bsvm",
+    CANOPUS_TARGET_ID,
+    bsvm_prepare,
+    bsvm_activate,
+    bsvm_deactivate,
+    bsvm_stop,
+    bsvm_query,
+    bsvm_publish_native_app_stage,
+};
+
+CANOPUS_MODULE_ENTRY(&s_descriptor)

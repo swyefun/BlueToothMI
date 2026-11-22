@@ -261,3 +261,124 @@ jobs:
           git add -A
           git commit -m "ci log (toolbox): run ${{ github.run_id }} (sha ${{ github.sha }})"
           git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/ci-logs
+  build-bsvm:
+    # Native app-launcher toolbox for firmware 4.100.139: memory + storage
+    # usage. Same pipeline as the headset-link job, different target/module;
+    # artifacts land on the dist-bsvm branch so the two jobs never race.
+    runs-on: ubuntu-latest
+    env:
+      CANOPUS_SHA: f196b200823f47780c73ae48c4c62da8fe5311df
+      TARGET_ID: xiaomi-band-11-4.100.139
+      MODULE_ID: bsvm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Canopus toolchain (pinned, anonymous)
+        run: |
+          git clone --quiet https://github.com/AstralSightStudios/Canopus.git canopus
+          git -C canopus checkout --quiet --detach "$CANOPUS_SHA"
+
+      - name: Install Rust (stable + thumbv8m.main-none-eabi)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabi
+
+      - name: Install LLVM toolchain (clang, ld.lld, llvm-ar, objcopy)
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+
+      - name: Overlay module into Canopus tree
+        run: cp -r modules/bsvm canopus/modules/
+
+      - name: Build canopus CLI
+        working-directory: canopus
+        run: cargo build --release -p canopus-cli
+
+      - name: Doctor
+        working-directory: canopus
+        run: target/release/canopus doctor
+
+      - name: Build module
+        working-directory: canopus/modules/bsvm
+        run: |
+          set -o pipefail
+          ../../target/release/canopus build 2>&1 | tee build-cli.log
+          ../../target/release/canopus package 2>&1 | tee package.log
+
+      - name: Verify ELF against target pack
+        working-directory: canopus
+        run: |
+          elf=$(find modules/bsvm/build -name '*.elf' | head -1)
+          echo "verifying $elf"
+          target/release/canopus verify "$elf" --target "$TARGET_ID" --targets-dir targets 2>&1 | tee modules/bsvm/verify.log
+
+      - name: Build .139 Supervisor + Band 11 framework installer watchface
+        working-directory: canopus
+        run: |
+          CANOPUS_TARGET="$TARGET_ID" sh scripts/build_canopus_supervisor.sh
+          echo "--- staged installer watchface ---"
+          find watchfaces/canopus-installer-prod/xiaomi-band-11 -type f | sort
+
+      - name: Collect deliverables
+        run: |
+          mkdir -p out inbox installer-watchface-bsvm
+          find canopus/modules/bsvm -name '*.canopus' -exec cp {} out/ \;
+          find canopus/modules/bsvm/build -name '*.elf' -exec cp {} out/bsvm.elf \;
+          pkg=$(find out -name '*.canopus' | head -1)
+          tar -xf "$pkg" -C out
+          cp out/receipts/*.cmi "inbox/${MODULE_ID}.cmi.next"
+          cp out/artifacts/*/module.elf "inbox/${MODULE_ID}.ko.next"
+          if [ -d canopus/watchfaces/canopus-installer-prod/xiaomi-band-11 ]; then
+            cp -r canopus/watchfaces/canopus-installer-prod/xiaomi-band-11/* installer-watchface-bsvm/
+          fi
+          echo "--- deliverables ---"
+          find out inbox installer-watchface-bsvm -type f | sort
+
+      - name: Build toolbox module installer watchface (.139)
+        run: |
+          cd canopus
+          python3 - <<'EOF'
+          p = 'scripts/build_module_installer_prod.py'
+          s = open(p, encoding='utf-8').read()
+          old1 = "PRODUCTS = {\n    'resource-hook':"
+          new1 = "PRODUCTS = {\n    'bsvm': ('bsvm', 'BSVM', 4194304, []),\n    'resource-hook':"
+          old2 = "PRODUCT_TARGETS = {\n    'resource-hook':"
+          new2 = "PRODUCT_TARGETS = {\n    'bsvm': ['xiaomi-band-11-4.100.139'],\n    'resource-hook':"
+          assert old1 in s and old2 in s, 'generator anchors missing'
+          open(p, 'w', encoding='utf-8', newline='\n').write(
+              s.replace(old1, new1).replace(old2, new2))
+          EOF
+          mkdir -p build/payload/"$TARGET_ID" build/assets ../module-installer-watchface-bsvm
+          cp ../inbox/"$MODULE_ID".ko.next   build/payload/"$TARGET_ID"/bsvm.elf
+          cp ../inbox/"$MODULE_ID".cmi.next  build/payload/"$TARGET_ID"/receipt.bin
+          python3 scripts/build_module_installer_prod.py \
+            --product bsvm --target "$TARGET_ID" \
+            --payload-dir build/payload --assets-dir build/assets \
+            --output-dir build/installer
+          python3 ../scripts/patch_installer_button.py \
+            build/installer/xiaomi-band-11/main.lua
+          cp -r build/installer/xiaomi-band-11/* ../module-installer-watchface-bsvm/
+
+      - name: Publish deliverables to dist-bsvm branch
+        if: success()
+        run: |
+          mkdir -p pub
+          cp -r out inbox installer-watchface-bsvm module-installer-watchface-bsvm pub/
+          cd pub
+          git init -q -b dist
+          git config user.name "ci-dist"
+          git config user.email "ci-dist@users.noreply.github.com"
+          git add -A
+          git commit -q -m "dist-bsvm: build ${{ github.sha }}"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/dist-bsvm
+
+      - name: Push build log on failure
+        if: failure()
+        run: |
+          git config user.name "ci-logs"
+          git config user.email "ci-logs@users.noreply.github.com"
+          cp canopus/modules/bsvm/*.log . 2>/dev/null || true
+          git checkout --orphan ci-logs-tmp
+          git rm -rf --quiet . || true
+          git add -A
+          git commit -m "ci log (bsvm): run ${{ github.run_id }} (sha ${{ github.sha }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/swyefun/BlueToothMI.git" HEAD:refs/heads/ci-logs
