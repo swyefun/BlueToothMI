@@ -84,6 +84,26 @@ struct b11_mallinfo {
 
 typedef void *(*mallinfo_fn)(struct b11_mallinfo *, void *);
 
+/* The ELF verifier rejects embedded absolute addresses outside its
+ * allowlist, so every firmware address is stored XOR 0x06000000 (the same
+ * trick the headset-link .179 module uses: 0x0A86BD29 ^ 0x06000000 =
+ * 0x0C86BD29). */
+#define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
+
+/* u32/u32 long division (shift-subtract): the zero-import target has no
+ * __aeabi_uldivmod and 64-bit division is therefore unavailable. */
+static uint32_t udiv32(uint32_t n, uint32_t d)
+{
+    uint32_t q = 0u, r = 0u;
+    int i;
+    if (d == 0u) return 0xFFFFFFFFu;
+    for (i = 31; i >= 0; i--) {
+        r = (r << 1) | ((n >> i) & 1u);
+        if (r >= d) { r -= d; q |= (1u << i); }
+    }
+    return q;
+}
+
 /* ------------------------------------------------------------------ */
 /* Module state                                                        */
 /* ------------------------------------------------------------------ */
@@ -164,7 +184,7 @@ static void format_pct(char *buf, uint32_t pct, int valid)
 static void label_set(void *obj, const char *text)
 {
     if (obj != 0) {
-        ((void (*)(void *, const char *))(uintptr_t)FW_LABEL_TEXT)(obj, text);
+        ((void (*)(void *, const char *))VENA(FW_LABEL_TEXT)(obj, text);
     }
 }
 
@@ -175,17 +195,22 @@ static void label_set(void *obj, const char *text)
 static void sample_heap(uintptr_t slot_addr, struct res_sample *out)
 {
     struct b11_mallinfo info;
-    void *heap = *(void **)(uintptr_t)slot_addr;
+    void *heap = *(void **)(uintptr_t)VENA(slot_addr);
     out->valid = 0u;
     out->pct = 0u;
     if (heap == 0) return;
     info.arena = 0u;
     info.uordblks = 0u;
-    ((mallinfo_fn)(uintptr_t)FW_MM_MALLINFO)(&info, heap);
+    ((mallinfo_fn)VENA(FW_MM_MALLINFO)(&info, heap);
     if (info.arena == 0u) return;
     out->used = info.uordblks;
     out->total = info.arena;
-    out->pct = (uint32_t)(((uint64_t)info.uordblks * 100u) / info.arena);
+    {
+        uint32_t scale = info.arena / 100u;
+        if (info.uordblks >= info.arena) out->pct = 100u;
+        else out->pct = scale != 0u ? udiv32(info.uordblks, scale) : 0u;
+        if (out->pct > 100u) out->pct = 100u;
+    }
     if (out->pct > 100u) out->pct = 100u;
     out->valid = 1u;
 }
@@ -193,14 +218,6 @@ static void sample_heap(uintptr_t slot_addr, struct res_sample *out)
 /* ------------------------------------------------------------------ */
 /* Storage sample: /proc/fs/usage (loose parse + probe dump)           */
 /* ------------------------------------------------------------------ */
-
-static int starts_with(const char *s, const char *p)
-{
-    while (*p) {
-        if (*s++ != *p++) return 0;
-    }
-    return 1;
-}
 
 static void sample_storage(void)
 {
@@ -252,10 +269,12 @@ static void sample_storage(void)
                 nums[nnum++] = v;
             } else {
                 if (*p == '\n') {
-                    if (nnum >= 2u && nums[1] >= nums[0] && nums[1] > 0u) {
+                    if (nnum >= 2 && nums[1] >= nums[0] && nums[1] > 0u) {
                         s_sto.used = nums[0];
                         s_sto.total = nums[1];
-                        s_sto.pct = (uint32_t)(((uint64_t)nums[0] * 100u) / nums[1]);
+                        uint32_t scale2 = nums[1] / 100u;
+                        s_sto.pct = nums[0] >= nums[1] ? 100u
+                            : (scale2 != 0u ? udiv32(nums[0], scale2) : 0u);
                         if (s_sto.pct > 100u) s_sto.pct = 100u;
                         s_sto.valid = 1u;
                         break;
@@ -295,7 +314,7 @@ static void refresh_views(void)
     format_kib(det + j, s_mem_umem.total / 1024u);
     label_set(s_detail_mem, det);
     if (s_bar_mem != 0) {
-        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)FW_BAR_VALUE)(
+        ((void (*)(void *, int32_t, uint32_t))VENA(FW_BAR_VALUE)(
             s_bar_mem, (int32_t)s_mem_umem.pct, 1u /* LV_BAR_ANIM_ON */);
     }
 
@@ -317,7 +336,7 @@ static void refresh_views(void)
     }
     label_set(s_detail_sto, det);
     if (s_bar_sto != 0) {
-        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)FW_BAR_VALUE)(
+        ((void (*)(void *, int32_t, uint32_t))VENA(FW_BAR_VALUE)(
             s_bar_sto, (int32_t)s_sto.pct, 1u);
     }
 }
@@ -326,8 +345,8 @@ static void toolbox_tick(void *timer)
 {
     (void)timer;
     s_refresh_count++;
-    sample_heap(UMEM_SLOT, &s_mem_umem);
-    sample_heap(KMEM_SLOT, &s_mem_kmem);
+    sample_heap(VENA(UMEM_SLOT), &s_mem_umem);
+    sample_heap(VENA(KMEM_SLOT), &s_mem_kmem);
     sample_storage();
     refresh_views();
 }
@@ -356,59 +375,59 @@ static int toolbox_on_create(struct firmware_page_descriptor *page,
         uintptr_t)FW_PAGE_TITLE)(root, "工具箱", 0u, 0, 0);
     (void)title;
 
-    s_content = ((void *(*)(void *))(uintptr_t)FW_PAGE_CONTENT)(root);
+    s_content = ((void *(*)(void *))VENA(FW_PAGE_CONTENT)(root);
     if (s_content != 0) {
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)FW_OBJ_SIZE)(
+        ((void (*)(void *, int32_t, int32_t))VENA(FW_OBJ_SIZE)(
             s_content, TB_CONTENT_W, TB_CONTENT_H);
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN)(
+        ((void (*)(void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN)(
             s_content, ALIGN_TOP_MID, 0, TB_CONTENT_TOP);
     }
 
     /* --- memory block --- */
-    s_pct_mem = s_content ? ((void *(*)(void *))(uintptr_t)FW_LABEL_CREATE)(s_content) : 0;
+    s_pct_mem = s_content ? ((void *(*)(void *))VENA(FW_LABEL_CREATE)(s_content) : 0;
     if (s_pct_mem) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN)(
+        ((void (*)(void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN)(
             s_pct_mem, ALIGN_TOP_MID, 0, 24);
         label_set(s_pct_mem, "--%");
     }
-    s_detail_mem = s_content ? ((void *(*)(void *))(uintptr_t)FW_LABEL_CREATE)(s_content) : 0;
+    s_detail_mem = s_content ? ((void *(*)(void *))VENA(FW_LABEL_CREATE)(s_content) : 0;
     if (s_detail_mem) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN)(
+        ((void (*)(void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN)(
             s_detail_mem, ALIGN_TOP_MID, 0, 64);
         label_set(s_detail_mem, "mem");
     }
-    s_bar_mem = s_content ? ((void *(*)(void *))(uintptr_t)FW_BAR_CREATE)(s_content) : 0;
+    s_bar_mem = s_content ? ((void *(*)(void *))VENA(FW_BAR_CREATE)(s_content) : 0;
     if (s_bar_mem) {
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)FW_OBJ_SIZE)(s_bar_mem, 180, 14);
-        ((void (*)(void *, void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN_TO)(
+        ((void (*)(void *, int32_t, int32_t))VENA(FW_OBJ_SIZE)(s_bar_mem, 180, 14);
+        ((void (*)(void *, void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN_TO)(
             s_bar_mem, s_detail_mem, ALIGN_OUT_BOTTOM_MID, 0, 14);
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)FW_BAR_RANGE)(s_bar_mem, 0, 100);
+        ((void (*)(void *, int32_t, int32_t))VENA(FW_BAR_RANGE)(s_bar_mem, 0, 100);
     }
 
     /* --- storage block --- */
-    s_pct_sto = s_content ? ((void *(*)(void *))(uintptr_t)FW_LABEL_CREATE)(s_content) : 0;
+    s_pct_sto = s_content ? ((void *(*)(void *))VENA(FW_LABEL_CREATE)(s_content) : 0;
     if (s_pct_sto) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN)(
+        ((void (*)(void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN)(
             s_pct_sto, ALIGN_TOP_MID, 0, 130);
         label_set(s_pct_sto, "--%");
     }
-    s_detail_sto = s_content ? ((void *(*)(void *))(uintptr_t)FW_LABEL_CREATE)(s_content) : 0;
+    s_detail_sto = s_content ? ((void *(*)(void *))VENA(FW_LABEL_CREATE)(s_content) : 0;
     if (s_detail_sto) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN)(
+        ((void (*)(void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN)(
             s_detail_sto, ALIGN_TOP_MID, 0, 170);
         label_set(s_detail_sto, "storage");
     }
-    s_bar_sto = s_content ? ((void *(*)(void *))(uintptr_t)FW_BAR_CREATE)(s_content) : 0;
+    s_bar_sto = s_content ? ((void *(*)(void *))VENA(FW_BAR_CREATE)(s_content) : 0;
     if (s_bar_sto) {
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)FW_OBJ_SIZE)(s_bar_sto, 180, 14);
-        ((void (*)(void *, void *, uint32_t, int32_t, int32_t))(uintptr_t)FW_OBJ_ALIGN_TO)(
+        ((void (*)(void *, int32_t, int32_t))VENA(FW_OBJ_SIZE)(s_bar_sto, 180, 14);
+        ((void (*)(void *, void *, uint32_t, int32_t, int32_t))VENA(FW_OBJ_ALIGN_TO)(
             s_bar_sto, s_detail_sto, ALIGN_OUT_BOTTOM_MID, 0, 14);
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)FW_BAR_RANGE)(s_bar_sto, 0, 100);
+        ((void (*)(void *, int32_t, int32_t))VENA(FW_BAR_RANGE)(s_bar_sto, 0, 100);
     }
 
     /* initial sample + probe dump, then a 3 s refresh timer */
     toolbox_tick(0);
-    s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)FW_TIMER_CREATE)(
+    s_timer = ((void *(*)(void *, uint32_t, void *))VENA(FW_TIMER_CREATE)(
         toolbox_tick, 3000u, 0);
     return 0;
 }
@@ -417,7 +436,7 @@ static int toolbox_on_resume(struct firmware_page_descriptor *page)
 {
     (void)page;
     if (s_timer == 0) {
-        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)FW_TIMER_CREATE)(
+        s_timer = ((void *(*)(void *, uint32_t, void *))VENA(FW_TIMER_CREATE)(
             toolbox_tick, 3000u, 0);
     }
     return 0;
@@ -427,7 +446,7 @@ static int toolbox_on_pause(struct firmware_page_descriptor *page)
 {
     (void)page;
     if (s_timer != 0) {
-        ((void (*)(void *))(uintptr_t)FW_TIMER_DEL)(s_timer);
+        ((void (*)(void *))VENA(FW_TIMER_DEL)(s_timer);
         s_timer = 0;
     }
     return 0;
@@ -437,7 +456,7 @@ static int toolbox_on_ui_destroy(struct firmware_page_descriptor *page)
 {
     (void)page;
     if (s_timer != 0) {
-        ((void (*)(void *))(uintptr_t)FW_TIMER_DEL)(s_timer);
+        ((void (*)(void *))VENA(FW_TIMER_DEL)(s_timer);
         s_timer = 0;
     }
     return 0;
