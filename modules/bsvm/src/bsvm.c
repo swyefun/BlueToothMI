@@ -39,7 +39,9 @@ typedef int (*posix_open_fn)(const char *, int, ...);
 typedef int (*posix_read_fn)(int, void *, uint32_t);
 typedef int (*posix_write_fn)(int, const void *, uint32_t);
 typedef int (*posix_close_fn)(int);
-typedef int32_t (*posix_lseek_fn)(int, int32_t, int);
+/* firmware lseek is int64_t(int, int64_t, int): the 64-bit offset travels in
+ * the even-aligned r2:r3 pair per AAPCS — a 32-bit call site corrupts it */
+typedef int64_t (*posix_lseek_fn)(int, int64_t, int);
 
 #define O_RDONLY 0
 #define O_RDWR   2
@@ -146,7 +148,7 @@ static void log_flush(void)
     if (s_logn <= 0) return;
     int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(LOG_PATH, O_RDWR | O_CREAT, 0666);
     if (fd >= 0) {
-        ((posix_lseek_fn)vfn(FW_LSEEK))(fd, 0, SEEK_END);
+        ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
         ((posix_write_fn)vfn(FW_POSIX_WRITE))(fd, s_logbuf, (uint32_t)s_logn);
         ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
     }
@@ -225,11 +227,22 @@ static int str_get(uint32_t off, char *out, int max)
     uint32_t end = (lo + 1u < s_strn) ? s_strtab[lo + 1u] : s_str_len;
     uint32_t len = end - off;
     if (len > (uint32_t)(max - 1)) len = (uint32_t)(max - 1);
-    ((posix_lseek_fn)vfn(FW_LSEEK))(s_fd, (int32_t)(s_str_off + off), SEEK_SET);
+    ((posix_lseek_fn)vfn(FW_LSEEK))(s_fd, (int64_t)(s_str_off + off), SEEK_SET);
     int n = ((posix_read_fn)vfn(FW_POSIX_READ))(s_fd, out, len);
     if (n < 0) return -1;
     out[n] = '\0';
     return n;
+}
+
+/* size probe for diagnostics: -1 missing, -2 lseek error, else size */
+static int32_t probe_size(const char *path)
+{
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int64_t sz = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+    ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    if (sz < 0 || sz > 0x7FFFFFF0ll) return -2;
+    return (int32_t)sz;
 }
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -254,13 +267,19 @@ static int read_full(int fd, uint8_t *buf, uint32_t len)
 }
 
 /* ---------------- load ---------------- */
+static uint32_t s_probe_size;    /* size of the opened game-data file */
+
 static int bsvm_load(void)
 {
     uint8_t hdr[38];
     int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_A, O_RDONLY);
     if (fd < 0) fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_B, O_RDONLY);
     if (fd < 0) return -1;
-    if (read_full(fd, hdr, 38) != 38) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -2; }
+    int64_t fsize = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_SET);
+    s_probe_size = (fsize >= 0 && fsize <= 0x7FFFFFF0ll) ? (uint32_t)fsize : 0xFFFFFFFFu;
+    int r = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, hdr, 38);
+    if (r <= 0) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return (r == 0) ? -2 : -8; }
     if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -3; }
     s_str_off = rd32(hdr + 6);
     s_str_len = rd32(hdr + 10) - s_str_off;
@@ -601,6 +620,8 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM");
     }
     s_ok_init = 0;
+    log_line("BSVM create");
+    log_flush();
     int rc = bsvm_load();
     if (rc == 0) {
         s_ok_init = 1u;
@@ -625,6 +646,10 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         }
         log_line("LOAD-FAIL");
         log_kv("code", (uint32_t)(-rc));
+        log_kv("bsize", s_probe_size);
+        log_kv("alt", (uint32_t)probe_size(BIN_PATH_B));
+        log_kv("koinbox", (uint32_t)probe_size("/data/canopus/inbox/bsvm.ko.next"));
+        log_kv("cmi", (uint32_t)probe_size("/data/canopus/inbox/bsvm.cmi.next"));
         log_flush();
     }
     return 0;
@@ -750,7 +775,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.3",
+    "0.1.4",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
