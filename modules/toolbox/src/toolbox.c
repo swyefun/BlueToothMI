@@ -11,19 +11,19 @@
  *     nothing on device; our content box also sat on top of the stock
  *     title area (68 px) — both fixed by dropping the stock header and
  *     drawing the whole layout on the page root
- *   - storage: /proc/fs/usage is DEAD DATA on .139 (its string has zero
- *     code references; procfs entries are not registered). Storage now
- *     walks /data with POSIX opendir/readdir and measures each file with
- *     lseek(fd, 0, SEEK_END); the /data YAFFS partition is capped at
- *     128 MiB (NAND media record 0x8000000 @ 0xcc4e5b0, matching the
- *     .155 data-quota-lift note), so pct = used / 128 MiB.
+ *   - storage: two bars per user request. Bar 1 = total capacity, a full
+ *     pill against the static NAND total (128 MiB media record 0x8000000
+ *     @ 0xcc4e5b0). Bar 2 = user partition /data: used bytes from a POSIX
+ *     tree walk vs the partition size read at runtime via
+ *     ioctl(/dev/nand_data, MTDIOC_GEOMETRY) (fallback: the 128 MiB cap
+ *     the .155 data-quota-lift documented). /proc/fs/usage proved dead
+ *     data (zero code refs), so no procfs probing.
  *   - layout matches the requested screenshot: left-aligned titles.
  *
  * Data sources:
  *   - memory : mm_mallinfo(heap) 0x0c34f0a1 on the Umem heap (verified
  *              working on device in 0.1.0).
- *   - storage: POSIX tree walk (open/lseek/close/opendir/readdir all
- *              verified symbols from the 139 pack).
+ *   - storage: walk + MTD geometry (see v0.3.0 notes above).
  *
  * All firmware veneers are XOR 0x06000000 encoded; percentages use plain
  * u32 division (zero-import target: no __aeabi_uldivmod).
@@ -40,16 +40,6 @@
 /* ------------------------------------------------------------------ */
 /* 139 firmware veneers (from the 139 symbol pack / loader audit)      */
 /* ------------------------------------------------------------------ */
-
-#define FW_POSIX_OPEN   0x0c342c55u /* int open(const char*, int, ...)      */
-#define FW_POSIX_READ   0x0c33d785u /* int read(int, void*, uint32_t)       */
-#define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, uint32_t)*/
-#define FW_POSIX_CLOSE  0xc33818du  /* int close(int)                       */
-#define FW_POSIX_LSEEK  0x0c33d511u /* int64 lseek(int, int64, int)         */
-#define FW_POSIX_OPENDIR 0x0c351749u/* void* opendir(const char*)           */
-#define FW_POSIX_READDIR 0x0c34956bu/* void* readdir(void*)  NuttX dirent: */
-                                            /*   +0 uint8 d_type, +1 d_name[] */
-#define FW_POSIX_CLOSEDIR 0x0c34cd41u/* int closedir(void*)                 */
 
 #define FW_MM_MALLINFO  0x0c34f0a1u /* void* fn(info*, void* heap)          */
 #define UMEM_SLOT       0x200B2590u /* RAM: Umem heap descriptor            */
@@ -72,14 +62,26 @@
  * native-app-demo constants; TOP_LEFT=1 continues the same enumeration). */
 #define ALIGN_TOP_LEFT       1u
 
-/* /data YAFFS capacity: NAND media record 0x8000000 @ 0xcc4e5b0, also the
- * 128 MiB byte cap the .155 data-quota-lift documented. */
-#define DATA_TOTAL_BYTES 0x08000000u
-
 #define TB_SCREEN_W 212
 #define TB_PAD 16
 #define TB_BAR_W (TB_SCREEN_W - 2 * TB_PAD) /* 180 */
 #define TB_SEEK_END 2
+
+#define FW_POSIX_OPEN   0x0c342c55u /* int open(const char*, int, ...)      */
+#define FW_POSIX_CLOSE  0xc33818du  /* int close(int)                       */
+#define FW_POSIX_LSEEK  0x0c33d511u /* int64 lseek(int, int64, int)         */
+#define FW_POSIX_OPENDIR 0x0c351749u/* void* opendir(const char*)           */
+#define FW_POSIX_READDIR 0x0c34956bu/* void* readdir(void*)  NuttX dirent: */
+                                            /*   +0 uint8 d_type, +1 d_name[] */
+#define FW_POSIX_CLOSEDIR 0x0c34cd41u/* int closedir(void*)                 */
+#define FW_IOCTL        0xc341e39u  /* int ioctl(int, uint32_t, ...)        */
+
+/* MTDIOC_GEOMETRY = _IOC(IOC_MTD=0x0d, 0x0001) = 0x0d01. mtd_geometry_s
+ * = { uint32 blocksize, erasesize, pagesize, neraseblocks }. */
+#define MTDIOC_GEOMETRY 0x0d01u
+
+#define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, uint32_t)*/
+#define FW_POSIX_READ   0x0c33d785u /* int read(int, void*, uint32_t)       */
 
 typedef int (*posix_open_fn)(const char *, int, ...);
 typedef int (*posix_read_fn)(int, void *, uint32_t);
@@ -89,7 +91,7 @@ typedef long long (*posix_lseek_fn)(int, long long, int);
 typedef void *(*posix_opendir_fn)(const char *);
 typedef void *(*posix_readdir_fn)(void *);
 typedef int (*posix_closedir_fn)(void *);
-
+typedef int (*ioctl_fn)(int, uint32_t, void *);
 struct b11_mallinfo {
     uint32_t arena, ordblks, aordblks, mxordblk, uordblks, fordblks, usmblks;
 };
@@ -104,12 +106,12 @@ static const struct canopus_context_v1 *s_ctx;
 static uint16_t s_app_id;
 
 static void *s_title;
-static void *s_cap_mem;      /* "内存占用" */
-static void *s_val_mem;      /* "x.xMB / y.yMB" */
-static void *s_bar_mem;
-static void *s_cap_sto;      /* "存储占用" */
-static void *s_val_sto;
-static void *s_bar_sto;
+static void *s_cap_total;    /* "总容量" */
+static void *s_val_total;    /* "128.0MB" static */
+static void *s_bar_total;    /* full pill */
+static void *s_cap_user;     /* "用户分区" */
+static void *s_val_user;     /* "x.xMB / y.yMB" */
+static void *s_bar_user;
 static void *s_timer;
 
 struct res_sample {
@@ -120,11 +122,12 @@ struct res_sample {
 };
 
 static struct res_sample s_mem_umem;
-static struct res_sample s_sto;
+static struct res_sample s_user; /* /data walk vs MTD geometry */
 
 static uint32_t s_refresh_count;
 static uint32_t s_walk_files;
 static uint32_t s_walk_truncated;
+static uint32_t s_user_total;    /* measured partition size (bytes) */
 
 static const char s_display_name[] = "工具箱";
 
@@ -231,6 +234,10 @@ static void sample_heap(uintptr_t slot_addr, struct res_sample *out)
 /* Storage: walk /data and sum file sizes via lseek(SEEK_END)          */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Storage: walk /data (used) + MTD geometry (partition size)          */
+/* ------------------------------------------------------------------ */
+
 static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
                          int depth)
 {
@@ -268,7 +275,6 @@ static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
             s_walk_truncated = 1u;
             break;
         }
-        /* build "<path>/<name>" in scratch */
         {
             uint32_t j = 0, k;
             for (k = 0; k < plen; k++) scratch[j++] = path[k];
@@ -284,8 +290,6 @@ static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
                 (void)closedir_f(sub);
                 s_walk_files++;
                 if (depth < 6) {
-                    /* recurse into the next scratch level: child paths are
-                     * built past the parent string, so they never overlap */
                     sum += walk_dir(scratch, scratch + clen, scratch_len - clen,
                                     depth + 1);
                 }
@@ -309,24 +313,57 @@ static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
     return sum;
 }
 
+/* /dev/nand_data geometry: neraseblocks * erasesize, else fallback */
+static uint32_t sample_user_total(void)
+{
+    struct geo {
+        uint32_t blocksize;
+        uint32_t erasesize;
+        uint32_t pagesize;
+        uint32_t neraseblocks;
+    } g;
+    posix_open_fn open_f = (posix_open_fn)(uintptr_t)VENA(FW_POSIX_OPEN);
+    posix_close_fn close_f = (posix_close_fn)(uintptr_t)VENA(FW_POSIX_CLOSE);
+    ioctl_fn ioctl_f = (ioctl_fn)(uintptr_t)VENA(FW_IOCTL);
+    int fd = open_f("/dev/nand_data", 0);
+    uint32_t total = 0u;
+
+    if (fd >= 0) {
+        g.blocksize = 0u;
+        g.erasesize = 0u;
+        g.pagesize = 0u;
+        g.neraseblocks = 0u;
+        if (ioctl_f(fd, MTDIOC_GEOMETRY, &g) == 0 &&
+            g.neraseblocks != 0u && g.erasesize != 0u) {
+            uint32_t product = g.neraseblocks * g.erasesize;
+            if (g.neraseblocks != 0u && product / g.neraseblocks == g.erasesize) {
+                total = product;
+            }
+        }
+        (void)close_f(fd);
+    }
+    if (total == 0u) total = 0x08000000u; /* NAND media record 0xcc4e5b0 */
+    return total;
+}
+
 static void sample_storage(void)
 {
     static char walk_buf[6][160];
 
-    s_sto.valid = 0u;
-    s_sto.pct = 0u;
+    s_user.valid = 0u;
+    s_user.pct = 0u;
     s_walk_files = 0u;
     s_walk_truncated = 0u;
 
-    s_sto.used = walk_dir("/data", walk_buf[0], 160u, 0);
-    /* /data is the user-visible partition; the NAND record pins 128 MiB. */
-    s_sto.total = DATA_TOTAL_BYTES;
-    if (s_walk_files > 0u || s_sto.used > 0u) {
-        uint32_t scale = DATA_TOTAL_BYTES / 100u;
-        s_sto.pct = s_sto.used >= DATA_TOTAL_BYTES ? 100u
-                  : (scale != 0u ? (s_sto.used / scale) : 0u);
-        if (s_sto.pct > 100u) s_sto.pct = 100u;
-        s_sto.valid = 1u;
+    s_user_total = sample_user_total();
+    s_user.used = walk_dir("/data", walk_buf[0], 160u, 0);
+    s_user.total = s_user_total;
+    {
+        uint32_t scale = s_user_total / 100u;
+        s_user.pct = s_user.used >= s_user_total ? 100u
+                   : (scale != 0u ? (s_user.used / scale) : 0u);
+        if (s_user.pct > 100u) s_user.pct = 100u;
+        s_user.valid = 1u;
     }
     (void)s_walk_truncated;
 }
@@ -346,12 +383,6 @@ static void refresh_views(void)
             s_bar_mem, (int32_t)s_mem_umem.pct, 1u /* LV_BAR_ANIM_ON */);
     }
 
-    format_pair(val, s_sto.used, s_sto.total, s_sto.valid);
-    label_set(s_val_sto, val);
-    if (s_bar_sto != 0) {
-        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_BAR_VALUE))(
-            s_bar_sto, (int32_t)s_sto.pct, 1u);
-    }
 }
 
 static void toolbox_tick(void *timer)
@@ -405,13 +436,21 @@ static int toolbox_on_create(void *page, void *root, void *start_data)
     /* Screenshot-style layout on the page root (212 wide). The stock
      * header area occupies the top 68 px and our 0.1.0 content box sat on
      * top of it; everything now starts below that. */
-    s_title   = add_label(root, "工具箱", TB_PAD, 84);
-    s_cap_mem = add_label(root, "内存占用", TB_PAD, 140);
-    s_val_mem = add_label(root, "--", TB_PAD, 170);
-    s_bar_mem = add_bar(root, TB_PAD, 210);
-    s_cap_sto = add_label(root, "存储占用", TB_PAD, 260);
-    s_val_sto = add_label(root, "--", TB_PAD, 290);
-    s_bar_sto = add_bar(root, TB_PAD, 330);
+    s_title    = add_label(root, "工具箱", TB_PAD, 84);
+    s_cap_mem  = add_label(root, "内存占用", TB_PAD, 140);
+    s_val_mem  = add_label(root, "--", TB_PAD, 170);
+    s_bar_mem  = add_bar(root, TB_PAD, 210);
+    s_cap_total = add_label(root, "总容量", TB_PAD, 260);
+    s_val_total = add_label(root, "128.0MB", TB_PAD, 290);
+    s_bar_total = add_bar(root, TB_PAD, 330);
+    if (s_bar_total != 0) {
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_BAR_VALUE))(
+            s_bar_total, 100, 0);
+    }
+    s_cap_user = add_label(root, "用户分区", TB_PAD, 380);
+    s_val_user = add_label(root, "--", TB_PAD, 410);
+    s_bar_user = add_bar(root, TB_PAD, 450);
+    /* toolbox_tick below samples storage + memory and refreshes all views */
 
     toolbox_tick(0);
     s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
