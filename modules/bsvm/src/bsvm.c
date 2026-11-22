@@ -75,7 +75,6 @@ static uint32_t s_strtab[STRN_MAX];
 static uint32_t s_strn;
 
 static uint32_t s_str_off, s_str_len;
-static int32_t   s_fd = -1;
 
 /* directory indices */
 static uint32_t s_ce_off[256];
@@ -224,7 +223,8 @@ static int str_get(uint32_t off, char *out, int max)
 {
     uint32_t lo = 0, hi = s_strn;
     const struct canopus_fs_obj *fs = (s_ctx != 0) ? s_ctx->fs : 0;
-    if (fs == 0 || fs->read == 0 || fs->seek == 0 || s_fd < 0 || s_strn == 0u) return -1;
+    if (fs == 0 || fs->open == 0 || fs->read == 0 || fs->seek == 0 ||
+        fs->close == 0 || s_strn == 0u) return -1;
     while (lo < hi) {
         uint32_t mid = udiv32(lo + hi, 2u);
         if (s_strtab[mid] < off) lo = mid + 1u;
@@ -234,8 +234,13 @@ static int str_get(uint32_t off, char *out, int max)
     uint32_t end = (lo + 1u < s_strn) ? s_strtab[lo + 1u] : s_str_len;
     uint32_t len = end - off;
     if (len > (uint32_t)(max - 1)) len = (uint32_t)(max - 1);
-    fs->seek(s_ctx, s_fd, (int64_t)(s_str_off + off), CANOPUS_FS_SEEK_SET);
-    int n = fs->read(s_ctx, s_fd, out, len);
+    /* per-call open/close: no service fd stays open across the run, so
+     * raw-VFS log writes never overlap a framework handle */
+    int32_t fd = fs->open(s_ctx, BIN_PATH_A, CANOPUS_FS_READ);
+    if (fd < 0) return -1;
+    fs->seek(s_ctx, fd, (int64_t)(s_str_off + off), CANOPUS_FS_SEEK_SET);
+    int n = fs->read(s_ctx, fd, out, len);
+    fs->close(s_ctx, fd);
     if (n < 0) return -1;
     out[n] = '\0';
     return n;
@@ -290,7 +295,8 @@ static int32_t  s_open_e;        /* errno if even open failed */
 
 /* progress marker written through the FS service itself (no raw-VFS ops
  * while a service fd is open). After a crash the file holds the last step
- * attempted: 1 open, 2 size, 3 hdr read, 4 evt, 5 db, 6 dir, 7 parse, 8 done */
+ * attempted: 1 open 2 size 3 hdr 4 parse 5 evt 6 db 7 dir 8 loaded
+ * 11 strtab 12 ce 13 maps 14 troop-walk 9 done */
 static void ld_mark(const struct canopus_fs_obj *fs, int n)
 {
     char buf[16];
@@ -353,28 +359,36 @@ static int bsvm_load(void)
     ld_mark(fs, 7);
     if (read_full(fs, fd, s_dir, dir_len) != (int)dir_len) { fs->close(s_ctx, fd); return -7; }
     ld_mark(fs, 8);
-    /* keep fd open for string reads */
-    s_fd = fd;
+    /* all sections are in RAM now; close the service fd so raw-VFS log
+     * writes during the run never overlap a framework handle */
+    fs->close(s_ctx, fd);
 
-    /* parse directory */
+    /* parse directory (bounds-checked; sub-markers pinpoint crashes) */
     uint32_t p = 0;
     s_strn = rd32(s_dir + p); p += 4;
     if (s_strn > STRN_MAX) s_strn = STRN_MAX;
+    if ((p + s_strn * 4u + 4u) > dir_len) return -10;
     for (uint32_t i = 0; i < s_strn; i++) { s_strtab[i] = rd32(s_dir + p); p += 4; }
+    ld_mark(fs, 11);
     s_ce_n = rd32(s_dir + p); p += 4;
     if (s_ce_n > 256u) s_ce_n = 256u;
+    if ((p + s_ce_n * 10u) > dir_len) return -10;
     for (uint32_t i = 0; i < s_ce_n; i++) {
         uint32_t id = rd32(s_dir + p); p += 4;
         s_ce_off[i] = rd32(s_dir + p); p += 4;
         s_ce_len[i] = rd16(s_dir + p); p += 2;
         (void)id;
     }
+    ld_mark(fs, 12);
     uint32_t map_n = rd32(s_dir + p); p += 4;
+    if (map_n > 512u) map_n = 512u;
     s_pg_n = 0;
     for (uint32_t m = 0; m < map_n; m++) {
+        if ((p + 8u) > dir_len) return -10;
         uint32_t mid = rd16(s_dir + p); p += 2;
         uint32_t evn = rd16(s_dir + p); p += 2;
         p += 4; /* reserved u32 */
+        if ((p + evn * 12u) > dir_len) return -10;
         for (uint32_t e = 0; e < evn; e++) {
             p += 4; /* eid u16 + page u16 */
             uint32_t off = rd32(s_dir + p); p += 4;
@@ -383,7 +397,9 @@ static int bsvm_load(void)
             (void)mid;
         }
     }
+    ld_mark(fs, 13);
     /* db fields */
+    if ((p + 32u) > dir_len) return -10;
     uint32_t skill_off = rd32(s_dir + p); p += 4;
     uint32_t state_off = rd32(s_dir + p); p += 4;
     uint32_t enemy_off = rd32(s_dir + p); p += 4;
@@ -391,21 +407,29 @@ static int bsvm_load(void)
     p += 16; /* class/actor/items/sz */
     (void)skill_off; (void)state_off; (void)enemy_off;
 
-    /* troop pages: walk troop records in db */
+    /* troop pages: walk troop records in db (bounds-checked) */
     s_troop_pg_n = 0;
     uint32_t tp = troop_off;
-    uint32_t tn = rd16(s_db + tp); tp += 2;
-    for (uint32_t i = 0; i < tn && tp + 8 < s_db_len; i++) {
-        tp += 6;                                   /* id u16 + name u32 */
-        uint32_t nm = s_db[tp]; tp += 1 + nm * 6;
-        uint32_t np = rd16(s_db + tp); tp += 2;
-        for (uint32_t j = 0; j < np; j++) {
-            tp += 9;                               /* condition */
-            uint32_t off = rd32(s_db + tp); tp += 4;
-            if (s_troop_pg_n < 1024u) s_troop_pg_off[s_troop_pg_n++] = off;
+    if (tp + 2u > s_db_len) tp = s_db_len;
+    else {
+        uint32_t tn = rd16(s_db + tp); tp += 2;
+        if (tn > 1024u) tn = 1024u;
+        for (uint32_t i = 0; i < tn && tp + 13u < s_db_len; i++) {
+            tp += 6;                                   /* id u16 + name u32 */
+            uint32_t nm = s_db[tp]; tp += 1 + nm * 6;
+            if (tp + 2u > s_db_len) break;
+            uint32_t np = rd16(s_db + tp); tp += 2;
+            if (np > 64u) np = 64u;
+            for (uint32_t j = 0; j < np; j++) {
+                if (tp + 13u > s_db_len) { tp = s_db_len; break; }
+                tp += 9;                               /* condition */
+                uint32_t off = rd32(s_db + tp); tp += 4;
+                if (s_troop_pg_n < 1024u) s_troop_pg_off[s_troop_pg_n++] = off;
+            }
         }
     }
     s_total_entries = s_ce_n + s_pg_n + s_troop_pg_n;
+    ld_mark(fs, 14);
     ld_mark(fs, 9);
     return 0;
 }
@@ -843,7 +867,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.9",
+    "0.2.0",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
