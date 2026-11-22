@@ -303,21 +303,6 @@ jobs:
           git show FETCH_HEAD:res/bsvm.bin > /tmp/bsvm.bin
           ls -la /tmp/bsvm.bin
 
-      - name: Patch installer Lua for data payload
-        working-directory: canopus
-        run: |
-          echo aW1wb3J0IGlvCnAgPSAnd2F0Y2hmYWNlcy9tb2R1bGUtaW5zdGFsbGVyLXByb2Qvc3JjL21haW4ubHVhJwpzID0gaW8ub3BlbihwLCBlbmNvZGluZz0ndXRmLTgnKS5yZWFkKCkKaWYgJ2RhdGFfbmFtZScgbm90IGluIHM6CiAgICBvbGQgPSAnWyJhc3NldHMiXSA9IHt9LCcKICAgIG5ldyA9IG9sZCArICdcblsiZGF0YV9uYW1lIl0gPSAiYnN2bV9kYXRhLmJpbiIsJwogICAgYXNzZXJ0IG9sZCBpbiBzLCAnY29uZmlnIGFuY2hvciBtaXNzaW5nJwogICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldywgMSkKaWYgJ2RhdGEgcGF5bG9hZCcgbm90IGluIHM6CiAgICBvbGQyID0gKAogICAgICAgICcgICAgbG9jYWwgcGF5bG9hZHMgPSB7XG4nCiAgICAgICAgJyAgICAgICAgeyJpbmJveC8iIC4uIENPTkZJRy50b2tlbiAuLiAiLmNtaS5uZXh0IiwgcmVjZWlwdH0sXG4nCiAgICAgICAgJyAgICAgICAgeyJpbmJveC8iIC4uIENPTkZJRy50b2tlbiAuLiAiLmtvLm5leHQiLCBtb2R1bGV9LFxuJwogICAgICAgICcgICAgfScpCiAgICBuZXcyID0gb2xkMiArICgKICAgICAgICAnXG4nCiAgICAgICAgJyAgICAtLSBCU1ZNIGdhbWUgZGF0YSBwYXlsb2FkIChndWFyZGVkOiBvcHRpb25hbCBmb3Igbm9uLWJzdm0gcHJvZHVjdHMpXG4nCiAgICAgICAgJyAgICBkb1xuJwogICAgICAgICcgICAgICAgIGxvY2FsIG9rLCBic3ZtX2RhdGEgPSBwY2FsbChyZWFkX2FsbCwgU0NSSVBUX1BBVEggLi4gKENPTkZJRy5kYXRhX25hbWUgb3IgImJzdm1fZGF0YS5iaW4iKSlcbicKICAgICAgICAnICAgICAgICBpZiBvayBhbmQgdHlwZShic3ZtX2RhdGEpID09ICJzdHJpbmciIGFuZCAjYnN2bV9kYXRhID4gMTAwMCB0aGVuXG4nCiAgICAgICAgJyAgICAgICAgICAgIHBheWxvYWRzWyNwYXlsb2FkcyArIDFdID0geyJic3ZtL2Jzdm0uYmluIiwgYnN2bV9kYXRhfVxuJwogICAgICAgICcgICAgICAgIGVuZFxuJwogICAgICAgICcgICAgZW5kJykKICAgIGFzc2VydCBvbGQyIGluIHMsICdwYXlsb2FkcyBhbmNob3IgbWlzc2luZycKICAgIHMgPSBzLnJlcGxhY2Uob2xkMiwgbmV3MiwgMSkKaW8ub3BlbihwLCAndycsIGVuY29kaW5nPSd1dGYtOCcsIG5ld2xpbmU9J1xuJykud3JpdGUocykKcHJpbnQoJ2luc3RhbGxlciBsdWEgcGF0Y2hlZCBmb3IgZGF0YSBwYXlsb2FkJykK | base64 -d > /tmp/patch_installer_data.py
-          python3 /tmp/patch_installer_data.py
-          cp /tmp/bsvm.bin watchfaces/module-installer-prod/src/bsvm_data.bin
-
-      - name: Copy data file next to generated main.lua
-        working-directory: canopus
-        run: |
-          # build_module_installer_prod.py copies template src into the output dir;
-          # ensure our data file rides along by placing it in the src dir
-          cp watchfaces/module-installer-prod/src/data/bsvm_data.bin \
-             watchfaces/module-installer-prod/src/bsvm_data.bin 2>/dev/null || true
-
       - name: Build module
         working-directory: canopus/modules/bsvm
         run: |
@@ -379,6 +364,13 @@ jobs:
             build/installer/xiaomi-band-11/main.lua
           cp /tmp/bsvm.bin build/installer/xiaomi-band-11/bsvm_data.bin 2>/dev/null || true
           cp -r build/installer/xiaomi-band-11/* ../module-installer-watchface-bsvm/
+
+      - name: Patch generated installer Lua for data payload
+        working-directory: canopus
+        run: |
+          echo "aW1wb3J0IGlvCnAgPSAnYnVpbGQvaW5zdGFsbGVyL3hpYW9taS1iYW5kLTExL21haW4ubHVhJwpzID0gaW8ub3BlbihwLCBlbmNvZGluZz0ndXRmLTgnKS5yZWFkKCkKaWYgJ2RhdGFfbmFtZScgbm90IGluIHM6CiAgICBvbGQgPSAnWyJhc3NldHMiXSA9IHt9LCcKICAgIG5ldyA9IG9sZCArICdcblsiZGF0YV9uYW1lIl0gPSAiYnN2bV9kYXRhLmJpbiIsJwogICAgYXNzZXJ0IG9sZCBpbiBzLCAnY29uZmlnIGFuY2hvciBtaXNzaW5nJwogICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldywgMSkKaWYgJ2RhdGEgcGF5bG9hZCcgbm90IGluIHM6CiAgICBvbGQyID0gKAogICAgICAgICcgICAgbG9jYWwgcGF5bG9hZHMgPSB7XG4nCiAgICAgICAgJyAgICAgICAgeyJpbmJveC8iIC4uIENPTkZJRy50b2tlbiAuLiAiLmNtaS5uZXh0IiwgcmVjZWlwdH0sXG4nCiAgICAgICAgJyAgICAgICAgeyJpbmJveC8iIC4uIENPTkZJRy50b2tlbiAuLiAiLmtvLm5leHQiLCBtb2R1bGV9LFxuJwogICAgICAgICcgICAgfScpCiAgICBuZXcyID0gb2xkMiArICgKICAgICAgICAnXG4nCiAgICAgICAgJyAgICAtLSBCU1ZNIGdhbWUgZGF0YSBwYXlsb2FkIChndWFyZGVkOiBvcHRpb25hbCBmb3Igbm9uLWJzdm0gcHJvZHVjdHMpXG4nCiAgICAgICAgJyAgICBkb1xuJwogICAgICAgICcgICAgICAgIGxvY2FsIG9rLCBic3ZtX2RhdGEgPSBwY2FsbChyZWFkX2FsbCwgU0NSSVBUX1BBVEggLi4gKENPTkZJRy5kYXRhX25hbWUgb3IgImJzdm1fZGF0YS5iaW4iKSlcbicKICAgICAgICAnICAgICAgICBpZiBvayBhbmQgdHlwZShic3ZtX2RhdGEpID09ICJzdHJpbmciIGFuZCAjYnN2bV9kYXRhID4gMTAwMCB0aGVuXG4nCiAgICAgICAgJyAgICAgICAgICAgIHBheWxvYWRzWyNwYXlsb2FkcyArIDFdID0geyJic3ZtL2Jzdm0uYmluIiwgYnN2bV9kYXRhfVxuJwogICAgICAgICcgICAgICAgIGVuZFxuJwogICAgICAgICcgICAgZW5kJykKICAgIGFzc2VydCBvbGQyIGluIHMsICdwYXlsb2FkcyBhbmNob3IgbWlzc2luZycKICAgIHMgPSBzLnJlcGxhY2Uob2xkMiwgbmV3MiwgMSkKaW8ub3BlbihwLCAndycsIGVuY29kaW5nPSd1dGYtOCcsIG5ld2xpbmU9J1xuJykud3JpdGUocykKcHJpbnQoJ2dlbmVyYXRlZCBpbnN0YWxsZXIgbHVhIHBhdGNoZWQgZm9yIGRhdGEgcGF5bG9hZCcpCg==" | base64 -d > /tmp/patch_installer_data.py
+          python3 /tmp/patch_installer_data.py
+          cp /tmp/bsvm.bin build/installer/xiaomi-band-11/bsvm_data.bin
 
       - name: Publish deliverables to dist-bsvm branch
         if: success()
