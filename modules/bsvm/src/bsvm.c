@@ -45,7 +45,7 @@ typedef int32_t (*posix_lseek_fn)(int, int32_t, int);
 #define SEEK_SET 0
 #define SEEK_END 2
 
-static const char BIN_PATH[] = "/data/bsvm/bsvm.bin";
+static const char BIN_PATH[] = "/data/canopus/bsvm/bsvm.bin";
 static const char LOG_PATH[] = "/data/bsvm/play_log.txt";
 
 /* ---------------- static pools ---------------- */

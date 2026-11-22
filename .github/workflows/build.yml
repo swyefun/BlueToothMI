@@ -297,6 +297,59 @@ jobs:
         working-directory: canopus
         run: target/release/canopus doctor
 
+      - name: Fetch game data (bsvm.bin from bsvm-data branch)
+        run: |
+          git fetch --depth=1 origin bsvm-data
+          git show FETCH_HEAD:res/bsvm.bin > /tmp/bsvm.bin
+          ls -la /tmp/bsvm.bin
+
+      - name: Patch installer Lua for data payload
+        working-directory: canopus
+        run: |
+          python3 - <<'EOF'
+          p = 'watchfaces/module-installer-prod/src/main.lua'
+          s = open(p, encoding='utf-8').read()
+          # 1. inject data config (idempotent)
+          if 'data_name' not in s:
+              old = '["assets"] = {},'
+              new = old + '\n["data_name"] = "bsvm_data.bin",'
+              assert old in s, 'config anchor missing'
+              s = s.replace(old, new, 1)
+          # 2. append the data payload to the staged files (read + verify + write
+          #    are handled by the shared payloads loop with its rollback check)
+          if 'bsvm_data' not in s.split('CONFIG')[0][-0:] or 'data payload' not in s:
+              old2 = '''    local payloads = {
+        {"inbox/" .. CONFIG.token .. ".cmi.next", receipt},
+        {"inbox/" .. CONFIG.token .. ".ko.next", module},
+    }'''
+              new2 = '''    local payloads = {
+        {"inbox/" .. CONFIG.token .. ".cmi.next", receipt},
+        {"inbox/" .. CONFIG.token .. ".ko.next", module},
+    }
+    -- BSVM game data payload (guarded: optional for non-bsvm products)
+    do
+        local ok, bsvm_data = pcall(read_all, SCRIPT_PATH .. (CONFIG.data_name or "bsvm_data.bin"))
+        if ok and type(bsvm_data) == "string" and #bsvm_data > 1000 then
+            payloads[#payloads + 1] = {"bsvm/bsvm.bin", bsvm_data}
+        end
+    end'''
+              assert old2 in s, 'payloads anchor missing'
+              s = s.replace(old2, new2, 1)
+          open(p, 'w', encoding='utf-8', newline='\n').write(s)
+          print('installer lua patched for data payload')
+          EOF
+          cp /tmp/bsvm.bin build-data-bsvm.bin
+          mkdir -p watchfaces/module-installer-prod/src/data
+          cp /tmp/bsvm.bin watchfaces/module-installer-prod/src/data/bsvm_data.bin
+
+      - name: Copy data file next to generated main.lua
+        working-directory: canopus
+        run: |
+          # build_module_installer_prod.py copies template src into the output dir;
+          # ensure our data file rides along by placing it in the src dir
+          cp watchfaces/module-installer-prod/src/data/bsvm_data.bin \
+             watchfaces/module-installer-prod/src/bsvm_data.bin 2>/dev/null || true
+
       - name: Build module
         working-directory: canopus/modules/bsvm
         run: |
@@ -356,6 +409,7 @@ jobs:
             --output-dir build/installer
           python3 ../scripts/patch_installer_button.py \
             build/installer/xiaomi-band-11/main.lua
+          cp /tmp/bsvm.bin build/installer/xiaomi-band-11/bsvm_data.bin 2>/dev/null || true
           cp -r build/installer/xiaomi-band-11/* ../module-installer-watchface-bsvm/
 
       - name: Publish deliverables to dist-bsvm branch
