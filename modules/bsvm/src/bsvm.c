@@ -59,9 +59,9 @@ static const char BIN_PATH_B[] = "/data/canopus/bsvm/bsvm.bin";   /* legacy prob
 static const char LOG_PATH[] = "/data/canopus/bsvm_log.txt";      /* /data/bsvm/ does not exist on device */
 
 /* ---------------- static pools ---------------- */
-#define EVT_MAX 180000u
-#define DB_MAX  116000u
-#define DIR_MAX 160000u
+#define EVT_MAX 178000u
+#define DB_MAX  115200u
+#define DIR_MAX 110000u
 #define STRN_MAX 7200u
 #define STEPS_PER_ENTRY 120000u
 
@@ -80,9 +80,9 @@ static uint32_t s_str_off, s_str_len;
 static uint32_t s_ce_off[256];
 static uint16_t s_ce_len[256];
 static uint32_t s_ce_n;
-static uint32_t s_pg_off[7000];
+static uint32_t s_pg_off[6440];
 static uint32_t s_pg_n;          /* all map pages */
-static uint32_t s_troop_pg_off[1024];
+static uint32_t s_troop_pg_off[720];
 static uint32_t s_troop_pg_n;
 
 /* ---------------- VM state ---------------- */
@@ -362,17 +362,23 @@ static int bsvm_load(void)
     /* all sections are in RAM now; close the service fd so raw-VFS log
      * writes during the run never overlap a framework handle */
     fs->close(s_ctx, fd);
+    /* pool-aliasing probe: if the loader under-allocated bss, s_dir
+     * overlaps s_evt and the first words match */
+    log_kv("d0", rd32(s_dir));
+    log_kv("e0", rd32(s_evt));
+    log_kv("b0", rd32(s_db));
+    log_flush();
 
     /* parse directory (bounds-checked; sub-markers pinpoint crashes) */
     uint32_t p = 0;
     s_strn = rd32(s_dir + p); p += 4;
     if (s_strn > STRN_MAX) s_strn = STRN_MAX;
-    if ((p + s_strn * 4u + 4u) > dir_len) return -10;
+    if ((p + s_strn * 4u + 4u) > dir_len) { log_kv("f1", p); log_kv("sn", s_strn); return -10; }
     for (uint32_t i = 0; i < s_strn; i++) { s_strtab[i] = rd32(s_dir + p); p += 4; }
     ld_mark(fs, 11);
     s_ce_n = rd32(s_dir + p); p += 4;
     if (s_ce_n > 256u) s_ce_n = 256u;
-    if ((p + s_ce_n * 10u) > dir_len) return -10;
+    if ((p + s_ce_n * 10u) > dir_len) { log_kv("f2", p); log_kv("cn", s_ce_n); return -10; }
     for (uint32_t i = 0; i < s_ce_n; i++) {
         uint32_t id = rd32(s_dir + p); p += 4;
         s_ce_off[i] = rd32(s_dir + p); p += 4;
@@ -384,22 +390,22 @@ static int bsvm_load(void)
     if (map_n > 512u) map_n = 512u;
     s_pg_n = 0;
     for (uint32_t m = 0; m < map_n; m++) {
-        if ((p + 8u) > dir_len) return -10;
+        if ((p + 8u) > dir_len) { log_kv("f3", p); return -10; }
         uint32_t mid = rd16(s_dir + p); p += 2;
         uint32_t evn = rd16(s_dir + p); p += 2;
         p += 4; /* reserved u32 */
-        if ((p + evn * 12u) > dir_len) return -10;
+        if ((p + evn * 12u) > dir_len) { log_kv("f4", p); log_kv("mn", map_n); log_kv("en", evn); return -10; }
         for (uint32_t e = 0; e < evn; e++) {
             p += 4; /* eid u16 + page u16 */
             uint32_t off = rd32(s_dir + p); p += 4;
             p += 4; /* size */
-            if (s_pg_n < 7000u) s_pg_off[s_pg_n++] = off;
+            if (s_pg_n < 6440u) s_pg_off[s_pg_n++] = off;
             (void)mid;
         }
     }
     ld_mark(fs, 13);
     /* db fields */
-    if ((p + 32u) > dir_len) return -10;
+    if ((p + 32u) > dir_len) { log_kv("f5", p); return -10; }
     uint32_t skill_off = rd32(s_dir + p); p += 4;
     uint32_t state_off = rd32(s_dir + p); p += 4;
     uint32_t enemy_off = rd32(s_dir + p); p += 4;
@@ -413,7 +419,7 @@ static int bsvm_load(void)
     if (tp + 2u > s_db_len) tp = s_db_len;
     else {
         uint32_t tn = rd16(s_db + tp); tp += 2;
-        if (tn > 1024u) tn = 1024u;
+        if (tn > 720u) tn = 720u;
         for (uint32_t i = 0; i < tn && tp + 13u < s_db_len; i++) {
             tp += 6;                                   /* id u16 + name u32 */
             uint32_t nm = s_db[tp]; tp += 1 + nm * 6;
@@ -424,7 +430,7 @@ static int bsvm_load(void)
                 if (tp + 13u > s_db_len) { tp = s_db_len; break; }
                 tp += 9;                               /* condition */
                 uint32_t off = rd32(s_db + tp); tp += 4;
-                if (s_troop_pg_n < 1024u) s_troop_pg_off[s_troop_pg_n++] = off;
+                if (s_troop_pg_n < 720u) s_troop_pg_off[s_troop_pg_n++] = off;
             }
         }
     }
@@ -867,7 +873,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.2.0",
+    "0.2.1",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
