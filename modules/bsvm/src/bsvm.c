@@ -12,6 +12,7 @@
  */
 
 #include "canopus_module_entry.h"
+#include "canopus_memory.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -89,6 +90,7 @@ static uint32_t s_ret[8];
 static uint32_t s_sp;
 static uint32_t s_steps;
 static uint32_t s_entry_idx;      /* scheduler cursor */
+static uint8_t  s_phase;          /* 0 running, 2 done */
 static uint32_t s_runs_done, s_runs_bad;
 static uint8_t  s_ok_init;
 static uint32_t s_total_entries;
@@ -180,6 +182,21 @@ static void log_text(const char *tag, uint32_t a, const char *txt)
     n = 0; while (txt && txt[n]) n++;
     log_raw(txt, n);
     log_raw("\r\n", 2);
+}
+
+static void log_line(const char *s)
+{
+    int n = 0;
+    while (s[n]) n++;
+    log_raw(s, n);
+    log_raw("\r\n", 2);
+}
+
+static void str_copy(char *d, const char *src, int max)
+{
+    int i = 0;
+    while (src[i] && i < max - 1) { d[i] = src[i]; i++; }
+    d[i] = '\0';
 }
 
 /* ---------------- string access ---------------- */
@@ -542,6 +559,12 @@ static void bsvm_tick(void *arg)
 }
 
 /* ---------------- page lifecycle (native-app-demo pattern) ---------------- */
+static int bsvm_on_signal(void *page, uint32_t event, void *payload)
+{
+    (void)page; (void)event; (void)payload;
+    return 0;
+}
+
 static int bsvm_on_create(void *page, void *root, void *start_data)
 {
     (void)page; (void)start_data;
@@ -662,6 +685,7 @@ static int32_t bsvm_publish_native_app_stage(const struct canopus_context_v1 *ct
         canopus_memset(&s_bsvm_page, 0, sizeof(s_bsvm_page));
         s_bsvm_page.page_name = (void *)"bsvm_main";
         s_bsvm_page.page_id = 0u;
+        s_bsvm_page.on_signal = (void *)bsvm_on_signal;
         s_bsvm_page.on_create = (void *)bsvm_on_create;
         s_bsvm_page.on_resume = (void *)bsvm_on_resume;
         s_bsvm_page.on_pause = (void *)bsvm_on_pause;
@@ -703,7 +727,8 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     bsvm_deactivate,
     bsvm_stop,
     bsvm_query,
+    0,
     bsvm_publish_native_app_stage,
 };
 
-CANOPUS_MODULE_ENTRY(&s_descriptor)
+CANOPUS_MODULE_ENTRY(s_descriptor)
