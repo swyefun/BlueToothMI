@@ -354,11 +354,16 @@ static int bsvm_load(void)
     s_dir_len_v = dir_len;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { fs->close(s_ctx, fd); return -4; }
 
+    /* each section must be seeked to before reading: offsets in the header
+     * are absolute file positions, and read_full starts at the fd's cursor */
     ld_mark(fs, 5);
+    if (fs->seek(s_ctx, fd, (int64_t)evt_off, CANOPUS_FS_SEEK_SET) < 0) { fs->close(s_ctx, fd); return -11; }
     if (read_full(fs, fd, s_evt, s_evt_len) != (int)s_evt_len) { fs->close(s_ctx, fd); return -5; }
     ld_mark(fs, 6);
+    if (fs->seek(s_ctx, fd, (int64_t)db_off, CANOPUS_FS_SEEK_SET) < 0) { fs->close(s_ctx, fd); return -12; }
     if (read_full(fs, fd, s_db, s_db_len) != (int)s_db_len) { fs->close(s_ctx, fd); return -6; }
     ld_mark(fs, 7);
+    if (fs->seek(s_ctx, fd, (int64_t)dir_off, CANOPUS_FS_SEEK_SET) < 0) { fs->close(s_ctx, fd); return -13; }
     if (read_full(fs, fd, s_dir, dir_len) != (int)dir_len) { fs->close(s_ctx, fd); return -7; }
     ld_mark(fs, 8);
     /* all sections are in RAM now; close the service fd so raw-VFS log
@@ -878,7 +883,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.2.2",
+    "0.2.3",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
