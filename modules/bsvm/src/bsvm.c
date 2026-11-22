@@ -101,6 +101,8 @@ static uint32_t s_steps;
 static uint32_t s_entry_idx;      /* scheduler cursor */
 static uint8_t  s_phase;          /* 0 running, 2 done */
 static uint32_t s_runs_done, s_runs_bad;
+static uint32_t s_opcnt[256];    /* opcode usage histogram for UI planning */
+static uint32_t s_total_steps;   /* steps across all entries */
 static uint32_t s_text_n;         /* TEXT ops processed (not logged) */
 static uint8_t  s_ok_init;
 static uint32_t s_total_entries;
@@ -467,6 +469,8 @@ static int vm_step(void)
     uint8_t op = s_evt[s_pc];
     uint32_t a = s_pc + 1;
     s_steps++;
+    s_total_steps++;
+    s_opcnt[op]++;
 
     switch (op) {
     case 0x00: /* END */
@@ -634,6 +638,7 @@ static void next_entry(void)
         off = s_troop_pg_off[s_entry_idx - s_ce_n - s_pg_n];
     }
     s_entry_idx++;
+    s_total_steps += s_steps;   /* carry the just-finished entry's steps */
     if (off >= s_evt_len) { s_runs_bad++; return; }
     vm_reset();
     s_pc = off;
@@ -700,6 +705,22 @@ static void bsvm_tick(void *arg)
         ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
         s_timer = 0;
         log_line("ALL-DONE");
+        /* opcode histogram: only non-zero entries, format "opNN <count>" */
+        for (uint32_t op = 0u; op < 256u; op++) {
+            if (s_opcnt[op] == 0u) continue;
+            char key[8];
+            key[0] = 'o'; key[1] = 'p';
+            uint32_t v = op;
+            char hex[2];
+            hex[0] = (v >> 4) < 10u ? (char)('0' + (v >> 4)) : (char)('A' + (v >> 4) - 10u);
+            hex[1] = (v & 15u) < 10u ? (char)('0' + (v & 15u)) : (char)('A' + (v & 15u) - 10u);
+            key[2] = hex[0]; key[3] = hex[1]; key[4] = '\0';
+            log_kv(key, s_opcnt[op]);
+        }
+        log_kv("entries", s_total_entries);
+        log_kv("done", s_runs_done);
+        log_kv("bad", s_runs_bad);
+        log_kv("steps", s_total_steps);
         log_flush();
         if (s_label != 0) {
             ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM OK");
@@ -883,7 +904,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.2.3",
+    "0.2.4",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
