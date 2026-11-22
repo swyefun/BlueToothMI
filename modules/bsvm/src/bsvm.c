@@ -45,8 +45,9 @@ typedef int32_t (*posix_lseek_fn)(int, int32_t, int);
 #define SEEK_SET 0
 #define SEEK_END 2
 
-static const char BIN_PATH[] = "/data/canopus/bsvm/bsvm.bin";
-static const char LOG_PATH[] = "/data/bsvm/play_log.txt";
+static const char BIN_PATH_A[] = "/data/canopus/bsvm.bin";        /* v0.1.1: flat path, no subdir needed */
+static const char BIN_PATH_B[] = "/data/canopus/bsvm/bsvm.bin";   /* legacy installer path */
+static const char LOG_PATH[] = "/data/canopus/bsvm_log.txt";      /* /data/bsvm/ does not exist on device */
 
 /* ---------------- static pools ---------------- */
 #define EVT_MAX 180000u
@@ -231,7 +232,8 @@ static uint32_t rd32(const uint8_t *p)
 static int bsvm_load(void)
 {
     uint8_t hdr[38];
-    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH, O_RDONLY);
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_A, O_RDONLY);
+    if (fd < 0) fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_B, O_RDONLY);
     if (fd < 0) return -1;
     if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, hdr, 38) != 38) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -2; }
     if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -3; }
@@ -553,7 +555,7 @@ static void bsvm_tick(void *arg)
         log_line("ALL-DONE");
         log_flush();
         if (s_label != 0) {
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM done");
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM OK");
         }
     }
 }
@@ -570,7 +572,7 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
     (void)page; (void)start_data;
     s_label = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
     if (s_label != 0) {
-        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM boot");
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM");
     }
     s_ok_init = 0;
     int rc = bsvm_load();
@@ -586,15 +588,18 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
             bsvm_tick, 50u, 0);
     } else {
-        char msg[32];
-        str_copy(msg, "BSVM load err ", sizeof(msg));
+        /* short label: round-screen bezel clips long text */
+        char msg[12];
         char vb[12];
         u32_to_dec(vb, (uint32_t)(-rc));
-        int n = 0; while (vb[n]) n++;
-        str_copy(msg + 14, vb, sizeof(msg) - 14);
+        msg[0] = 'L';
+        str_copy(msg + 1, vb, sizeof(msg) - 1);
         if (s_label != 0) {
             ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, msg);
         }
+        log_line("LOAD-FAIL");
+        log_kv("code", (uint32_t)(-rc));
+        log_flush();
     }
     return 0;
 }
@@ -719,7 +724,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.0",
+    "0.1.1",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
