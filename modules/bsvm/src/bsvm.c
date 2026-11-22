@@ -228,6 +228,20 @@ static uint32_t rd32(const uint8_t *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* chunked read: firmware may cap a single read() transfer */
+static int read_full(int fd, uint8_t *buf, uint32_t len)
+{
+    uint32_t got = 0;
+    while (got < len) {
+        uint32_t want = len - got;
+        if (want > 32768u) want = 32768u;
+        int r = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, buf + got, want);
+        if (r <= 0) return -1;
+        got += (uint32_t)r;
+    }
+    return (int)got;
+}
+
 /* ---------------- load ---------------- */
 static int bsvm_load(void)
 {
@@ -235,7 +249,7 @@ static int bsvm_load(void)
     int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_A, O_RDONLY);
     if (fd < 0) fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_B, O_RDONLY);
     if (fd < 0) return -1;
-    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, hdr, 38) != 38) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -2; }
+    if (read_full(fd, hdr, 38) != 38) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -2; }
     if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -3; }
     s_str_off = rd32(hdr + 6);
     s_str_len = rd32(hdr + 10) - s_str_off;
@@ -247,9 +261,9 @@ static int bsvm_load(void)
     uint32_t dir_len = rd32(hdr + 34) - dir_off;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -4; }
 
-    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_evt, s_evt_len) != (int)s_evt_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -5; }
-    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_db, s_db_len) != (int)s_db_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -6; }
-    if (((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_dir, dir_len) != (int)dir_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -7; }
+    if (read_full(fd, s_evt, s_evt_len) != (int)s_evt_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -5; }
+    if (read_full(fd, s_db, s_db_len) != (int)s_db_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -6; }
+    if (read_full(fd, s_dir, dir_len) != (int)dir_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -7; }
     /* keep fd open for string reads */
     s_fd = fd;
 
@@ -724,7 +738,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.1",
+    "0.1.2",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
