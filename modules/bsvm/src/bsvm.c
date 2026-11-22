@@ -50,8 +50,8 @@ typedef int64_t (*posix_lseek_fn)(int, int64_t, int);
 #define SEEK_SET 0
 #define SEEK_END 2
 
-static const char BIN_PATH_A[] = "/data/canopus/bsvm.bin";        /* v0.1.1: flat path, no subdir needed */
-static const char BIN_PATH_B[] = "/data/canopus/bsvm/bsvm.bin";   /* legacy installer path */
+static const char BIN_PATH_A[] = "/data/bsvm.bin";                /* v0.1.6: outside /data/canopus (framework denies module reads there) */
+static const char BIN_PATH_B[] = "/data/canopus/bsvm/bsvm.bin";   /* legacy probe only */
 static const char LOG_PATH[] = "/data/canopus/bsvm_log.txt";      /* /data/bsvm/ does not exist on device */
 
 /* ---------------- static pools ---------------- */
@@ -71,7 +71,7 @@ static uint32_t s_strtab[STRN_MAX];
 static uint32_t s_strn;
 
 static uint32_t s_str_off, s_str_len;
-static int      s_fd = -1;
+static int32_t   s_fd = -1;
 
 /* directory indices */
 static uint32_t s_ce_off[256];
@@ -218,7 +218,8 @@ static void label_center(void *obj)
 static int str_get(uint32_t off, char *out, int max)
 {
     uint32_t lo = 0, hi = s_strn;
-    if (s_fd < 0 || s_strn == 0u) return -1;
+    const struct canopus_fs_obj *fs = (s_ctx != 0) ? s_ctx->fs : 0;
+    if (fs == 0 || fs->read == 0 || fs->seek == 0 || s_fd < 0 || s_strn == 0u) return -1;
     while (lo < hi) {
         uint32_t mid = udiv32(lo + hi, 2u);
         if (s_strtab[mid] < off) lo = mid + 1u;
@@ -228,8 +229,8 @@ static int str_get(uint32_t off, char *out, int max)
     uint32_t end = (lo + 1u < s_strn) ? s_strtab[lo + 1u] : s_str_len;
     uint32_t len = end - off;
     if (len > (uint32_t)(max - 1)) len = (uint32_t)(max - 1);
-    ((posix_lseek_fn)vfn(FW_LSEEK))(s_fd, (int64_t)(s_str_off + off), SEEK_SET);
-    int n = ((posix_read_fn)vfn(FW_POSIX_READ))(s_fd, out, len);
+    fs->seek(s_ctx, s_fd, (int64_t)(s_str_off + off), CANOPUS_FS_SEEK_SET);
+    int n = fs->read(s_ctx, s_fd, out, len);
     if (n < 0) return -1;
     out[n] = '\0';
     return n;
@@ -259,14 +260,16 @@ static uint32_t rd32(const uint8_t *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* chunked read: firmware may cap a single read() transfer */
-static int read_full(int fd, uint8_t *buf, uint32_t len)
+/* chunked read via the Canopus FS service. Raw firmware read() is ACCESS-
+ * denied for module tasks inside /data/canopus; ctx->fs is the sanctioned
+ * path and /data/bsvm.bin sits outside the guarded area. */
+static int read_full(const struct canopus_fs_obj *fs, int32_t fd, uint8_t *buf, uint32_t len)
 {
     uint32_t got = 0;
     while (got < len) {
         uint32_t want = len - got;
         if (want > 32768u) want = 32768u;
-        int r = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, buf + got, want);
+        int r = fs->read(s_ctx, fd, buf + got, want);
         if (r <= 0) return -1;
         got += (uint32_t)r;
     }
@@ -282,30 +285,30 @@ static int32_t  s_open_e;        /* errno if even open failed */
 static int bsvm_load(void)
 {
     uint8_t hdr[38];
-    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_A, O_RDONLY, 0);
-    if (fd < 0) fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_B, O_RDONLY, 0);
-    if (fd < 0) { s_open_e = last_errno(); return -1; }
-    int64_t fsize = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
-    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_SET);
+    const struct canopus_fs_obj *fs = (s_ctx != 0) ? s_ctx->fs : 0;
+    if (fs == 0 || fs->open == 0 || fs->read == 0 || fs->seek == 0 || fs->size == 0 || fs->close == 0) return -9;
+    int32_t fd = fs->open(s_ctx, BIN_PATH_A, CANOPUS_FS_READ);
+    if (fd < 0) { s_open_e = fd; return -1; }
+    int64_t fsize = fs->size(s_ctx, fd);
     s_probe_size = (fsize >= 0 && fsize <= 0x7FFFFFF0ll) ? (uint32_t)fsize : 0xFFFFFFFFu;
-    int r = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, hdr, 38);
+    int r = fs->read(s_ctx, fd, hdr, 38);
     s_hdr_r = (uint32_t)r;
     if (r <= 0) {
-        s_e1 = last_errno();
-        /* retry with a static-pool buffer: distinguishes EFAULT (stack
-         * buffer unreachable) from fd-level read failure */
-        int r2 = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_evt, 38);
+        s_e1 = (r < 0) ? (int)(-r) : 0;
+        /* retry with a static-pool buffer: distinguishes buffer-access
+         * failures from fd-level read failure */
+        int r2 = fs->read(s_ctx, fd, s_evt, 38);
         if (r2 > 0) {
             for (int i = 0; i < 38; i++) hdr[i] = s_evt[i];
             r = r2;
             s_e2 = 0;
         } else {
-            s_e2 = last_errno();
-            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+            s_e2 = (r2 < 0) ? (int)(-r2) : 0;
+            fs->close(s_ctx, fd);
             return (r == 0 && r2 == 0) ? -2 : -8;
         }
     }
-    if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -3; }
+    if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { fs->close(s_ctx, fd); return -3; }
     s_str_off = rd32(hdr + 6);
     s_str_len = rd32(hdr + 10) - s_str_off;
     uint32_t evt_off = rd32(hdr + 14);
@@ -314,11 +317,11 @@ static int bsvm_load(void)
     s_db_len = rd32(hdr + 26) - db_off;
     uint32_t dir_off = rd32(hdr + 30);
     uint32_t dir_len = rd32(hdr + 34) - dir_off;
-    if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -4; }
+    if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { fs->close(s_ctx, fd); return -4; }
 
-    if (read_full(fd, s_evt, s_evt_len) != (int)s_evt_len) { s_e1 = last_errno(); ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -5; }
-    if (read_full(fd, s_db, s_db_len) != (int)s_db_len) { s_e1 = last_errno(); ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -6; }
-    if (read_full(fd, s_dir, dir_len) != (int)dir_len) { s_e1 = last_errno(); ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -7; }
+    if (read_full(fs, fd, s_evt, s_evt_len) != (int)s_evt_len) { fs->close(s_ctx, fd); return -5; }
+    if (read_full(fs, fd, s_db, s_db_len) != (int)s_db_len) { fs->close(s_ctx, fd); return -6; }
+    if (read_full(fs, fd, s_dir, dir_len) != (int)dir_len) { fs->close(s_ctx, fd); return -7; }
     /* keep fd open for string reads */
     s_fd = fd;
 
@@ -805,7 +808,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.5",
+    "0.1.6",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
