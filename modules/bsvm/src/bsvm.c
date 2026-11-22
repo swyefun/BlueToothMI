@@ -102,6 +102,7 @@ static uint32_t s_steps;
 static uint32_t s_entry_idx;      /* scheduler cursor */
 static uint8_t  s_phase;          /* 0 running, 2 done */
 static uint32_t s_runs_done, s_runs_bad;
+static uint32_t s_text_n;         /* TEXT ops processed (not logged) */
 static uint8_t  s_ok_init;
 static uint32_t s_total_entries;
 
@@ -266,13 +267,14 @@ static uint32_t rd32(const uint8_t *p)
 
 /* chunked read via the Canopus FS service. Raw firmware read() is ACCESS-
  * denied for module tasks inside /data/canopus; ctx->fs is the sanctioned
- * path and /data/bsvm.bin sits outside the guarded area. */
+ * path and /data/bsvm.bin sits outside the guarded area. 4KB chunks: large
+ * single transfers appear to block the service (watchdog reboot at 32KB). */
 static int read_full(const struct canopus_fs_obj *fs, int32_t fd, uint8_t *buf, uint32_t len)
 {
     uint32_t got = 0;
     while (got < len) {
         uint32_t want = len - got;
-        if (want > 32768u) want = 32768u;
+        if (want > 4096u) want = 4096u;
         int r = fs->read(s_ctx, fd, buf + got, want);
         if (r <= 0) return -1;
         got += (uint32_t)r;
@@ -326,9 +328,17 @@ static int bsvm_load(void)
     uint32_t dir_len = dir_end - dir_off;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { fs->close(s_ctx, fd); return -4; }
 
+    log_kv("ld1", s_evt_len);
+    log_flush();
     if (read_full(fs, fd, s_evt, s_evt_len) != (int)s_evt_len) { fs->close(s_ctx, fd); return -5; }
+    log_kv("ld2", s_db_len);
+    log_flush();
     if (read_full(fs, fd, s_db, s_db_len) != (int)s_db_len) { fs->close(s_ctx, fd); return -6; }
+    log_kv("ld3", dir_len);
+    log_flush();
     if (read_full(fs, fd, s_dir, dir_len) != (int)dir_len) { fs->close(s_ctx, fd); return -7; }
+    log_kv("ldok", dir_len);
+    log_flush();
     /* keep fd open for string reads */
     s_fd = fd;
 
@@ -410,13 +420,14 @@ static int vm_step(void)
         s_sp--;
         s_pc = s_ret[s_sp];
         return 0;
-    case 0x01: { /* TEXT */
-        char txt[240];
+    case 0x01: { /* TEXT: full bodies only for the first 50 entries (a full
+                  * run would otherwise write megabytes to NAND) */
+        char txt[96];
         uint32_t idx = rd32(s_evt + a);
-        if (str_get(idx, txt, (int)sizeof(txt)) >= 0) {
+        if (s_entry_idx <= 50u && str_get(idx, txt, (int)sizeof(txt)) >= 0) {
             log_text("T", 0u, txt);
         } else {
-            log_kv("T?str", idx);
+            s_text_n++;
         }
         s_pc += 5;
         return 0; }
@@ -589,9 +600,11 @@ static void run_slice(uint32_t budget)
             s_batch_active = 0u;
             log_kv("END entry", s_entry_idx);
             if (s_steps > STEPS_PER_ENTRY) log_kv("LONG", s_steps);
-            log_flush();
             next_entry();
             if (s_phase == 2u) return;
+            /* flush only when the buffer is near full or every 256 entries:
+             * per-entry NAND appends starved the firmware watchdog */
+            if (s_logn > 1600 || (s_entry_idx % 256u) == 0u) log_flush();
             continue;
         }
         if (s_steps > STEPS_PER_ENTRY) {
@@ -599,24 +612,25 @@ static void run_slice(uint32_t budget)
             log_kv("LIMIT entry", s_entry_idx);
             next_entry();
             if (s_phase == 2u) return;
+            if (s_logn > 1600 || (s_entry_idx % 256u) == 0u) log_flush();
             break;
         }
     }
     /* status line */
     char vb[12];
-    s_status[0] = 'E'; s_status[1] = ' ';
+    s_status[0] = 'E';
     u32_to_dec(vb, s_entry_idx);
     int m = 2, n = 0;
     while (vb[n]) s_status[m++] = vb[n++];
     s_status[m++] = ' ';
+    s_status[m++] = 'T';
+    s_status[m++] = ' ';
+    u32_to_dec(vb, s_text_n);
+    n = 0; while (vb[n]) s_status[m++] = vb[n++];
+    s_status[m++] = ' ';
     s_status[m++] = 'B';
     s_status[m++] = ' ';
     u32_to_dec(vb, s_runs_bad);
-    n = 0; while (vb[n]) s_status[m++] = vb[n++];
-    s_status[m++] = ' ';
-    s_status[m++] = 'P';
-    s_status[m++] = ' ';
-    u32_to_dec(vb, s_pc);
     n = 0; while (vb[n] && m < (int)sizeof(s_status) - 2) s_status[m++] = vb[n++];
     s_status[m] = '\0';
     if (s_label != 0) {
@@ -814,7 +828,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.7",
+    "0.1.8",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
