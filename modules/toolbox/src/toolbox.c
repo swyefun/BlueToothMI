@@ -106,6 +106,9 @@ static const struct canopus_context_v1 *s_ctx;
 static uint16_t s_app_id;
 
 static void *s_title;
+static void *s_cap_mem;      /* "内存占用" */
+static void *s_val_mem;      /* "x.xMB / y.yMB" */
+static void *s_bar_mem;
 static void *s_cap_total;    /* "总容量" */
 static void *s_val_total;    /* "128.0MB" static */
 static void *s_bar_total;    /* full pill */
