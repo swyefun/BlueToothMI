@@ -30,6 +30,8 @@
 #define FW_TIMER_CREATE 0x0c3abd21u
 #define FW_TIMER_DEL    0x0c3abe71u
 #define FW_PAGE_GOTO    0x0c8ed781u
+#define FW_OBJ_ALIGN    0x0c387789u /* void(obj, align, x, y)               */
+#define ALIGN_CENTER    9u          /* lv_align_t LV_ALIGN_CENTER (lvgl v8) */
 
 #define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
 
@@ -198,6 +200,15 @@ static void str_copy(char *d, const char *src, int max)
     int i = 0;
     while (src[i] && i < max - 1) { d[i] = src[i]; i++; }
     d[i] = '\0';
+}
+
+/* default label lands at (0,0) — fully hidden by the round bezel */
+static void label_center(void *obj)
+{
+    if (obj != 0) {
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+            obj, ALIGN_CENTER, 0, 0);
+    }
 }
 
 /* ---------------- string access ---------------- */
@@ -585,6 +596,7 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
 {
     (void)page; (void)start_data;
     s_label = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
+    label_center(s_label);
     if (s_label != 0) {
         ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM");
     }
@@ -738,7 +750,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.2",
+    "0.1.3",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
