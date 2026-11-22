@@ -423,7 +423,7 @@ static void toolbox_tick(void *timer)
     s_refresh_count++;
     stage_mark("tick", s_refresh_count, 0u);
     sample_heap(UMEM_SLOT, &s_mem_umem);
-    stage_mark("heap-done", s_mem_umem.pct, s_mem_umem.arena);
+    stage_mark("heap-done", s_mem_umem.pct, s_mem_umem.total);
     sample_storage();
     refresh_views();
     stage_mark("refresh-done", s_refresh_count, s_user.used);
