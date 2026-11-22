@@ -1,0 +1,21 @@
+schema = 1
+
+[module]
+id = "toolbox"
+version = "0.1.0"
+version_code = 1
+kind = "target"
+language = "c"
+lifecycle = "removable"
+canopus_abi = "2"
+description = "Native toolbox app: memory + storage usage rings in the app launcher (Band 11 4.100.139)"
+
+[build]
+sources = [
+  "src/toolbox.c",
+]
+
+[targets]
+include = [
+  "xiaomi-band-11-4.100.139",
+]
