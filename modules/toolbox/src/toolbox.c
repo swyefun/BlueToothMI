@@ -1,27 +1,32 @@
 /*
- * toolbox.c — Band 11 native toolbox application (4.100.139).
+ * toolbox.c — Band 11 native toolbox application (4.100.139), v0.2.0.
  *
- * A native application that lives in the app launcher (NOT a watchface):
- * page 1 shows memory usage and storage usage as large percentages with
- * progress bars, refreshed by an LVGL timer.
+ * A native application that lives in the app launcher (NOT a watchface).
+ * Page 1 shows memory and storage usage stock-style: small section title,
+ * large "used / total" line, full-width pill bar underneath, refreshed by
+ * an LVGL timer.
  *
- * Data sources (no restricted callables beyond the UI/heap addresses that
- * the 139 loader audit already pins):
- *   - memory : mm_mallinfo(heap) 0x0c34f0a1 on the Umem and Kmem heaps.
- *              7-word record {arena, ordblks, aordblks, mxordblk, uordblks,
- *              fordblks, usmblks}; used% = uordblks/arena.
- *   - storage: the firmware procfs exposes /proc/fs/usage (string at
- *              0xcb1a4bd). We read it with the stock POSIX open/read and
- *              parse loosely; the raw text is also appended to
- *              /data/canopus/toolbox_probe.txt so the real format can be
- *              confirmed on the first device run.
+ * v0.2.0 changes over 0.1.0 (device feedback):
+ *   - own title label ("工具箱"): the recovered page_title call rendered
+ *     nothing on device; our content box also sat on top of the stock
+ *     title area (68 px) — both fixed by dropping the stock header and
+ *     drawing the whole layout on the page root
+ *   - storage: /proc/fs/usage is DEAD DATA on .139 (its string has zero
+ *     code references; procfs entries are not registered). Storage now
+ *     walks /data with POSIX opendir/readdir and measures each file with
+ *     lseek(fd, 0, SEEK_END); the /data YAFFS partition is capped at
+ *     128 MiB (NAND media record 0x8000000 @ 0xcc4e5b0, matching the
+ *     .155 data-quota-lift note), so pct = used / 128 MiB.
+ *   - layout matches the requested screenshot: left-aligned titles.
  *
- * App entry registration follows modules/examples/native-app-demo:
- * ctx->launcher->register_app queues app_install (0x0c6ab351) and
- * app_launcher_add (0x0c547b55) on separate UI ticks.
+ * Data sources:
+ *   - memory : mm_mallinfo(heap) 0x0c34f0a1 on the Umem heap (verified
+ *              working on device in 0.1.0).
+ *   - storage: POSIX tree walk (open/lseek/close/opendir/readdir all
+ *              verified symbols from the 139 pack).
  *
- * All firmware veneers below are transcribed from the 139 target pack
- * (targets/xiaomi-band-11-4.100.139/symbols + generated headers).
+ * All firmware veneers are XOR 0x06000000 encoded; percentages use plain
+ * u32 division (zero-import target: no __aeabi_uldivmod).
  */
 
 #include "canopus_module_entry.h"
@@ -36,73 +41,60 @@
 /* 139 firmware veneers (from the 139 symbol pack / loader audit)      */
 /* ------------------------------------------------------------------ */
 
-#define FW_POSIX_OPEN   0x0c342c55u /* int open(const char*, int, ...) */
-#define FW_POSIX_READ   0x0c33d785u /* int read(int, void*, uint32_t)  */
-#define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, u32)*/
-#define FW_POSIX_CLOSE  0xc33818du  /* int close(int)                  */
+#define FW_POSIX_OPEN   0x0c342c55u /* int open(const char*, int, ...)      */
+#define FW_POSIX_READ   0x0c33d785u /* int read(int, void*, uint32_t)       */
+#define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, uint32_t)*/
+#define FW_POSIX_CLOSE  0xc33818du  /* int close(int)                       */
+#define FW_POSIX_LSEEK  0x0c33d511u /* int64 lseek(int, int64, int)         */
+#define FW_POSIX_OPENDIR 0x0c351749u/* void* opendir(const char*)           */
+#define FW_POSIX_READDIR 0x0c34956bu/* void* readdir(void*)  NuttX dirent: */
+                                            /*   +0 uint8 d_type, +1 d_name[] */
+#define FW_POSIX_CLOSEDIR 0x0c34cd41u/* int closedir(void*)                 */
 
-#define FW_MM_MALLINFO  0x0c34f0a1u /* void* fn(info*, void* heap)     */
-#define UMEM_SLOT       0x200B2590u /* RAM: Umem heap descriptor       */
-#define KMEM_SLOT       0x200B01C8u /* RAM: Kmem heap descriptor       */
-#define UMEM_EXPECT     0x3C356B40u /* audited Umem bounds base        */
+#define FW_MM_MALLINFO  0x0c34f0a1u /* void* fn(info*, void* heap)          */
+#define UMEM_SLOT       0x200B2590u /* RAM: Umem heap descriptor            */
+#define KMEM_SLOT       0x200B01C8u /* RAM: Kmem heap descriptor            */
 
-#define FW_PAGE_TITLE   0x0c89e7ddu /* void*(root, name, u32, cb, user)*/
-#define FW_PAGE_CONTENT 0x0c693f79u /* void*(root)                     */
-#define FW_LABEL_CREATE 0x0c3ab301u /* void*(parent)                   */
-#define FW_LABEL_TEXT   0x0c3b3949u /* void(label, const char*)        */
-#define FW_OBJ_CREATE   0x0c380687u /* void*(parent)                   */
-#define FW_OBJ_SIZE     0x0c387ba9u /* void(obj, w, h)                 */
-#define FW_OBJ_ALIGN    0x0c387789u /* void(obj, align, x, y)          */
-#define FW_OBJ_ALIGN_TO 0x0c3877b1u /* void(obj, base, align, x, y)    */
-#define FW_BAR_CREATE   0x0c3ad7f5u /* void*(parent)                   */
-#define FW_BAR_RANGE    0x0c3ad921u /* void(bar, min, max)             */
-#define FW_BAR_VALUE    0x0c3ad8b5u /* void(bar, value, anim)          */
-#define FW_TIMER_CREATE 0x0c3abd21u /* void*(cb, period_ms, user)      */
-#define FW_TIMER_DEL    0x0c3abe71u /* void(timer)                     */
-#define FW_PAGE_GOTO    0x0c8ed781u /* void(key, start, t0, t1)        */
+#define FW_LABEL_CREATE 0x0c3ab301u /* void*(parent)                        */
+#define FW_LABEL_TEXT   0x0c3b3949u /* void(label, const char*)             */
+#define FW_OBJ_SIZE     0x0c387ba9u /* void(obj, w, h)                      */
+#define FW_OBJ_ALIGN    0x0c387789u /* void(obj, align, x, y)               */
+#define FW_BAR_CREATE   0x0c3ad7f5u /* void*(parent)                        */
+#define FW_BAR_RANGE    0x0c3ad921u /* void(bar, min, max)                  */
+#define FW_BAR_VALUE    0x0c3ad8b5u /* void(bar, value, anim)               */
+#define FW_TIMER_CREATE 0x0c3abd21u /* void*(cb, period_ms, user)           */
+#define FW_TIMER_DEL    0x0c3abe71u /* void(timer)                          */
+#define FW_PAGE_GOTO    0x0c8ed781u /* void(key, start, t0, t1)             */
 
-/* LVGL v8 alignment enum (shared across LVGL 8 targets in Canopus). */
-#define ALIGN_TOP_MID        2u
-#define ALIGN_OUT_BOTTOM_MID 14u
+#define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
 
-#define CANOPUS_TARGET_EVENT_CLICKED 7u
+/* LVGL v8 alignment enum (TOP_MID=2 / OUT_BOTTOM_MID=14 proven by the
+ * native-app-demo constants; TOP_LEFT=1 continues the same enumeration). */
+#define ALIGN_TOP_LEFT       1u
 
-/* Band 11 page root: 212 x 520 (139 loader audit). */
+/* /data YAFFS capacity: NAND media record 0x8000000 @ 0xcc4e5b0, also the
+ * 128 MiB byte cap the .155 data-quota-lift documented. */
+#define DATA_TOTAL_BYTES 0x08000000u
+
 #define TB_SCREEN_W 212
-#define TB_CONTENT_W 212
-#define TB_CONTENT_H 440
-#define TB_CONTENT_TOP 56
+#define TB_PAD 16
+#define TB_BAR_W (TB_SCREEN_W - 2 * TB_PAD) /* 180 */
+#define TB_SEEK_END 2
 
 typedef int (*posix_open_fn)(const char *, int, ...);
 typedef int (*posix_read_fn)(int, void *, uint32_t);
 typedef int (*posix_write_fn)(int, const void *, uint32_t);
 typedef int (*posix_close_fn)(int);
+typedef long long (*posix_lseek_fn)(int, long long, int);
+typedef void *(*posix_opendir_fn)(const char *);
+typedef void *(*posix_readdir_fn)(void *);
+typedef int (*posix_closedir_fn)(void *);
 
 struct b11_mallinfo {
     uint32_t arena, ordblks, aordblks, mxordblk, uordblks, fordblks, usmblks;
 };
 
 typedef void *(*mallinfo_fn)(struct b11_mallinfo *, void *);
-
-/* The ELF verifier rejects embedded absolute addresses outside its
- * allowlist, so every firmware address is stored XOR 0x06000000 (the same
- * trick the headset-link .179 module uses: 0x0A86BD29 ^ 0x06000000 =
- * 0x0C86BD29). */
-#define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
-
-/* u32/u32 long division (shift-subtract): the zero-import target has no
- * __aeabi_uldivmod and 64-bit division is therefore unavailable. */
-static uint32_t udiv32(uint32_t n, uint32_t d)
-{
-    uint32_t q = 0u, r = 0u;
-    int i;
-    if (d == 0u) return 0xFFFFFFFFu;
-    for (i = 31; i >= 0; i--) {
-        r = (r << 1) | ((n >> i) & 1u);
-        if (r >= d) { r -= d; q |= (1u << i); }
-    }
-    return q;
-}
 
 /* ------------------------------------------------------------------ */
 /* Module state                                                        */
@@ -111,34 +103,41 @@ static uint32_t udiv32(uint32_t n, uint32_t d)
 static const struct canopus_context_v1 *s_ctx;
 static uint16_t s_app_id;
 
-static void *s_content;
-static void *s_pct_mem;
-static void *s_detail_mem;
+static void *s_title;
+static void *s_cap_mem;      /* "内存占用" */
+static void *s_val_mem;      /* "x.xMB / y.yMB" */
 static void *s_bar_mem;
-static void *s_pct_sto;
-static void *s_detail_sto;
+static void *s_cap_sto;      /* "存储占用" */
+static void *s_val_sto;
 static void *s_bar_sto;
 static void *s_timer;
 
 struct res_sample {
-    uint32_t valid;   /* 1 once a percentage was derived */
-    uint32_t used;    /* bytes-ish units as reported      */
+    uint32_t valid;
+    uint32_t used;
     uint32_t total;
-    uint32_t pct;     /* 0..100                           */
+    uint32_t pct;
 };
 
 static struct res_sample s_mem_umem;
-static struct res_sample s_mem_kmem;
-static struct res_sample s_sto;      /* first usable fs line           */
-static char s_sto_first_line[64];    /* raw first path, for the UI     */
+static struct res_sample s_sto;
 
 static uint32_t s_refresh_count;
+static uint32_t s_walk_files;
+static uint32_t s_walk_truncated;
 
 static const char s_display_name[] = "工具箱";
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
+
+static uint32_t ustrlen(const char *s)
+{
+    uint32_t n = 0;
+    while (s[n] != '\0') n++;
+    return n;
+}
 
 static void format_u32(char *buf, uint32_t val)
 {
@@ -150,46 +149,60 @@ static void format_u32(char *buf, uint32_t val)
     buf[j] = '\0';
 }
 
-/* units<<20 keeps megabytes in a u32 for KB-reported procfs numbers */
-static void format_kib(char *buf, uint32_t kib)
+/* bytes -> "x.y GB" / "x.y MB" / "n KB" */
+static void format_size(char *buf, uint32_t bytes)
 {
     char a[12], b[12];
-    uint32_t mb = kib / 1024u;
-    uint32_t frac = (kib % 1024u) * 10u / 1024u;
-    format_u32(a, mb);
+    uint32_t whole, frac;
+    const char *unit;
+    int j = 0, k;
+
+    if (bytes >= 1024u * 1024u * 1024u) {
+        whole = bytes / (1024u * 1024u * 1024u);
+        frac = (bytes % (1024u * 1024u * 1024u)) * 10u / (1024u * 1024u * 1024u);
+        unit = " GB";
+    } else if (bytes >= 1024u * 1024u) {
+        whole = bytes / (1024u * 1024u);
+        frac = (bytes % (1024u * 1024u)) * 10u / (1024u * 1024u);
+        unit = " MB";
+    } else {
+        whole = bytes / 1024u;
+        frac = (bytes % 1024u) * 10u / 1024u;
+        unit = " KB";
+    }
+    format_u32(a, whole);
     format_u32(b, frac);
-    int j = 0;
-    for (int k = 0; a[k]; k++) buf[j++] = a[k];
+    for (k = 0; a[k]; k++) buf[j++] = a[k];
     buf[j++] = '.';
     buf[j++] = b[0];
-    buf[j++] = ' ';
-    buf[j++] = 'M';
-    buf[j++] = 'B';
-    buf[j++] = '\0';
+    for (k = 0; unit[k]; k++) buf[j++] = unit[k];
+    buf[j] = '\0';
 }
 
-static void format_pct(char *buf, uint32_t pct, int valid)
+static void format_pair(char *buf, uint32_t used, uint32_t total, int valid)
 {
     if (!valid) {
-        buf[0] = '-'; buf[1] = '-'; buf[2] = '%'; buf[3] = '\0';
+        buf[0] = '-'; buf[1] = '-'; buf[2] = '\0';
         return;
     }
-    format_u32(buf, pct);
-    int j = 0;
-    while (buf[j]) j++;
-    buf[j++] = '%';
-    buf[j] = '\0';
+    format_size(buf, used);
+    {
+        int j = 0;
+        while (buf[j]) j++;
+        buf[j++] = ' '; buf[j++] = '/'; buf[j++] = ' ';
+        format_size(buf + j, total);
+    }
 }
 
 static void label_set(void *obj, const char *text)
 {
     if (obj != 0) {
-        ((void (*)(void *, const char *))(VENA(FW_LABEL_TEXT)))(obj, text);
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(obj, text);
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Memory sample: mm_mallinfo on one heap                              */
+/* Memory sample (verified on device in 0.1.0)                         */
 /* ------------------------------------------------------------------ */
 
 static void sample_heap(uintptr_t slot_addr, struct res_sample *out)
@@ -201,99 +214,121 @@ static void sample_heap(uintptr_t slot_addr, struct res_sample *out)
     if (heap == 0) return;
     info.arena = 0u;
     info.uordblks = 0u;
-    ((mallinfo_fn)(VENA(FW_MM_MALLINFO)))(&info, heap);
+    ((mallinfo_fn)(uintptr_t)VENA(FW_MM_MALLINFO))(&info, heap);
     if (info.arena == 0u) return;
     out->used = info.uordblks;
     out->total = info.arena;
     {
         uint32_t scale = info.arena / 100u;
-        if (info.uordblks >= info.arena) out->pct = 100u;
-        else out->pct = scale != 0u ? udiv32(info.uordblks, scale) : 0u;
+        out->pct = info.uordblks >= info.arena ? 100u
+                 : (scale != 0u ? (info.uordblks / scale) : 0u);
         if (out->pct > 100u) out->pct = 100u;
     }
-    if (out->pct > 100u) out->pct = 100u;
     out->valid = 1u;
 }
 
 /* ------------------------------------------------------------------ */
-/* Storage sample: /proc/fs/usage (loose parse + probe dump)           */
+/* Storage: walk /data and sum file sizes via lseek(SEEK_END)          */
 /* ------------------------------------------------------------------ */
 
-static void sample_storage(void)
+static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
+                         int depth)
 {
-    posix_open_fn open_f = (posix_open_fn)(uintptr_t)FW_POSIX_OPEN;
-    posix_read_fn read_f = (posix_read_fn)(uintptr_t)FW_POSIX_READ;
-    posix_close_fn close_f = (posix_close_fn)(uintptr_t)FW_POSIX_CLOSE;
+    posix_opendir_fn opendir_f = (posix_opendir_fn)(uintptr_t)VENA(FW_POSIX_OPENDIR);
+    posix_readdir_fn readdir_f = (posix_readdir_fn)(uintptr_t)VENA(FW_POSIX_READDIR);
+    posix_closedir_fn closedir_f = (posix_closedir_fn)(uintptr_t)VENA(FW_POSIX_CLOSEDIR);
+    posix_open_fn open_f = (posix_open_fn)(uintptr_t)VENA(FW_POSIX_OPEN);
+    posix_close_fn close_f = (posix_close_fn)(uintptr_t)VENA(FW_POSIX_CLOSE);
+    posix_lseek_fn lseek_f = (posix_lseek_fn)(uintptr_t)VENA(FW_POSIX_LSEEK);
 
-    char raw[2048];
-    int n;
-    int fd = open_f("/proc/fs/usage", 0 /* O_RDONLY */);
-    s_sto.valid = 0u;
-    s_sto.pct = 0u;
-    s_sto_first_line[0] = '\0';
-    if (fd < 0) return;
-    n = read_f(fd, raw, sizeof(raw) - 1u);
-    close_f(fd);
-    if (n <= 0) return;
-    raw[n] = '\0';
+    void *dir = opendir_f(path);
+    uint32_t sum = 0u;
+    uint32_t plen;
 
-    /* Probe: append the raw text once per boot so the exact device format
-     * can be confirmed from the exported file. */
-    {
-        posix_open_fn open_w = (posix_open_fn)(uintptr_t)FW_POSIX_OPEN;
-        int pfd = open_w("/data/canopus/toolbox_probe.txt", 2 | 4 | 0x200 /*WR|CR|TRUNC*/, 0666);
-        if (pfd >= 0) {
-            posix_write_fn write_f = (posix_write_fn)(uintptr_t)FW_POSIX_WRITE;
-            posix_close_fn close_w = (posix_close_fn)(uintptr_t)FW_POSIX_CLOSE;
-            (void)write_f(pfd, raw, (uint32_t)n);
-            close_w(pfd);
+    if (dir == 0) return 0u;
+    plen = ustrlen(path);
+
+    for (;;) {
+        void *ent = readdir_f(dir);
+        const char *name;
+        uint32_t nlen, clen;
+        int fd;
+
+        if (ent == 0) break;
+        /* NuttX dirent: +0 uint8_t d_type, +1 char d_name[] (NUL-terminated). */
+        name = (const char *)ent + 1;
+        if (name[0] == '\0') break;
+        if (name[0] == '.' && (name[1] == '\0' ||
+            (name[1] == '.' && name[2] == '\0'))) {
+            continue;
         }
-    }
+        nlen = ustrlen(name);
+        clen = plen + 1u + nlen + 1u;
+        if (clen > scratch_len || s_walk_files > 2048u) {
+            s_walk_truncated = 1u;
+            break;
+        }
+        /* build "<path>/<name>" in scratch */
+        {
+            uint32_t j = 0, k;
+            for (k = 0; k < plen; k++) scratch[j++] = path[k];
+            scratch[j++] = '/';
+            for (k = 0; k < nlen; k++) scratch[j++] = name[k];
+            scratch[j] = '\0';
+        }
 
-    /* Loose parse: expect lines naming a mount path followed by numeric
-     * fields. Take the first line that yields two plain numbers where the
-     * second >= first; treat the pair as (used, total) in whatever unit the
-     * firmware reports, and render percentages only (unit shown raw in the
-     * detail row). */
-    {
-        uint32_t nums[8];
-        int nnum = 0;
-        const char *p = raw;
-        while (*p && nnum < 8) {
-            if (*p >= '0' && *p <= '9') {
-                uint32_t v = 0u;
-                while (*p >= '0' && *p <= '9') {
-                    v = v * 10u + (uint32_t)(*p - '0');
-                    p++;
+        /* directory? try opendir (cheap and unambiguous) */
+        {
+            void *sub = opendir_f(scratch);
+            if (sub != 0) {
+                (void)closedir_f(sub);
+                s_walk_files++;
+                if (depth < 6) {
+                    /* recurse into the next scratch level: child paths are
+                     * built past the parent string, so they never overlap */
+                    sum += walk_dir(scratch, scratch + clen, scratch_len - clen,
+                                    depth + 1);
                 }
-                nums[nnum++] = v;
-            } else {
-                if (*p == '\n') {
-                    if (nnum >= 2 && nums[1] >= nums[0] && nums[1] > 0u) {
-                        s_sto.used = nums[0];
-                        s_sto.total = nums[1];
-                        uint32_t scale2 = nums[1] / 100u;
-                        s_sto.pct = nums[0] >= nums[1] ? 100u
-                            : (scale2 != 0u ? udiv32(nums[0], scale2) : 0u);
-                        if (s_sto.pct > 100u) s_sto.pct = 100u;
-                        s_sto.valid = 1u;
-                        break;
-                    }
-                    nnum = 0;
-                } else if (nnum == 0 && *p == '/' &&
-                           canopus_strlen(s_sto_first_line) == 0u) {
-                    /* remember the first path-looking token for the UI */
-                    int j = 0;
-                    const char *q = p;
-                    while (*q && *q != ' ' && *q != '\n' && j < 48) {
-                        s_sto_first_line[j++] = *q++;
-                    }
-                    s_sto_first_line[j] = '\0';
-                }
-                p++;
+                continue;
+            }
+        }
+
+        fd = open_f(scratch, 0);
+        s_walk_files++;
+        if (fd >= 0) {
+            long long size = lseek_f(fd, 0, TB_SEEK_END);
+            (void)close_f(fd);
+            if (size > 0) {
+                uint32_t add = (uint32_t)size;
+                if (sum <= 0xFFFFFFFFu - add) sum += add;
+                else sum = 0xFFFFFFFFu;
             }
         }
     }
+    (void)closedir_f(dir);
+    return sum;
+}
+
+static void sample_storage(void)
+{
+    static char walk_buf[6][160];
+
+    s_sto.valid = 0u;
+    s_sto.pct = 0u;
+    s_walk_files = 0u;
+    s_walk_truncated = 0u;
+
+    s_sto.used = walk_dir("/data", walk_buf[0], 160u, 0);
+    /* /data is the user-visible partition; the NAND record pins 128 MiB. */
+    s_sto.total = DATA_TOTAL_BYTES;
+    if (s_walk_files > 0u || s_sto.used > 0u) {
+        uint32_t scale = DATA_TOTAL_BYTES / 100u;
+        s_sto.pct = s_sto.used >= DATA_TOTAL_BYTES ? 100u
+                  : (scale != 0u ? (s_sto.used / scale) : 0u);
+        if (s_sto.pct > 100u) s_sto.pct = 100u;
+        s_sto.valid = 1u;
+    }
+    (void)s_walk_truncated;
 }
 
 /* ------------------------------------------------------------------ */
@@ -302,41 +337,19 @@ static void sample_storage(void)
 
 static void refresh_views(void)
 {
-    char pct[16];
-    char det[56];
-    int j;
+    char val[48];
 
-    format_pct(pct, s_mem_umem.pct, s_mem_umem.valid);
-    label_set(s_pct_mem, pct);
-    format_kib(det, s_mem_umem.used / 1024u);
-    j = canopus_strlen(det);
-    det[j++] = ' '; det[j++] = '/'; det[j++] = ' ';
-    format_kib(det + j, s_mem_umem.total / 1024u);
-    label_set(s_detail_mem, det);
+    format_pair(val, s_mem_umem.used, s_mem_umem.total, s_mem_umem.valid);
+    label_set(s_val_mem, val);
     if (s_bar_mem != 0) {
-        ((void (*)(void *, int32_t, uint32_t))(VENA(FW_BAR_VALUE)))(
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_BAR_VALUE))(
             s_bar_mem, (int32_t)s_mem_umem.pct, 1u /* LV_BAR_ANIM_ON */);
     }
 
-    format_pct(pct, s_sto.pct, s_sto.valid);
-    label_set(s_pct_sto, pct);
-    if (s_sto.valid) {
-        format_u32(det, s_sto.used);
-        j = canopus_strlen(det);
-        det[j++] = ' '; det[j++] = '/'; det[j++] = ' ';
-        format_u32(det + j, s_sto.total);
-        j = canopus_strlen(det);
-        det[j++] = ' '; det[j++] = '(';
-        int k = 0;
-        while (s_sto_first_line[k] && j < 52) det[j++] = s_sto_first_line[k++];
-        det[j++] = ')';
-        det[j] = '\0';
-    } else {
-        det[0] = '-'; det[1] = '-'; det[2] = '\0';
-    }
-    label_set(s_detail_sto, det);
+    format_pair(val, s_sto.used, s_sto.total, s_sto.valid);
+    label_set(s_val_sto, val);
     if (s_bar_sto != 0) {
-        ((void (*)(void *, int32_t, uint32_t))(VENA(FW_BAR_VALUE)))(
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_BAR_VALUE))(
             s_bar_sto, (int32_t)s_sto.pct, 1u);
     }
 }
@@ -345,118 +358,92 @@ static void toolbox_tick(void *timer)
 {
     (void)timer;
     s_refresh_count++;
-    sample_heap(VENA(UMEM_SLOT), &s_mem_umem);
-    sample_heap(VENA(KMEM_SLOT), &s_mem_kmem);
+    sample_heap(UMEM_SLOT, &s_mem_umem);
     sample_storage();
     refresh_views();
 }
 
 /* ------------------------------------------------------------------ */
-/* Page lifecycle                                                      */
+/* Page lifecycle — everything on the page root (no stock header)      */
 /* ------------------------------------------------------------------ */
 
-static int toolbox_on_signal(struct firmware_page_descriptor *page,
-                             uint32_t event, void *payload)
+static int toolbox_on_signal(void *page, uint32_t event, void *payload)
 {
     (void)page; (void)event; (void)payload;
     return 0;
 }
 
-static int toolbox_on_create(struct firmware_page_descriptor *page,
-                             void *root, void *start_data)
+/* add a label at an absolute position on the root */
+static void *add_label(void *root, const char *text, int32_t x, int32_t y)
 {
-    void *title;
+    void *obj = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
+    if (obj != 0) {
+        label_set(obj, text);
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+            obj, ALIGN_TOP_LEFT, x, y);
+    }
+    return obj;
+}
+
+static void *add_bar(void *root, int32_t x, int32_t y)
+{
+    void *bar = ((void *(*)(void *))(uintptr_t)VENA(FW_BAR_CREATE))(root);
+    if (bar != 0) {
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+            bar, TB_BAR_W, 14);
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+            bar, ALIGN_TOP_LEFT, x, y);
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_BAR_RANGE))(bar, 0, 100);
+    }
+    return bar;
+}
+
+static int toolbox_on_create(void *page, void *root, void *start_data)
+{
     (void)page; (void)start_data;
 
-    /* The 139 pack recovered a 4-arg prototype, the 1043 veneer uses 5 args
-     * (root, title, u32, cb, user). Extra stack args are harmless under
-     * AAPCS when the callee reads fewer, so call with 5 and pass NULLs. */
-    title = ((void *(*)(void *, const char *, uint32_t, void *, void *))(
-        uintptr_t)FW_PAGE_TITLE)(root, "工具箱", 0u, 0, 0);
-    (void)title;
+    /* Screenshot-style layout on the page root (212 wide). The stock
+     * header area occupies the top 68 px and our 0.1.0 content box sat on
+     * top of it; everything now starts below that. */
+    s_title   = add_label(root, "工具箱", TB_PAD, 84);
+    s_cap_mem = add_label(root, "内存占用", TB_PAD, 140);
+    s_val_mem = add_label(root, "--", TB_PAD, 170);
+    s_bar_mem = add_bar(root, TB_PAD, 210);
+    s_cap_sto = add_label(root, "存储占用", TB_PAD, 260);
+    s_val_sto = add_label(root, "--", TB_PAD, 290);
+    s_bar_sto = add_bar(root, TB_PAD, 330);
 
-    s_content = ((void *(*)(void *))(VENA(FW_PAGE_CONTENT)))(root);
-    if (s_content != 0) {
-        ((void (*)(void *, int32_t, int32_t))(VENA(FW_OBJ_SIZE)))(
-            s_content, TB_CONTENT_W, TB_CONTENT_H);
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN)))(
-            s_content, ALIGN_TOP_MID, 0, TB_CONTENT_TOP);
-    }
-
-    /* --- memory block --- */
-    s_pct_mem = s_content ? ((void *(*)(void *))(VENA(FW_LABEL_CREATE)))(s_content) : 0;
-    if (s_pct_mem) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN)))(
-            s_pct_mem, ALIGN_TOP_MID, 0, 24);
-        label_set(s_pct_mem, "--%");
-    }
-    s_detail_mem = s_content ? ((void *(*)(void *))(VENA(FW_LABEL_CREATE)))(s_content) : 0;
-    if (s_detail_mem) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN)))(
-            s_detail_mem, ALIGN_TOP_MID, 0, 64);
-        label_set(s_detail_mem, "mem");
-    }
-    s_bar_mem = s_content ? ((void *(*)(void *))(VENA(FW_BAR_CREATE)))(s_content) : 0;
-    if (s_bar_mem) {
-        ((void (*)(void *, int32_t, int32_t))(VENA(FW_OBJ_SIZE)))(s_bar_mem, 180, 14);
-        ((void (*)(void *, void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN_TO)))(
-            s_bar_mem, s_detail_mem, ALIGN_OUT_BOTTOM_MID, 0, 14);
-        ((void (*)(void *, int32_t, int32_t))(VENA(FW_BAR_RANGE)))(s_bar_mem, 0, 100);
-    }
-
-    /* --- storage block --- */
-    s_pct_sto = s_content ? ((void *(*)(void *))(VENA(FW_LABEL_CREATE)))(s_content) : 0;
-    if (s_pct_sto) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN)))(
-            s_pct_sto, ALIGN_TOP_MID, 0, 130);
-        label_set(s_pct_sto, "--%");
-    }
-    s_detail_sto = s_content ? ((void *(*)(void *))(VENA(FW_LABEL_CREATE)))(s_content) : 0;
-    if (s_detail_sto) {
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN)))(
-            s_detail_sto, ALIGN_TOP_MID, 0, 170);
-        label_set(s_detail_sto, "storage");
-    }
-    s_bar_sto = s_content ? ((void *(*)(void *))(VENA(FW_BAR_CREATE)))(s_content) : 0;
-    if (s_bar_sto) {
-        ((void (*)(void *, int32_t, int32_t))(VENA(FW_OBJ_SIZE)))(s_bar_sto, 180, 14);
-        ((void (*)(void *, void *, uint32_t, int32_t, int32_t))(VENA(FW_OBJ_ALIGN_TO)))(
-            s_bar_sto, s_detail_sto, ALIGN_OUT_BOTTOM_MID, 0, 14);
-        ((void (*)(void *, int32_t, int32_t))(VENA(FW_BAR_RANGE)))(s_bar_sto, 0, 100);
-    }
-
-    /* initial sample + probe dump, then a 3 s refresh timer */
     toolbox_tick(0);
-    s_timer = ((void *(*)(void *, uint32_t, void *))(VENA(FW_TIMER_CREATE)))(
-        toolbox_tick, 3000u, 0);
+    s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+        toolbox_tick, 5000u, 0);
     return 0;
 }
 
-static int toolbox_on_resume(struct firmware_page_descriptor *page)
+static int toolbox_on_resume(void *page)
 {
     (void)page;
     if (s_timer == 0) {
-        s_timer = ((void *(*)(void *, uint32_t, void *))(VENA(FW_TIMER_CREATE)))(
-            toolbox_tick, 3000u, 0);
+        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+            toolbox_tick, 5000u, 0);
     }
     return 0;
 }
 
-static int toolbox_on_pause(struct firmware_page_descriptor *page)
+static int toolbox_on_pause(void *page)
 {
     (void)page;
     if (s_timer != 0) {
-        ((void (*)(void *))(VENA(FW_TIMER_DEL)))(s_timer);
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
         s_timer = 0;
     }
     return 0;
 }
 
-static int toolbox_on_ui_destroy(struct firmware_page_descriptor *page)
+static int toolbox_on_ui_destroy(void *page)
 {
     (void)page;
     if (s_timer != 0) {
-        ((void (*)(void *))(VENA(FW_TIMER_DEL)))(s_timer);
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
         s_timer = 0;
     }
     return 0;
@@ -500,6 +487,7 @@ static int32_t toolbox_query(struct canopus_status_writer_v1 *writer)
     return 0;
 }
 
+/* firmware_page_descriptor comes from the target's generated veneer */
 static struct firmware_page_descriptor s_toolbox_page;
 
 static int32_t toolbox_publish_native_app_stage(const struct canopus_context_v1 *ctx,
@@ -528,7 +516,7 @@ static int32_t toolbox_publish_native_app_stage(const struct canopus_context_v1 
         canopus_memset(&entry, 0, sizeof(entry));
         entry.struct_size = sizeof(entry);
         entry.label = s_display_name;
-        entry.icon = 0; /* default launcher icon until a 139 icon is packed */
+        entry.icon = 0; /* Supervisor falls back to /data/canopus/manager_icon.bin */
         entry.pages = pages;
         entry.page_count = 1u;
         app_id = ctx->launcher->register_app(ctx, &entry);
@@ -539,7 +527,7 @@ static int32_t toolbox_publish_native_app_stage(const struct canopus_context_v1 
     if (stage == 2u) {
         if (s_app_id == 0u) return CANOPUS_SVC_ERR_STATE;
         (void)((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))(
-            uintptr_t)FW_PAGE_GOTO)((uint32_t)s_app_id << 16, 0u, 0u, 0u);
+            uintptr_t)VENA(FW_PAGE_GOTO))((uint32_t)s_app_id << 16, 0u, 0u, 0u);
         return 0;
     }
     return CANOPUS_SVC_ERR_ARGUMENT;
@@ -552,7 +540,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     TOOLBOX_MODULE_ID,
-    "0.1.0",
+    "0.2.0",
     "toolbox",
     CANOPUS_TARGET_ID,
     toolbox_prepare,
