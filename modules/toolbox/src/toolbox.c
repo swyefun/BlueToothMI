@@ -1,33 +1,34 @@
 /*
- * toolbox.c — Band 11 native toolbox application (4.100.139), v0.2.0.
+ * toolbox.c — Band 11 native toolbox application (4.100.139), v0.4.0.
  *
  * A native application that lives in the app launcher (NOT a watchface).
- * Page 1 shows memory and storage usage stock-style: small section title,
- * large "used / total" line, full-width pill bar underneath, refreshed by
- * an LVGL timer.
+ * Page 1 shows memory and storage stock-style: small section title,
+ * large value line, full-width pill bar underneath, refreshed by an
+ * LVGL timer.
  *
- * v0.2.0 changes over 0.1.0 (device feedback):
- *   - own title label ("工具箱"): the recovered page_title call rendered
- *     nothing on device; our content box also sat on top of the stock
- *     title area (68 px) — both fixed by dropping the stock header and
- *     drawing the whole layout on the page root
- *   - storage: two bars per user request. Bar 1 = total capacity, a full
- *     pill against the static NAND total (128 MiB media record 0x8000000
- *     @ 0xcc4e5b0). Bar 2 = user partition /data: used bytes from a POSIX
- *     tree walk vs the 128 MiB partition total (NAND media record
- *     0x8000000 @ 0xcc4e5b0; the runtime MTD geometry ioctl was removed
- *     in 0.3.1 after a load-time hard-lock — a wrong command encoding on
- *     this closed kernel is not worth the risk). /proc/fs/usage proved
- *     dead data (zero code refs), so no procfs probing.
- *   - layout matches the requested screenshot: left-aligned titles.
+ * Layout (device-confirmed constraints):
+ *   - the stock header area occupies the top 68 px of the page root;
+ *     the whole layout starts below it and every object is placed
+ *     directly on the root (the recovered stock page_title call rendered
+ *     nothing in 0.1.0 and is not used)
  *
- * Data sources:
- *   - memory : mm_mallinfo(heap) 0x0c34f0a1 on the Umem heap (verified
- *              working on device in 0.1.0).
- *   - storage: /data walk vs static 128 MiB total (see v0.3.0 notes).
+ * Storage (0.4.0):
+ *   - Bar 1 "总容量": static full pill against the NAND total 128 MiB
+ *     (media record 0x8000000 @ 0xcc4e5b0)
+ *   - Bar 2 "用户分区": /data used bytes vs 128 MiB. /proc/fs/usage is
+ *     dead data on .139 (zero code refs), so used comes from a
+ *     NON-recursive /data walk (explicit directory stack, max 8 deep,
+ *     max 2048 files, file size via lseek(SEEK_END))
+ *   - 0.2.0/0.3.0 hard-locked on load while 0.1.0 (no walk) did not.
+ *     0.4.0 adds a full stage probe: every milestone overwrites
+ *     /data/canopus/toolbox_stage.txt (walk start/done, raw dirent
+ *     hexdumps, tick counters), so one lock-up + log export pins the
+ *     exact failing step. The dirent layout assumption (+1 d_name) is
+ *     verified by the dumps.
  *
- * All firmware veneers are XOR 0x06000000 encoded; percentages use plain
- * u32 division (zero-import target: no __aeabi_uldivmod).
+ * Memory: mm_mallinfo(heap) 0x0c34f0a1 on the Umem heap (verified
+ * working on device in 0.1.0). All firmware veneers are XOR 0x06000000
+ * encoded; no 64-bit division (zero-import target).
  */
 
 #include "canopus_module_entry.h"
@@ -45,6 +46,14 @@
 #define FW_MM_MALLINFO  0x0c34f0a1u /* void* fn(info*, void* heap)          */
 #define UMEM_SLOT       0x200B2590u /* RAM: Umem heap descriptor            */
 #define KMEM_SLOT       0x200B01C8u /* RAM: Kmem heap descriptor            */
+
+#define FW_POSIX_OPEN   0x0c342c55u /* int open(const char*, int, ...)      */
+#define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, uint32_t)*/
+#define FW_POSIX_CLOSE  0xc33818du  /* int close(int)                       */
+#define FW_POSIX_LSEEK  0x0c33d511u /* int64 lseek(int, int64, int)         */
+#define FW_POSIX_OPENDIR 0x0c351749u/* void* opendir(const char*)           */
+#define FW_POSIX_READDIR 0x0c34956bu/* void* readdir(void*)                 */
+#define FW_POSIX_CLOSEDIR 0x0c34cd41u/* int closedir(void*)                 */
 
 #define FW_LABEL_CREATE 0x0c3ab301u /* void*(parent)                        */
 #define FW_LABEL_TEXT   0x0c3b3949u /* void(label, const char*)             */
@@ -67,25 +76,16 @@
 #define TB_PAD 16
 #define TB_BAR_W (TB_SCREEN_W - 2 * TB_PAD) /* 180 */
 #define TB_SEEK_END 2
-
-#define FW_POSIX_OPEN   0x0c342c55u /* int open(const char*, int, ...)      */
-#define FW_POSIX_CLOSE  0xc33818du  /* int close(int)                       */
-#define FW_POSIX_LSEEK  0x0c33d511u /* int64 lseek(int, int64, int)         */
-#define FW_POSIX_OPENDIR 0x0c351749u/* void* opendir(const char*)           */
-#define FW_POSIX_READDIR 0x0c34956bu/* void* readdir(void*)  NuttX dirent: */
-                                            /*   +0 uint8 d_type, +1 d_name[] */
-#define FW_POSIX_CLOSEDIR 0x0c34cd41u/* int closedir(void*)                 */
-#define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, uint32_t)*/
-#define FW_POSIX_READ   0x0c33d785u /* int read(int, void*, uint32_t)       */
+#define DATA_TOTAL_BYTES 0x08000000u /* NAND media record @ 0xcc4e5b0 */
 
 typedef int (*posix_open_fn)(const char *, int, ...);
-typedef int (*posix_read_fn)(int, void *, uint32_t);
 typedef int (*posix_write_fn)(int, const void *, uint32_t);
 typedef int (*posix_close_fn)(int);
 typedef long long (*posix_lseek_fn)(int, long long, int);
 typedef void *(*posix_opendir_fn)(const char *);
 typedef void *(*posix_readdir_fn)(void *);
 typedef int (*posix_closedir_fn)(void *);
+
 struct b11_mallinfo {
     uint32_t arena, ordblks, aordblks, mxordblk, uordblks, fordblks, usmblks;
 };
@@ -119,12 +119,11 @@ struct res_sample {
 };
 
 static struct res_sample s_mem_umem;
-static struct res_sample s_user; /* /data walk vs MTD geometry */
+static struct res_sample s_user; /* /data walk vs 128 MiB */
 
 static uint32_t s_refresh_count;
 static uint32_t s_walk_files;
 static uint32_t s_walk_truncated;
-static uint32_t s_user_total;    /* measured partition size (bytes) */
 
 static const char s_display_name[] = "工具箱";
 
@@ -228,16 +227,47 @@ static void sample_heap(uintptr_t slot_addr, struct res_sample *out)
 }
 
 /* ------------------------------------------------------------------ */
-/* Storage: walk /data and sum file sizes via lseek(SEEK_END)          */
+/* Stage probe: every milestone overwrites the stage file so one       */
+/* hard-lock + log export pins the exact failing step.                 */
 /* ------------------------------------------------------------------ */
 
-/* ------------------------------------------------------------------ */
-/* Storage: walk /data (used) + MTD geometry (partition size)          */
-/* ------------------------------------------------------------------ */
-
-static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
-                         int depth)
+static void stage_write(const char *line, uint32_t len)
 {
+    posix_open_fn open_f = (posix_open_fn)(uintptr_t)VENA(FW_POSIX_OPEN);
+    posix_write_fn write_f = (posix_write_fn)(uintptr_t)VENA(FW_POSIX_WRITE);
+    posix_close_fn close_f = (posix_close_fn)(uintptr_t)VENA(FW_POSIX_CLOSE);
+    int fd = open_f("/data/canopus/toolbox_stage.txt", 2 | 4 | 0x200, 0666);
+    if (fd >= 0) {
+        (void)write_f(fd, line, len);
+        (void)close_f(fd);
+    }
+}
+
+static void stage_mark(const char *msg, uint32_t a, uint32_t b)
+{
+    char line[80];
+    int j = 0, k;
+
+    for (k = 0; msg[k] != '\0' && j < 60; k++) line[j++] = msg[k];
+    line[j++] = ' ';
+    format_u32(line + j, a);
+    while (line[j] != '\0') j++;
+    line[j++] = ' ';
+    format_u32(line + j, b);
+    while (line[j] != '\0') j++;
+    line[j++] = '\r';
+    line[j++] = '\n';
+    stage_write(line, (uint32_t)j);
+}
+
+/* ------------------------------------------------------------------ */
+/* Storage: NON-recursive /data walk (explicit dir stack)              */
+/* ------------------------------------------------------------------ */
+
+static uint32_t walk_dir(const char *root)
+{
+    static char dirstack[8][192];
+    static char child[192];
     posix_opendir_fn opendir_f = (posix_opendir_fn)(uintptr_t)VENA(FW_POSIX_OPENDIR);
     posix_readdir_fn readdir_f = (posix_readdir_fn)(uintptr_t)VENA(FW_POSIX_READDIR);
     posix_closedir_fn closedir_f = (posix_closedir_fn)(uintptr_t)VENA(FW_POSIX_CLOSEDIR);
@@ -245,99 +275,122 @@ static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
     posix_close_fn close_f = (posix_close_fn)(uintptr_t)VENA(FW_POSIX_CLOSE);
     posix_lseek_fn lseek_f = (posix_lseek_fn)(uintptr_t)VENA(FW_POSIX_LSEEK);
 
-    void *dir = opendir_f(path);
+    int sp = 0;
     uint32_t sum = 0u;
-    uint32_t plen;
+    uint32_t dumped = 0u;
+    int k;
 
-    if (dir == 0) return 0u;
-    plen = ustrlen(path);
+    for (k = 0; root[k] != '\0' && k < 190; k++) dirstack[0][k] = root[k];
+    dirstack[0][k] = '\0';
+    sp = 1;
 
-    for (;;) {
-        void *ent = readdir_f(dir);
-        const char *name;
-        uint32_t nlen, clen;
-        int fd;
+    while (sp > 0 && s_walk_files < 2048u) {
+        char *cur = dirstack[sp - 1];
+        uint32_t plen = ustrlen(cur);
+        void *dir = opendir_f(cur);
+        if (dir == 0) { sp--; continue; }
+        sp--;
 
-        if (ent == 0) break;
-        /* NuttX dirent: +0 uint8_t d_type, +1 char d_name[] (NUL-terminated). */
-        name = (const char *)ent + 1;
-        if (name[0] == '\0') break;
-        if (name[0] == '.' && (name[1] == '\0' ||
-            (name[1] == '.' && name[2] == '\0'))) {
-            continue;
-        }
-        nlen = ustrlen(name);
-        clen = plen + 1u + nlen + 1u;
-        if (clen > scratch_len || s_walk_files > 2048u) {
-            s_walk_truncated = 1u;
-            break;
-        }
-        {
-            uint32_t j = 0, k;
-            for (k = 0; k < plen; k++) scratch[j++] = path[k];
-            scratch[j++] = '/';
-            for (k = 0; k < nlen; k++) scratch[j++] = name[k];
-            scratch[j] = '\0';
-        }
+        for (;;) {
+            void *ent = readdir_f(dir);
+            const char *name;
+            uint32_t nlen, clen;
+            int fd;
 
-        /* directory? try opendir (cheap and unambiguous) */
-        {
-            void *sub = opendir_f(scratch);
-            if (sub != 0) {
-                (void)closedir_f(sub);
-                s_walk_files++;
-                if (depth < 6) {
-                    sum += walk_dir(scratch, scratch + clen, scratch_len - clen,
-                                    depth + 1);
-                }
+            if (ent == 0) break;
+            /* Assumed NuttX dirent: +0 uint8_t d_type, +1 char d_name[].
+             * The first raw entries are hexdumped to the stage probe to
+             * confirm this layout on device. */
+            name = (const char *)ent + 1;
+            if (name[0] == '\0') break;
+            if (name[0] == '.' && (name[1] == '\0' ||
+                (name[1] == '.' && name[2] == '\0'))) {
                 continue;
             }
-        }
+            nlen = ustrlen(name);
+            clen = plen + 1u + nlen + 1u;
+            if (clen > 190u) continue;
 
-        fd = open_f(scratch, 0);
-        s_walk_files++;
-        if (fd >= 0) {
-            long long size = lseek_f(fd, 0, TB_SEEK_END);
-            (void)close_f(fd);
-            if (size > 0) {
-                uint32_t add = (uint32_t)size;
-                if (sum <= 0xFFFFFFFFu - add) sum += add;
-                else sum = 0xFFFFFFFFu;
+            {
+                uint32_t j = 0, q;
+                for (q = 0; q < plen; q++) child[j++] = cur[q];
+                child[j++] = '/';
+                for (q = 0; q < nlen; q++) child[j++] = name[q];
+                child[j] = '\0';
+            }
+
+            if (dumped < 4u) {
+                /* raw first bytes of the dirent record (layout evidence) */
+                char rawdump[112];
+                const char hexd[17] = "0123456789abcdef";
+                uint32_t j = 0, q;
+                rawdump[j++] = 'e'; rawdump[j++] = 'n'; rawdump[j++] = 't';
+                rawdump[j++] = ' ';
+                for (q = 0; q < 24u; q++) {
+                    unsigned char b = (unsigned char)((const char *)ent)[q];
+                    rawdump[j++] = hexd[b >> 4];
+                    rawdump[j++] = hexd[b & 0xF];
+                    rawdump[j++] = ' ';
+                    if ((q & 7u) == 7u) rawdump[j++] = '|';
+                }
+                rawdump[j++] = '\r';
+                rawdump[j++] = '\n';
+                stage_write(rawdump, j);
+                dumped++;
+            }
+
+            /* directory? try opendir (cheap and unambiguous) */
+            {
+                void *sub = opendir_f(child);
+                if (sub != 0) {
+                    (void)closedir_f(sub);
+                    s_walk_files++;
+                    if (sp < 8) {
+                        for (k = 0; child[k] != '\0'; k++) dirstack[sp][k] = child[k];
+                        dirstack[sp][k] = '\0';
+                        sp++;
+                    }
+                    continue;
+                }
+            }
+
+            fd = open_f(child, 0);
+            s_walk_files++;
+            if (fd >= 0) {
+                long long size = lseek_f(fd, 0, TB_SEEK_END);
+                (void)close_f(fd);
+                if (size > 0) {
+                    uint32_t add = (uint32_t)size;
+                    if (sum <= 0xFFFFFFFFu - add) sum += add;
+                    else sum = 0xFFFFFFFFu;
+                }
             }
         }
+        (void)closedir_f(dir);
     }
-    (void)closedir_f(dir);
     return sum;
-}
-
-/* Partition size: the runtime MTD geometry ioctl is NOT probed — a wrong
- * command encoding on this closed kernel risks hitting a dangerous MTD
- * command or an assert. Use the NAND media total (0x8000000 @ 0xcc4e5b0),
- * which is also the 128 MiB /data cap the .155 data-quota-lift documented. */
-static uint32_t sample_user_total(void)
-{
-    return 0x08000000u;
 }
 
 static void sample_storage(void)
 {
-    static char walk_buf[6][160];
-
     s_user.valid = 0u;
     s_user.pct = 0u;
     s_walk_files = 0u;
     s_walk_truncated = 0u;
 
-    s_user_total = sample_user_total();
-    s_user.used = walk_dir("/data", walk_buf[0], 160u, 0);
-    s_user.total = s_user_total;
+    stage_mark("walk-start", 0u, 0u);
+    s_user.used = walk_dir("/data");
+    stage_mark("walk-done", s_walk_files, s_user.used);
+
+    s_user.total = DATA_TOTAL_BYTES;
     {
-        uint32_t scale = s_user_total / 100u;
-        s_user.pct = s_user.used >= s_user_total ? 100u
+        uint32_t scale = DATA_TOTAL_BYTES / 100u;
+        s_user.pct = s_user.used >= DATA_TOTAL_BYTES ? 100u
                    : (scale != 0u ? (s_user.used / scale) : 0u);
         if (s_user.pct > 100u) s_user.pct = 100u;
         s_user.valid = 1u;
     }
+    stage_mark("storage-done", s_user.pct, s_user.total);
     (void)s_walk_truncated;
 }
 
@@ -356,15 +409,24 @@ static void refresh_views(void)
             s_bar_mem, (int32_t)s_mem_umem.pct, 1u /* LV_BAR_ANIM_ON */);
     }
 
+    format_pair(val, s_user.used, s_user.total, s_user.valid);
+    label_set(s_val_user, val);
+    if (s_bar_user != 0) {
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_BAR_VALUE))(
+            s_bar_user, (int32_t)s_user.pct, 1u);
+    }
 }
 
 static void toolbox_tick(void *timer)
 {
     (void)timer;
     s_refresh_count++;
+    stage_mark("tick", s_refresh_count, 0u);
     sample_heap(UMEM_SLOT, &s_mem_umem);
+    stage_mark("heap-done", s_mem_umem.pct, s_mem_umem.arena);
     sample_storage();
     refresh_views();
+    stage_mark("refresh-done", s_refresh_count, s_user.used);
 }
 
 /* ------------------------------------------------------------------ */
@@ -406,9 +468,8 @@ static int toolbox_on_create(void *page, void *root, void *start_data)
 {
     (void)page; (void)start_data;
 
-    /* Screenshot-style layout on the page root (212 wide). The stock
-     * header area occupies the top 68 px and our 0.1.0 content box sat on
-     * top of it; everything now starts below that. */
+    stage_mark("create", 0u, 0u);
+
     s_title    = add_label(root, "工具箱", TB_PAD, 84);
     s_cap_mem  = add_label(root, "内存占用", TB_PAD, 140);
     s_val_mem  = add_label(root, "--", TB_PAD, 170);
@@ -423,8 +484,8 @@ static int toolbox_on_create(void *page, void *root, void *start_data)
     s_cap_user = add_label(root, "用户分区", TB_PAD, 380);
     s_val_user = add_label(root, "--", TB_PAD, 410);
     s_bar_user = add_bar(root, TB_PAD, 450);
-    /* toolbox_tick below samples storage + memory and refreshes all views */
 
+    stage_mark("ui-done", 0u, 0u);
     toolbox_tick(0);
     s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
         toolbox_tick, 5000u, 0);
@@ -552,7 +613,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     TOOLBOX_MODULE_ID,
-    "0.2.0",
+    "0.4.0",
     "toolbox",
     CANOPUS_TARGET_ID,
     toolbox_prepare,
