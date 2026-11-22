@@ -19,6 +19,10 @@
 
 #define BSVM_MODULE_ID "bsvm"
 
+/* Canopus service context, captured in prepare/activate (declared early:
+ * the FS service reads game data before the lifecycle section below) */
+static const struct canopus_context_v1 *s_ctx;
+
 /* ---------------- firmware veneers (139) ---------------- */
 #define FW_POSIX_OPEN   0x0c342c55u
 #define FW_POSIX_READ   0x0c33d785u
@@ -721,7 +725,6 @@ static int bsvm_on_ui_destroy(void *page)
 }
 
 /* ---------------- module lifecycle ---------------- */
-static const struct canopus_context_v1 *s_ctx;
 static uint16_t s_app_id;
 static const char s_display_name[] = "BSVM";
 
