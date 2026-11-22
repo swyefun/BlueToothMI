@@ -14,16 +14,17 @@
  *   - storage: two bars per user request. Bar 1 = total capacity, a full
  *     pill against the static NAND total (128 MiB media record 0x8000000
  *     @ 0xcc4e5b0). Bar 2 = user partition /data: used bytes from a POSIX
- *     tree walk vs the partition size read at runtime via
- *     ioctl(/dev/nand_data, MTDIOC_GEOMETRY) (fallback: the 128 MiB cap
- *     the .155 data-quota-lift documented). /proc/fs/usage proved dead
- *     data (zero code refs), so no procfs probing.
+ *     tree walk vs the 128 MiB partition total (NAND media record
+ *     0x8000000 @ 0xcc4e5b0; the runtime MTD geometry ioctl was removed
+ *     in 0.3.1 after a load-time hard-lock — a wrong command encoding on
+ *     this closed kernel is not worth the risk). /proc/fs/usage proved
+ *     dead data (zero code refs), so no procfs probing.
  *   - layout matches the requested screenshot: left-aligned titles.
  *
  * Data sources:
  *   - memory : mm_mallinfo(heap) 0x0c34f0a1 on the Umem heap (verified
  *              working on device in 0.1.0).
- *   - storage: walk + MTD geometry (see v0.3.0 notes above).
+ *   - storage: /data walk vs static 128 MiB total (see v0.3.0 notes).
  *
  * All firmware veneers are XOR 0x06000000 encoded; percentages use plain
  * u32 division (zero-import target: no __aeabi_uldivmod).
@@ -74,12 +75,6 @@
 #define FW_POSIX_READDIR 0x0c34956bu/* void* readdir(void*)  NuttX dirent: */
                                             /*   +0 uint8 d_type, +1 d_name[] */
 #define FW_POSIX_CLOSEDIR 0x0c34cd41u/* int closedir(void*)                 */
-#define FW_IOCTL        0xc341e39u  /* int ioctl(int, uint32_t, ...)        */
-
-/* MTDIOC_GEOMETRY = _IOC(IOC_MTD=0x0d, 0x0001) = 0x0d01. mtd_geometry_s
- * = { uint32 blocksize, erasesize, pagesize, neraseblocks }. */
-#define MTDIOC_GEOMETRY 0x0d01u
-
 #define FW_POSIX_WRITE  0xc33dc4fu  /* int write(int, const void*, uint32_t)*/
 #define FW_POSIX_READ   0x0c33d785u /* int read(int, void*, uint32_t)       */
 
@@ -91,7 +86,6 @@ typedef long long (*posix_lseek_fn)(int, long long, int);
 typedef void *(*posix_opendir_fn)(const char *);
 typedef void *(*posix_readdir_fn)(void *);
 typedef int (*posix_closedir_fn)(void *);
-typedef int (*ioctl_fn)(int, uint32_t, void *);
 struct b11_mallinfo {
     uint32_t arena, ordblks, aordblks, mxordblk, uordblks, fordblks, usmblks;
 };
@@ -316,37 +310,13 @@ static uint32_t walk_dir(const char *path, char *scratch, uint32_t scratch_len,
     return sum;
 }
 
-/* /dev/nand_data geometry: neraseblocks * erasesize, else fallback */
+/* Partition size: the runtime MTD geometry ioctl is NOT probed — a wrong
+ * command encoding on this closed kernel risks hitting a dangerous MTD
+ * command or an assert. Use the NAND media total (0x8000000 @ 0xcc4e5b0),
+ * which is also the 128 MiB /data cap the .155 data-quota-lift documented. */
 static uint32_t sample_user_total(void)
 {
-    struct geo {
-        uint32_t blocksize;
-        uint32_t erasesize;
-        uint32_t pagesize;
-        uint32_t neraseblocks;
-    } g;
-    posix_open_fn open_f = (posix_open_fn)(uintptr_t)VENA(FW_POSIX_OPEN);
-    posix_close_fn close_f = (posix_close_fn)(uintptr_t)VENA(FW_POSIX_CLOSE);
-    ioctl_fn ioctl_f = (ioctl_fn)(uintptr_t)VENA(FW_IOCTL);
-    int fd = open_f("/dev/nand_data", 0);
-    uint32_t total = 0u;
-
-    if (fd >= 0) {
-        g.blocksize = 0u;
-        g.erasesize = 0u;
-        g.pagesize = 0u;
-        g.neraseblocks = 0u;
-        if (ioctl_f(fd, MTDIOC_GEOMETRY, &g) == 0 &&
-            g.neraseblocks != 0u && g.erasesize != 0u) {
-            uint32_t product = g.neraseblocks * g.erasesize;
-            if (g.neraseblocks != 0u && product / g.neraseblocks == g.erasesize) {
-                total = product;
-            }
-        }
-        (void)close_f(fd);
-    }
-    if (total == 0u) total = 0x08000000u; /* NAND media record 0xcc4e5b0 */
-    return total;
+    return 0x08000000u;
 }
 
 static void sample_storage(void)
