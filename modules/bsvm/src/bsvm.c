@@ -32,6 +32,7 @@
 #define FW_PAGE_GOTO    0x0c8ed781u
 #define FW_OBJ_ALIGN    0x0c387789u /* void(obj, align, x, y)               */
 #define ALIGN_CENTER    9u          /* lv_align_t LV_ALIGN_CENTER (lvgl v8) */
+#define FW_ERRNO_LOC    0x0c349539u /* int *errno_location(void)            */
 
 #define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
 
@@ -245,6 +246,12 @@ static int32_t probe_size(const char *path)
     return (int32_t)sz;
 }
 
+static int last_errno(void)
+{
+    int *p = ((int *(*)(void))(uintptr_t)VENA(FW_ERRNO_LOC))();
+    return (p != 0) ? *p : -1000;
+}
+
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p)
 {
@@ -268,18 +275,36 @@ static int read_full(int fd, uint8_t *buf, uint32_t len)
 
 /* ---------------- load ---------------- */
 static uint32_t s_probe_size;    /* size of the opened game-data file */
+static int      s_e1, s_e2;      /* errno of failed header reads */
+static uint32_t s_hdr_r;         /* bytes returned by first header read */
+static int32_t  s_open_e;        /* errno if even open failed */
 
 static int bsvm_load(void)
 {
     uint8_t hdr[38];
-    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_A, O_RDONLY);
-    if (fd < 0) fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_B, O_RDONLY);
-    if (fd < 0) return -1;
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_A, O_RDONLY, 0);
+    if (fd < 0) fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(BIN_PATH_B, O_RDONLY, 0);
+    if (fd < 0) { s_open_e = last_errno(); return -1; }
     int64_t fsize = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
     ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_SET);
     s_probe_size = (fsize >= 0 && fsize <= 0x7FFFFFF0ll) ? (uint32_t)fsize : 0xFFFFFFFFu;
     int r = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, hdr, 38);
-    if (r <= 0) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return (r == 0) ? -2 : -8; }
+    s_hdr_r = (uint32_t)r;
+    if (r <= 0) {
+        s_e1 = last_errno();
+        /* retry with a static-pool buffer: distinguishes EFAULT (stack
+         * buffer unreachable) from fd-level read failure */
+        int r2 = ((posix_read_fn)vfn(FW_POSIX_READ))(fd, s_evt, 38);
+        if (r2 > 0) {
+            for (int i = 0; i < 38; i++) hdr[i] = s_evt[i];
+            r = r2;
+            s_e2 = 0;
+        } else {
+            s_e2 = last_errno();
+            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+            return (r == 0 && r2 == 0) ? -2 : -8;
+        }
+    }
     if (hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'V' || hdr[3] != 'M') { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -3; }
     s_str_off = rd32(hdr + 6);
     s_str_len = rd32(hdr + 10) - s_str_off;
@@ -291,9 +316,9 @@ static int bsvm_load(void)
     uint32_t dir_len = rd32(hdr + 34) - dir_off;
     if (dir_len > DIR_MAX || s_evt_len > EVT_MAX || s_db_len > DB_MAX) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -4; }
 
-    if (read_full(fd, s_evt, s_evt_len) != (int)s_evt_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -5; }
-    if (read_full(fd, s_db, s_db_len) != (int)s_db_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -6; }
-    if (read_full(fd, s_dir, dir_len) != (int)dir_len) { ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -7; }
+    if (read_full(fd, s_evt, s_evt_len) != (int)s_evt_len) { s_e1 = last_errno(); ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -5; }
+    if (read_full(fd, s_db, s_db_len) != (int)s_db_len) { s_e1 = last_errno(); ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -6; }
+    if (read_full(fd, s_dir, dir_len) != (int)dir_len) { s_e1 = last_errno(); ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd); return -7; }
     /* keep fd open for string reads */
     s_fd = fd;
 
@@ -627,6 +652,7 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         s_ok_init = 1u;
         log_line("BSVM headless start");
         log_kv("entries", s_total_entries);
+        log_kv("fsize", s_probe_size);
         log_kv("evt", s_evt_len);
         log_kv("db", s_db_len);
         log_kv("dir", s_dir_len);
@@ -646,10 +672,14 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         }
         log_line("LOAD-FAIL");
         log_kv("code", (uint32_t)(-rc));
+        log_kv("e1", (uint32_t)s_e1);
+        log_kv("e2", (uint32_t)s_e2);
+        log_kv("hdrr", s_hdr_r);
         log_kv("bsize", s_probe_size);
         log_kv("alt", (uint32_t)probe_size(BIN_PATH_B));
         log_kv("koinbox", (uint32_t)probe_size("/data/canopus/inbox/bsvm.ko.next"));
         log_kv("cmi", (uint32_t)probe_size("/data/canopus/inbox/bsvm.cmi.next"));
+        log_kv("opene", (uint32_t)s_open_e);
         log_flush();
     }
     return 0;
@@ -775,7 +805,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.1.4",
+    "0.1.5",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
