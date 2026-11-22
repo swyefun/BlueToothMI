@@ -306,41 +306,9 @@ jobs:
       - name: Patch installer Lua for data payload
         working-directory: canopus
         run: |
-          python3 - <<'EOF'
-          p = 'watchfaces/module-installer-prod/src/main.lua'
-          s = open(p, encoding='utf-8').read()
-          # 1. inject data config (idempotent)
-          if 'data_name' not in s:
-              old = '["assets"] = {},'
-              new = old + '\n["data_name"] = "bsvm_data.bin",'
-              assert old in s, 'config anchor missing'
-              s = s.replace(old, new, 1)
-          # 2. append the data payload to the staged files (read + verify + write
-          #    are handled by the shared payloads loop with its rollback check)
-          if 'bsvm_data' not in s.split('CONFIG')[0][-0:] or 'data payload' not in s:
-              old2 = '''    local payloads = {
-        {"inbox/" .. CONFIG.token .. ".cmi.next", receipt},
-        {"inbox/" .. CONFIG.token .. ".ko.next", module},
-    }'''
-              new2 = '''    local payloads = {
-        {"inbox/" .. CONFIG.token .. ".cmi.next", receipt},
-        {"inbox/" .. CONFIG.token .. ".ko.next", module},
-    }
-    -- BSVM game data payload (guarded: optional for non-bsvm products)
-    do
-        local ok, bsvm_data = pcall(read_all, SCRIPT_PATH .. (CONFIG.data_name or "bsvm_data.bin"))
-        if ok and type(bsvm_data) == "string" and #bsvm_data > 1000 then
-            payloads[#payloads + 1] = {"bsvm/bsvm.bin", bsvm_data}
-        end
-    end'''
-              assert old2 in s, 'payloads anchor missing'
-              s = s.replace(old2, new2, 1)
-          open(p, 'w', encoding='utf-8', newline='\n').write(s)
-          print('installer lua patched for data payload')
-          EOF
-          cp /tmp/bsvm.bin build-data-bsvm.bin
-          mkdir -p watchfaces/module-installer-prod/src/data
-          cp /tmp/bsvm.bin watchfaces/module-installer-prod/src/data/bsvm_data.bin
+          echo aW1wb3J0IGlvCnAgPSAnd2F0Y2hmYWNlcy9tb2R1bGUtaW5zdGFsbGVyLXByb2Qvc3JjL21haW4ubHVhJwpzID0gaW8ub3BlbihwLCBlbmNvZGluZz0ndXRmLTgnKS5yZWFkKCkKaWYgJ2RhdGFfbmFtZScgbm90IGluIHM6CiAgICBvbGQgPSAnWyJhc3NldHMiXSA9IHt9LCcKICAgIG5ldyA9IG9sZCArICdcblsiZGF0YV9uYW1lIl0gPSAiYnN2bV9kYXRhLmJpbiIsJwogICAgYXNzZXJ0IG9sZCBpbiBzLCAnY29uZmlnIGFuY2hvciBtaXNzaW5nJwogICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldywgMSkKaWYgJ2RhdGEgcGF5bG9hZCcgbm90IGluIHM6CiAgICBvbGQyID0gKAogICAgICAgICcgICAgbG9jYWwgcGF5bG9hZHMgPSB7XG4nCiAgICAgICAgJyAgICAgICAgeyJpbmJveC8iIC4uIENPTkZJRy50b2tlbiAuLiAiLmNtaS5uZXh0IiwgcmVjZWlwdH0sXG4nCiAgICAgICAgJyAgICAgICAgeyJpbmJveC8iIC4uIENPTkZJRy50b2tlbiAuLiAiLmtvLm5leHQiLCBtb2R1bGV9LFxuJwogICAgICAgICcgICAgfScpCiAgICBuZXcyID0gb2xkMiArICgKICAgICAgICAnXG4nCiAgICAgICAgJyAgICAtLSBCU1ZNIGdhbWUgZGF0YSBwYXlsb2FkIChndWFyZGVkOiBvcHRpb25hbCBmb3Igbm9uLWJzdm0gcHJvZHVjdHMpXG4nCiAgICAgICAgJyAgICBkb1xuJwogICAgICAgICcgICAgICAgIGxvY2FsIG9rLCBic3ZtX2RhdGEgPSBwY2FsbChyZWFkX2FsbCwgU0NSSVBUX1BBVEggLi4gKENPTkZJRy5kYXRhX25hbWUgb3IgImJzdm1fZGF0YS5iaW4iKSlcbicKICAgICAgICAnICAgICAgICBpZiBvayBhbmQgdHlwZShic3ZtX2RhdGEpID09ICJzdHJpbmciIGFuZCAjYnN2bV9kYXRhID4gMTAwMCB0aGVuXG4nCiAgICAgICAgJyAgICAgICAgICAgIHBheWxvYWRzWyNwYXlsb2FkcyArIDFdID0geyJic3ZtL2Jzdm0uYmluIiwgYnN2bV9kYXRhfVxuJwogICAgICAgICcgICAgICAgIGVuZFxuJwogICAgICAgICcgICAgZW5kJykKICAgIGFzc2VydCBvbGQyIGluIHMsICdwYXlsb2FkcyBhbmNob3IgbWlzc2luZycKICAgIHMgPSBzLnJlcGxhY2Uob2xkMiwgbmV3MiwgMSkKaW8ub3BlbihwLCAndycsIGVuY29kaW5nPSd1dGYtOCcsIG5ld2xpbmU9J1xuJykud3JpdGUocykKcHJpbnQoJ2luc3RhbGxlciBsdWEgcGF0Y2hlZCBmb3IgZGF0YSBwYXlsb2FkJykK | base64 -d > /tmp/patch_installer_data.py
+          python3 /tmp/patch_installer_data.py
+          cp /tmp/bsvm.bin watchfaces/module-installer-prod/src/bsvm_data.bin
 
       - name: Copy data file next to generated main.lua
         working-directory: canopus
