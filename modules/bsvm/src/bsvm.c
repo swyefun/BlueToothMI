@@ -500,7 +500,7 @@ static int vm_step(void)
         int32_t eo = i32(s_evt + a + 3);
         uint32_t bit = sw >> 3;
         uint8_t cur = (bit < 73u) ? ((s_switches[bit] >> (sw & 7u)) & 1u) : 0u;
-        if (cur != val) s_pc = (uint32_t)((int32_t)(a + 3) + eo + 4);
+        if (cur != val) s_pc = (uint32_t)((int32_t)(a + 3) + eo);
         else s_pc += 8;
         return 0; }
     case 0x04: { /* IF_VAR: u16 var, u8 op, u16 imm, s32 else_off */
@@ -520,12 +520,13 @@ static int vm_step(void)
         case 5: cond = (lhs != rhs); break;
         default: cond = 0; break;
         }
-        if (!cond) s_pc = (uint32_t)((int32_t)(a + 5) + eo + 4);
+        if (!cond) s_pc = (uint32_t)((int32_t)(a + 5) + eo);
         else s_pc += 10;
         return 0; }
-    case 0x06: { /* JMP */
-        int32_t rel = i32(s_evt + a);
-        s_pc = (uint32_t)((int32_t)a + rel);
+    case 0x06: { /* JMP: compiler writes an ABSOLUTE evt offset */
+        int32_t target = i32(s_evt + a);
+        if (target < 0 || (uint32_t)target >= s_evt_len) return -1;
+        s_pc = (uint32_t)target;
         return 0; }
     case 0x07: { /* SET_SW */
         uint32_t sw = rd16(s_evt + a);
@@ -598,7 +599,7 @@ static int vm_step(void)
         uint32_t want = s_evt[a];
         int32_t eo = i32(s_evt + a + 1);
         if (s_battle_result != (int32_t)want)
-            s_pc = (uint32_t)((int32_t)(a + 1) + eo + 4);
+            s_pc = (uint32_t)((int32_t)(a + 1) + eo);
         else s_pc += 6;
         return 0; }
     case 0x19: { /* PARTY */
@@ -904,7 +905,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.2.4",
+    "0.3.0",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
