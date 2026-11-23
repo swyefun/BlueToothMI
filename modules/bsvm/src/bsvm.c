@@ -35,8 +35,13 @@ static const struct canopus_context_v1 *s_ctx;
 #define FW_TIMER_DEL    0x0c3abe71u
 #define FW_PAGE_GOTO    0x0c8ed781u
 #define FW_OBJ_ALIGN    0x0c387789u /* void(obj, align, x, y)               */
-#define ALIGN_CENTER    9u          /* lv_align_t LV_ALIGN_CENTER (lvgl v8) */
+#define FW_OBJ_SIZE     0x0c387ba9u /* void(obj, w, h)                      */
+#define ALIGN_CENTER    9u          /* lvgl v8 LV_ALIGN_CENTER              */
+#define ALIGN_TOP_LEFT  1u          /* lvgl v8 LV_ALIGN_TOP_LEFT            */
 #define FW_ERRNO_LOC    0x0c349539u /* int *errno_location(void)            */
+/* UI v0.3: story display — only label + long-mode (all device-verified) */
+#define FW_LABEL_LONG   0x0c3b3f5du /* void lvx_label_set_long_mode(label, mode) */
+#define LV_LABEL_LONG_WRAP 2u       /* lvgl v8: WRAP=2 (scroll=0,clip=1,wrap=2) */
 
 #define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
 
@@ -111,6 +116,17 @@ static uint32_t s_total_entries;
 static void *s_label;
 static void *s_timer;
 static char  s_status[72];
+
+/* ---- UI v0.3: auto story player (display-only, timer-driven) ---- */
+static void *s_root;
+static void *s_dlg;          /* dialogue text label (long-mode wrap) */
+static void *s_scene;        /* scene / location line */
+static uint8_t s_ui_mode;    /* 0 boot, 1 story, 3 done */
+static char  s_dlg_buf[256];
+static char  s_scene_buf[64];
+static uint32_t s_story_off; /* bytecode offset of the story entry being played */
+static uint32_t s_story_end; /* end offset */
+static uint32_t s_dwell;     /* timer ticks before auto-advance */
 
 /* ---------------- helpers ---------------- */
 static void *vfn(uint32_t enc) { return (void *)(uintptr_t)VENA(enc); }
@@ -218,6 +234,23 @@ static void label_center(void *obj)
         ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
             obj, ALIGN_CENTER, 0, 0);
     }
+}
+
+/* UI: label at absolute position, with optional long-text wrap */
+static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int wrap)
+{
+    void *obj = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
+    if (obj == 0) return 0;
+    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+        obj, ALIGN_TOP_LEFT, x, y);
+    if (w > 0) {
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(obj, w, 120);
+    }
+    if (wrap) {
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_LABEL_LONG))(
+            obj, LV_LABEL_LONG_WRAP);
+    }
+    return obj;
 }
 
 /* ---------------- string access ---------------- */
@@ -698,6 +731,111 @@ static void run_slice(uint32_t budget)
     }
 }
 
+/* ---------------- UI v0.3: auto story player ----------------
+ * Display-only first step: pick one story entry, walk its bytecode with the
+ * fixed jump semantics, and show each TEXT in a wrapped Chinese label.
+ * Timer-driven auto-advance; no unverified click APIs. Every step is logged.
+ */
+static void ui_pick_story(void)
+{
+    /* choose the common event with the most commands as the demo story */
+    uint32_t best = 0, bestlen = 0;
+    for (uint32_t i = 0; i < s_ce_n; i++) {
+        uint32_t len = s_ce_len[i];
+        if (len > bestlen) { bestlen = len; best = i; }
+    }
+    s_story_off = (best < s_ce_n) ? s_ce_off[best] : 0u;
+    s_story_end = s_story_off + ((best < s_ce_n) ? s_ce_len[best] : 0u);
+    if (s_story_end > s_evt_len) s_story_end = s_evt_len;
+    s_pc = s_story_off;
+    s_ui_mode = 1u;
+    s_dwell = 0u;
+    log_kv("story-ce", best);
+    log_kv("story-off", s_story_off);
+    log_kv("story-end", s_story_end);
+}
+
+static void ui_set_scene(const char *txt)
+{
+    int i = 0;
+    while (txt[i] && i < (int)sizeof(s_scene_buf) - 1) { s_scene_buf[i] = txt[i]; i++; }
+    s_scene_buf[i] = '\0';
+    if (s_scene != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_scene, s_scene_buf);
+    }
+}
+
+static void ui_set_dlg(const char *txt)
+{
+    int i = 0;
+    while (txt[i] && i < (int)sizeof(s_dlg_buf) - 1) { s_dlg_buf[i] = txt[i]; i++; }
+    s_dlg_buf[i] = '\0';
+    if (s_dlg != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_dlg, s_dlg_buf);
+    }
+}
+
+/* run bytecode until a TEXT is shown or the entry ends; returns 1 if a
+ * dialogue is now on screen, 0 if entry finished */
+static int ui_run_until_text(void)
+{
+    for (uint32_t guard = 0; guard < 20000u; guard++) {
+        if (s_pc >= s_story_end || s_pc >= s_evt_len) return 0;
+        uint8_t op = s_evt[s_pc];
+        uint32_t a = s_pc + 1u;
+        if (op == 0x00u) return 0;              /* END */
+        if (op == 0x01u) {                      /* TEXT */
+            uint32_t idx = rd32(s_evt + a);
+            char txt[240];
+            if (str_get(idx, txt, (int)sizeof(txt)) >= 0) {
+                ui_set_dlg(txt);
+                log_line("SHOW-TEXT");
+                return 1;
+            }
+            s_pc += 5u;
+            continue;
+        }
+        if (op == 0x02u) {                      /* CHOICE: pick option 0 */
+            uint32_t n = s_evt[a];
+            if (n > 0u) {
+                uint32_t field = a + 1u + 4u * n;
+                int32_t rel = (int32_t)rd16(s_evt + field);
+                uint32_t tgt = (uint32_t)((int32_t)field + rel);
+                if (tgt < s_evt_len) { s_pc = tgt; continue; }
+            }
+            s_pc += 1u + n * 6u + 2u;
+            continue;
+        }
+        /* reuse the VM step for all logic opcodes; it updates s_pc */
+        int r = vm_step();
+        if (r != 0) return 0;
+    }
+    return 0;
+}
+
+static void ui_tick(void *arg)
+{
+    (void)arg;
+    if (s_ui_mode != 1u) return;
+    if (s_dwell > 0u) {                 /* dwell on the current dialogue */
+        s_dwell--;
+        return;
+    }
+    int showing = ui_run_until_text();
+    if (showing) {
+        s_dwell = 40u;                  /* ~2s at 50ms per tick */
+    } else {
+        s_ui_mode = 3u;
+        ui_set_dlg("故事播放完毕");
+        log_line("STORY-DONE");
+        log_flush();
+        if (s_timer != 0) {
+            ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+            s_timer = 0;
+        }
+    }
+}
+
 static void bsvm_tick(void *arg)
 {
     (void)arg;
@@ -750,16 +888,35 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
     int rc = bsvm_load();
     if (rc == 0) {
         s_ok_init = 1u;
-        log_line("BSVM headless start");
+        s_root = root;
+        log_line("BSVM start");
         log_kv("entries", s_total_entries);
         log_kv("fsize", s_probe_size);
         log_kv("evt", s_evt_len);
         log_kv("db", s_db_len);
         log_kv("dir", s_dir_len);
         log_kv("strn", s_strn);
-        log_flush();
-        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
-            bsvm_tick, 50u, 0);
+        /* headless escape hatch: /data/bsvm_headless.txt present => old full run */
+        {
+            int hfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_headless.txt", O_RDONLY);
+            if (hfd >= 0) {
+                ((posix_close_fn)vfn(FW_POSIX_CLOSE))(hfd);
+                log_line("MODE headless");
+                log_flush();
+                s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+                    bsvm_tick, 50u, 0);
+            } else {
+                log_line("MODE story-ui");
+                /* build the UI: scene line + wrapped dialogue label */
+                s_scene = ui_label(root, 14, 96, 240, 0);
+                s_dlg   = ui_label(root, 14, 150, 240, 1);
+                ui_set_scene("BSVM 剧情");
+                ui_pick_story();
+                log_flush();
+                s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+                    ui_tick, 50u, 0);
+            }
+        }
     } else {
         /* short label: round-screen bezel clips long text */
         char msg[12];
@@ -905,7 +1062,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.3.0",
+    "0.3.1",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
