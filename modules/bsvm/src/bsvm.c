@@ -39,9 +39,12 @@ static const struct canopus_context_v1 *s_ctx;
 #define ALIGN_CENTER    9u          /* lvgl v8 LV_ALIGN_CENTER              */
 #define ALIGN_TOP_LEFT  1u          /* lvgl v8 LV_ALIGN_TOP_LEFT            */
 #define FW_ERRNO_LOC    0x0c349539u /* int *errno_location(void)            */
-/* UI v0.3: story display — only label + long-mode (all device-verified) */
+/* UI v0.3: story display — label + long-mode + CJK font */
 #define FW_LABEL_LONG   0x0c3b3f5du /* void lvx_label_set_long_mode(label, mode) */
 #define LV_LABEL_LONG_WRAP 2u       /* lvgl v8: WRAP=2 (scroll=0,clip=1,wrap=2) */
+/* CJK font: private-ABI calendar font port (approved, device-unproven) */
+#define FW_FONT_CREATE  0x0c4950b1u /* void *calendar_font_create(family,size,style) */
+#define FW_TEXT_FONT    0x0c387ebbu /* void calendar_text_font(obj, font, selector)  */
 
 #define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
 
@@ -127,6 +130,7 @@ static char  s_scene_buf[64];
 static uint32_t s_story_off; /* bytecode offset of the story entry being played */
 static uint32_t s_story_end; /* end offset */
 static uint32_t s_dwell;     /* timer ticks before auto-advance */
+static void *s_cjk_font;     /* created once, must outlive all labels */
 
 /* ---------------- helpers ---------------- */
 static void *vfn(uint32_t enc) { return (void *)(uintptr_t)VENA(enc); }
@@ -237,18 +241,22 @@ static void label_center(void *obj)
 }
 
 /* UI: label at absolute position, with optional long-text wrap */
-static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int wrap)
+static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int32_t h, int wrap)
 {
     void *obj = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
     if (obj == 0) return 0;
     ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
         obj, ALIGN_TOP_LEFT, x, y);
     if (w > 0) {
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(obj, w, 120);
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(obj, w, h);
     }
     if (wrap) {
         ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_LABEL_LONG))(
             obj, LV_LABEL_LONG_WRAP);
+    }
+    if (s_cjk_font != 0) {
+        ((void (*)(void *, const void *, uint32_t))(uintptr_t)VENA(FW_TEXT_FONT))(
+            obj, s_cjk_font, 0u);
     }
     return obj;
 }
@@ -736,23 +744,95 @@ static void run_slice(uint32_t budget)
  * fixed jump semantics, and show each TEXT in a wrapped Chinese label.
  * Timer-driven auto-advance; no unverified click APIs. Every step is logged.
  */
+/* quick dry-run of one entry with choice-0 auto-pick; counts TEXTs and
+ * rejects entries that jump backwards (menus/loops) or never finish */
+static int ui_probe_entry(uint32_t off, uint32_t end, uint32_t *texts)
+{
+    uint32_t pc = off, texts_n = 0u;
+    *texts = 0u;
+    if (end > s_evt_len) end = s_evt_len;
+    for (uint32_t guard = 0u; guard < 3000u; guard++) {
+        if (pc >= end || pc >= s_evt_len) return (texts_n >= 3u) ? 1 : 0;
+        uint8_t op = s_evt[pc];
+        uint32_t a = pc + 1u;
+        if (op == 0x00u) return (texts_n >= 3u) ? 1 : 0;   /* END */
+        if (op == 0x01u) { texts_n++; pc += 5u; continue; } /* TEXT */
+        if (op == 0x02u) {                                  /* CHOICE pick 0 */
+            uint32_t n = s_evt[a];
+            if (n > 0u) {
+                uint32_t field = a + 1u + 4u * n;
+                int32_t rel = (int32_t)rd16(s_evt + field);
+                uint32_t tgt = (uint32_t)((int32_t)field + rel);
+                if (tgt < s_evt_len && tgt > pc) { pc = tgt; continue; }
+                if (tgt <= pc) return 0;                    /* backward: menu */
+            }
+            pc += 1u + n * 6u + 2u;
+            continue;
+        }
+        if (op == 0x06u) {                                  /* JMP absolute */
+            int32_t tgt = i32(s_evt + a);
+            if (tgt < 0 || (uint32_t)tgt >= s_evt_len) return 0;
+            if ((uint32_t)tgt <= pc) return 0;              /* backward: loop */
+            pc = (uint32_t)tgt;
+            continue;
+        }
+        if (op == 0x03u || op == 0x04u || op == 0x18u) {    /* branches: both sides must stay forward */
+            uint32_t field = pc + ((op == 0x03u) ? 4u : (op == 0x04u) ? 6u : 2u);
+            if (field + 4u > s_evt_len) return 0;
+            int32_t rel = i32(s_evt + field);
+            uint32_t tgt = (uint32_t)((int32_t)field + rel);
+            if (tgt > pc && tgt < s_evt_len) {
+                /* take the jump side (false branch) as the spine */
+                pc = tgt;
+                continue;
+            }
+            /* fall-through side */
+            pc += (op == 0x03u) ? 8u : (op == 0x04u) ? 10u : 6u;
+            continue;
+        }
+        pc += 12u; /* unknown opcode: pessimistic skip keeps us moving */
+    }
+    return 0;
+}
+
 static void ui_pick_story(void)
 {
-    /* choose the common event with the most commands as the demo story */
-    uint32_t best = 0, bestlen = 0;
+    uint32_t best_off = 0u, best_end = 0u, best_texts = 0u;
+    /* CE entries */
     for (uint32_t i = 0; i < s_ce_n; i++) {
-        uint32_t len = s_ce_len[i];
-        if (len > bestlen) { bestlen = len; best = i; }
+        uint32_t off = s_ce_off[i];
+        uint32_t end = off + s_ce_len[i];
+        uint32_t t;
+        if (ui_probe_entry(off, end, &t) && t > best_texts) {
+            best_texts = t; best_off = off; best_end = end;
+        }
     }
-    s_story_off = (best < s_ce_n) ? s_ce_off[best] : 0u;
-    s_story_end = s_story_off + ((best < s_ce_n) ? s_ce_len[best] : 0u);
+    /* map pages */
+    for (uint32_t i = 0; i < s_pg_n && best_texts < 8u; i++) {
+        uint32_t off = s_pg_off[i];
+        uint32_t end = off + 8192u;
+        uint32_t t;
+        if (ui_probe_entry(off, end, &t) && t > best_texts) {
+            best_texts = t; best_off = off; best_end = end;
+        }
+    }
+    if (best_off == 0u) {                    /* fallback: biggest CE */
+        uint32_t best = 0, bestlen = 0;
+        for (uint32_t i = 0; i < s_ce_n; i++) {
+            if (s_ce_len[i] > bestlen) { bestlen = s_ce_len[i]; best = i; }
+        }
+        best_off = s_ce_off[best];
+        best_end = best_off + s_ce_len[best];
+    }
+    s_story_off = best_off;
+    s_story_end = best_end;
     if (s_story_end > s_evt_len) s_story_end = s_evt_len;
     s_pc = s_story_off;
     s_ui_mode = 1u;
     s_dwell = 0u;
-    log_kv("story-ce", best);
     log_kv("story-off", s_story_off);
     log_kv("story-end", s_story_end);
+    log_kv("story-texts", best_texts);
 }
 
 static void ui_set_scene(const char *txt)
@@ -894,7 +974,7 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         log_kv("fsize", s_probe_size);
         log_kv("evt", s_evt_len);
         log_kv("db", s_db_len);
-        log_kv("dir", s_dir_len);
+        log_kv("dir", s_dir_len_v);
         log_kv("strn", s_strn);
         /* headless escape hatch: /data/bsvm_headless.txt present => old full run */
         {
@@ -907,9 +987,17 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
                     bsvm_tick, 50u, 0);
             } else {
                 log_line("MODE story-ui");
-                /* build the UI: scene line + wrapped dialogue label */
-                s_scene = ui_label(root, 14, 96, 240, 0);
-                s_dlg   = ui_label(root, 14, 150, 240, 1);
+                /* CJK font: watchfaces render Chinese with MiSans; the native
+                 * default font has no CJK glyphs (boxes on device) */
+                log_line("font-create");
+                log_flush();
+                s_cjk_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
+                    "MiSans-Regular", 18u, 0u);
+                log_kv("font", (uint32_t)(uintptr_t)s_cjk_font);
+                /* build the UI: scene line + wrapped dialogue label; widths
+                 * stay inside the ~192px screen so page gestures keep working */
+                s_scene = ui_label(root, 14, 96, 164, 30, 0);
+                s_dlg   = ui_label(root, 14, 150, 164, 260, 1);
                 ui_set_scene("BSVM 剧情");
                 ui_pick_story();
                 log_flush();
@@ -1062,7 +1150,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
         CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.3.1",
+    "0.3.2",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
