@@ -775,76 +775,65 @@ static void run_slice(uint32_t budget)
  * fixed jump semantics, and show each TEXT in a wrapped Chinese label.
  * Timer-driven auto-advance; no unverified click APIs. Every step is logged.
  */
-/* quick dry-run of one entry with choice-0 auto-pick; counts TEXTs and
- * rejects entries that jump backwards (menus/loops) or never finish */
-static int ui_probe_entry(uint32_t off, uint32_t end, uint32_t *texts)
+/* dry-run one entry with the REAL VM semantics (choice 0, battle won,
+ * default switches/vars) and count TEXT ops on the executed path.
+ * No string fetches (zero fs churn). Budget caps runaway menus/loops.
+ * Because this is the same code path playback uses, the count cannot
+ * diverge from what will actually be shown — the v0.5 static probe did. */
+static uint32_t story_dry_run(uint32_t off, uint32_t end, uint32_t budget)
 {
-    uint32_t pc = off, texts_n = 0u;
-    *texts = 0u;
+    uint32_t texts = 0u, steps = 0u;
     if (end > s_evt_len) end = s_evt_len;
-    for (uint32_t guard = 0u; guard < 3000u; guard++) {
-        if (pc >= end || pc >= s_evt_len) return (texts_n >= 3u) ? 1 : 0;
-        uint8_t op = s_evt[pc];
-        uint32_t a = pc + 1u;
-        if (op == 0x00u) return (texts_n >= 3u) ? 1 : 0;   /* END */
-        if (op == 0x01u) { texts_n++; pc += 5u; continue; } /* TEXT */
-        if (op == 0x02u) {                                  /* CHOICE pick 0 */
+    vm_reset();
+    s_pc = off;
+    while (steps < budget) {
+        if (s_pc >= end || s_pc >= s_evt_len) break;
+        uint8_t op = s_evt[s_pc];
+        uint32_t a = s_pc + 1u;
+        if (op == 0x00u) {                       /* END */
+            if (s_sp == 0u) break;
+            s_sp--;
+            s_pc = s_ret[s_sp];
+            continue;
+        }
+        steps++;
+        if (op == 0x01u) { texts++; s_pc += 5u; continue; }  /* TEXT */
+        if (op == 0x02u) {                       /* CHOICE: pick option 0 */
             uint32_t n = s_evt[a];
             if (n > 0u) {
                 uint32_t field = a + 1u + 4u * n;
                 int32_t rel = (int32_t)rd16(s_evt + field);
                 uint32_t tgt = (uint32_t)((int32_t)field + rel);
-                if (tgt < s_evt_len && tgt > pc) { pc = tgt; continue; }
-                if (tgt <= pc) return 0;                    /* backward: menu */
+                if (tgt < s_evt_len) { s_pc = tgt; continue; }
             }
-            pc += 1u + n * 6u + 2u;
+            s_pc += 1u + n * 6u + 2u;
             continue;
         }
-        if (op == 0x06u) {                                  /* JMP absolute */
-            int32_t tgt = i32(s_evt + a);
-            if (tgt < 0 || (uint32_t)tgt >= s_evt_len) return 0;
-            if ((uint32_t)tgt <= pc) return 0;              /* backward: loop */
-            pc = (uint32_t)tgt;
-            continue;
-        }
-        if (op == 0x03u || op == 0x04u || op == 0x18u) {    /* branches: both sides must stay forward */
-            uint32_t field = pc + ((op == 0x03u) ? 4u : (op == 0x04u) ? 6u : 2u);
-            if (field + 4u > s_evt_len) return 0;
-            int32_t rel = i32(s_evt + field);
-            uint32_t tgt = (uint32_t)((int32_t)field + rel);
-            if (tgt > pc && tgt < s_evt_len) {
-                /* take the jump side (false branch) as the spine */
-                pc = tgt;
-                continue;
-            }
-            /* fall-through side */
-            pc += (op == 0x03u) ? 8u : (op == 0x04u) ? 10u : 6u;
-            continue;
-        }
-        pc += 12u; /* unknown opcode: pessimistic skip keeps us moving */
+        if (vm_step() != 0) break;
     }
-    return 0;
+    return texts;
 }
 
 static void ui_pick_story(void)
 {
     uint32_t best_off = 0u, best_end = 0u, best_texts = 0u;
-    /* CE entries */
+    int32_t best_ce = -1;
+    /* CE entries: dry-run each, keep the one with the most real TEXTs */
     for (uint32_t i = 0; i < s_ce_n; i++) {
         uint32_t off = s_ce_off[i];
-        uint32_t end = off + s_ce_len[i];
-        uint32_t t;
-        if (ui_probe_entry(off, end, &t) && t > best_texts) {
-            best_texts = t; best_off = off; best_end = end;
+        uint32_t t = story_dry_run(off, off + s_ce_len[i], 2000u);
+        if (t > best_texts) {
+            best_texts = t; best_off = off;
+            best_end = off + s_ce_len[i]; best_ce = (int32_t)i;
         }
     }
-    /* map pages */
+    /* map pages: only when no CE carries a real story */
     for (uint32_t i = 0; i < s_pg_n && best_texts < 8u; i++) {
         uint32_t off = s_pg_off[i];
-        uint32_t end = off + 8192u;
-        uint32_t t;
-        if (ui_probe_entry(off, end, &t) && t > best_texts) {
-            best_texts = t; best_off = off; best_end = end;
+        uint32_t t = story_dry_run(off, off + 8192u, 2000u);
+        if (t > best_texts) {
+            best_texts = t; best_off = off;
+            best_end = off + 8192u; best_ce = -1;
         }
     }
     if (best_off == 0u) {                    /* fallback: biggest CE */
@@ -854,13 +843,16 @@ static void ui_pick_story(void)
         }
         best_off = s_ce_off[best];
         best_end = best_off + s_ce_len[best];
+        best_ce = (int32_t)best;
     }
     s_story_off = best_off;
     s_story_end = best_end;
     if (s_story_end > s_evt_len) s_story_end = s_evt_len;
+    vm_reset();                              /* dry runs mutated VM state */
     s_pc = s_story_off;
     s_ui_mode = 1u;
     s_dwell = 0u;
+    log_kv("story-ce", (uint32_t)best_ce);
     log_kv("story-off", s_story_off);
     log_kv("story-end", s_story_end);
     log_kv("story-texts", best_texts);
@@ -898,12 +890,13 @@ static int ui_run_until_text(void)
         if (op == 0x01u) {                      /* TEXT */
             uint32_t idx = rd32(s_evt + a);
             char txt[240];
+            s_pc += 5u;                         /* advance FIRST: the next call
+                                                 * continues after this line */
             if (str_get(idx, txt, (int)sizeof(txt)) >= 0) {
                 ui_set_dlg(txt);
                 log_line("SHOW-TEXT");
                 return 1;
             }
-            s_pc += 5u;
             continue;
         }
         if (op == 0x02u) {                      /* CHOICE: pick option 0 */
