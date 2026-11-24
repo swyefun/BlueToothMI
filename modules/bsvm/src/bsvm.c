@@ -1,25 +1,18 @@
 /*
- * bsvm.c — BlackSoul VM: RMVA events bytecode runtime for Band 11.
+ * bsvm.c — BlackSoul VM: RMVA events bytecode runtime for Band 11 (4.100.139).
  *
- * v0.4: all firmware access goes through the Supervisor's mapped ctx services
- * (ctx->fs / ctx->time / ctx->ui). No raw veneer addresses, so the same source
- * builds for .139 / .155 / .179 and behaves identically on device and Mirage.
+ * v0.1 HEADLESS: runs every event page (common events, all map pages, troop
+ * pages) in sequence with auto-advance (TEXT logged, CHOICE picks 0, BATTLE
+ * assumed won). Everything lands in /data/bsvm/play_log.txt. This validates
+ * file IO, decoding, memory and the interpreter on real hardware BEFORE any
+ * UI is attached.
  *
- * Two modes (chosen by /data/bsvm_headless.txt):
- *  - headless: a ctx->time timer walks every event page in slices (TEXT logged,
- *    CHOICE picks 0, BATTLE assumed won); the full trace is appended to
- *    /data/bsvm_log.txt. Used to validate decode/VM/memory end to end.
- *  - story UI: ctx->ui semantic tree in the Manager page; "next" steps one
- *    TEXT at a time through the selected story entry. Auto-wrapped CJK text is
- *    rendered by the target backend, not by hand-built LVGL objects.
- *
- * Verifier rules honored: no 64-bit division, no float math, zero imports,
- * fixed pools only, timer-sliced work.
+ * Verifier rules honored: no 64-bit division, no float math, firmware veneers
+ * XOR 0x06000000 (VENA), zero imports, fixed pools only, timer-sliced work.
  */
 
 #include "canopus_module_entry.h"
 #include "canopus_memory.h"
-#include "canopus_ui.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -30,20 +23,48 @@
  * the FS service reads game data before the lifecycle section below) */
 static const struct canopus_context_v1 *s_ctx;
 
-/* ---------------- firmware access: ctx services only (v0.4) -------------
- * ALL firmware calls go through the Supervisor's mapped ctx services
- * (ctx->fs / ctx->time / ctx->ui). No raw veneer addresses: those are target
- * specific and were the cause of the "load -> instant crash, no log" on .179.
- * This source builds for every target that exposes the ABI2 service set, so
- * the same package target list covers .139 / .155 / .179.
- */
+/* ---------------- firmware veneers (139) ---------------- */
+#define FW_POSIX_OPEN   0x0c342c55u
+#define FW_POSIX_READ   0x0c33d785u
+#define FW_POSIX_WRITE  0xc33dc4fu
+#define FW_POSIX_CLOSE  0xc33818du
+#define FW_LSEEK        0x0c33d511u
+#define FW_LABEL_CREATE 0x0c3ab301u
+#define FW_LABEL_TEXT   0x0c3b3949u
+#define FW_TIMER_CREATE 0x0c3abd21u
+#define FW_TIMER_DEL    0x0c3abe71u
+#define FW_PAGE_GOTO    0x0c8ed781u
+#define FW_OBJ_ALIGN    0x0c387789u /* void(obj, align, x, y)               */
+#define FW_OBJ_SIZE     0x0c387ba9u /* void(obj, w, h)                      */
+#define ALIGN_CENTER    9u          /* lvgl v8 LV_ALIGN_CENTER              */
+#define ALIGN_TOP_LEFT  1u          /* lvgl v8 LV_ALIGN_TOP_LEFT            */
+#define FW_ERRNO_LOC    0x0c349539u /* int *errno_location(void)            */
+/* UI v0.3: story display — label + long-mode + CJK font */
+#define FW_LABEL_LONG   0x0c3b3f5du /* void lvx_label_set_long_mode(label, mode) */
+#define LV_LABEL_LONG_WRAP 2u       /* lvgl v8: WRAP=2 (scroll=0,clip=1,wrap=2) */
+/* CJK font: private-ABI calendar font port (approved, device-unproven) */
+#define FW_FONT_CREATE  0x0c4950b1u /* void *calendar_font_create(family,size,style) */
+#define FW_TEXT_FONT    0x0c387ebbu /* void calendar_text_font(obj, font, selector)  */
+
+#define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
+
+typedef int (*posix_open_fn)(const char *, int, ...);
+typedef int (*posix_read_fn)(int, void *, uint32_t);
+typedef int (*posix_write_fn)(int, const void *, uint32_t);
+typedef int (*posix_close_fn)(int);
+/* firmware lseek is int64_t(int, int64_t, int): the 64-bit offset travels in
+ * the even-aligned r2:r3 pair per AAPCS — a 32-bit call site corrupts it */
+typedef int64_t (*posix_lseek_fn)(int, int64_t, int);
+
+#define O_RDONLY 0
+#define O_RDWR   2
+#define O_CREAT  4
+#define SEEK_SET 0
+#define SEEK_END 2
 
 static const char BIN_PATH_A[] = "/data/bsvm.bin";                /* v0.1.6: outside /data/canopus (framework denies module reads there) */
 static const char BIN_PATH_B[] = "/data/canopus/bsvm/bsvm.bin";   /* legacy probe only */
-/* v0.4: written through ctx->fs (official service). /data/canopus is a
- * protected prefix for bare module reads, but /data itself is allowed, so the
- * log sits beside the game data where the emulator harness can fetch it. */
-static const char LOG_PATH[] = "/data/bsvm_log.txt";
+static const char LOG_PATH[] = "/data/canopus/bsvm_log.txt";      /* /data/bsvm/ does not exist on device */
 
 /* ---------------- static pools ---------------- */
 #define EVT_MAX 178000u
@@ -94,22 +115,26 @@ static uint32_t s_text_n;         /* TEXT ops processed (not logged) */
 static uint8_t  s_ok_init;
 static uint32_t s_total_entries;
 
-/* ui: ctx services (no raw firmware pointers) */
-static int32_t s_timer_id = -1;   /* ctx->time timer; -1 = none */
+/* ui */
+static void *s_label;
+static void *s_timer;
 static char  s_status[72];
 
-/* ---- story player state (rendered through ctx->ui semantic tree) ---- */
+/* ---- UI v0.3: auto story player (display-only, timer-driven) ---- */
+static void *s_root;
+static void *s_dlg;          /* dialogue text label (long-mode wrap) */
+static void *s_scene;        /* scene / location line */
 static uint8_t s_ui_mode;    /* 0 boot, 1 story, 3 done */
-static char  s_dlg_buf[256];    /* current dialogue (body text node) */
-static char  s_scene_buf[64];   /* scene / location (title text node) */
+static char  s_dlg_buf[256];
+static char  s_scene_buf[64];
 static uint32_t s_story_off; /* bytecode offset of the story entry being played */
 static uint32_t s_story_end; /* end offset */
-
-/* ui entry / render state */
-enum { EV_NEXT = 1, EV_HEADLESS };
-static struct canopus_ui_context_v1 *s_ui_ctx;   /* live page, valid while open */
+static uint32_t s_dwell;     /* timer ticks before auto-advance */
+static void *s_cjk_font;     /* created once, must outlive all labels */
 
 /* ---------------- helpers ---------------- */
+static void *vfn(uint32_t enc) { return (void *)(uintptr_t)VENA(enc); }
+
 static void u32_to_dec(char *b, uint32_t v)
 {
     char t[12]; int i = 0, j = 0;
@@ -148,13 +173,11 @@ static int  s_logn;
 static void log_flush(void)
 {
     if (s_logn <= 0) return;
-    const struct canopus_fs_obj *fs = (s_ctx != 0) ? s_ctx->fs : 0;
-    if (fs != 0 && fs->open != 0 && fs->write != 0 && fs->close != 0) {
-        int32_t fd = fs->open(s_ctx, LOG_PATH, CANOPUS_FS_WRITE | CANOPUS_FS_APPEND);
-        if (fd >= 0) {
-            (void)fs->write(s_ctx, fd, s_logbuf, (uint32_t)s_logn);
-            (void)fs->close(s_ctx, fd);
-        }
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(LOG_PATH, O_RDWR | O_CREAT, 0666);
+    if (fd >= 0) {
+        ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+        ((posix_write_fn)vfn(FW_POSIX_WRITE))(fd, s_logbuf, (uint32_t)s_logn);
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
     }
     s_logn = 0;
 }
@@ -201,6 +224,43 @@ static void log_line(const char *s)
     log_raw("\r\n", 2);
 }
 
+static void str_copy(char *d, const char *src, int max)
+{
+    int i = 0;
+    while (src[i] && i < max - 1) { d[i] = src[i]; i++; }
+    d[i] = '\0';
+}
+
+/* default label lands at (0,0) — fully hidden by the round bezel */
+static void label_center(void *obj)
+{
+    if (obj != 0) {
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+            obj, ALIGN_CENTER, 0, 0);
+    }
+}
+
+/* UI: label at absolute position, with optional long-text wrap */
+static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int32_t h, int wrap)
+{
+    void *obj = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
+    if (obj == 0) return 0;
+    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+        obj, ALIGN_TOP_LEFT, x, y);
+    if (w > 0) {
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(obj, w, h);
+    }
+    if (wrap) {
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_LABEL_LONG))(
+            obj, LV_LABEL_LONG_WRAP);
+    }
+    if (s_cjk_font != 0) {
+        ((void (*)(void *, const void *, uint32_t))(uintptr_t)VENA(FW_TEXT_FONT))(
+            obj, s_cjk_font, 0u);
+    }
+    return obj;
+}
+
 /* ---------------- string access ---------------- */
 static int str_get(uint32_t off, char *out, int max)
 {
@@ -227,6 +287,23 @@ static int str_get(uint32_t off, char *out, int max)
     if (n < 0) return -1;
     out[n] = '\0';
     return n;
+}
+
+/* size probe for diagnostics: -1 missing, -2 lseek error, else size */
+static int32_t probe_size(const char *path)
+{
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int64_t sz = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+    ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    if (sz < 0 || sz > 0x7FFFFFF0ll) return -2;
+    return (int32_t)sz;
+}
+
+static int last_errno(void)
+{
+    int *p = ((int *(*)(void))(uintptr_t)VENA(FW_ERRNO_LOC))();
+    return (p != 0) ? *p : -1000;
 }
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -657,6 +734,9 @@ static void run_slice(uint32_t budget)
     u32_to_dec(vb, s_runs_bad);
     n = 0; while (vb[n] && m < (int)sizeof(s_status) - 2) s_status[m++] = vb[n++];
     s_status[m] = '\0';
+    if (s_label != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, s_status);
+    }
 }
 
 /* ---------------- UI v0.3: auto story player ----------------
@@ -749,6 +829,7 @@ static void ui_pick_story(void)
     if (s_story_end > s_evt_len) s_story_end = s_evt_len;
     s_pc = s_story_off;
     s_ui_mode = 1u;
+    s_dwell = 0u;
     log_kv("story-off", s_story_off);
     log_kv("story-end", s_story_end);
     log_kv("story-texts", best_texts);
@@ -759,6 +840,9 @@ static void ui_set_scene(const char *txt)
     int i = 0;
     while (txt[i] && i < (int)sizeof(s_scene_buf) - 1) { s_scene_buf[i] = txt[i]; i++; }
     s_scene_buf[i] = '\0';
+    if (s_scene != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_scene, s_scene_buf);
+    }
 }
 
 static void ui_set_dlg(const char *txt)
@@ -766,6 +850,9 @@ static void ui_set_dlg(const char *txt)
     int i = 0;
     while (txt[i] && i < (int)sizeof(s_dlg_buf) - 1) { s_dlg_buf[i] = txt[i]; i++; }
     s_dlg_buf[i] = '\0';
+    if (s_dlg != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_dlg, s_dlg_buf);
+    }
 }
 
 /* run bytecode until a TEXT is shown or the entry ends; returns 1 if a
@@ -806,13 +893,36 @@ static int ui_run_until_text(void)
     return 0;
 }
 
-/* headless full-run: one slice per timer fire, driven by ctx->time. */
-static void bsvm_tick(const struct canopus_context_v1 *ctx, int32_t timer_id,
-                      void *user_data)
+static void ui_tick(void *arg)
 {
-    (void)ctx; (void)timer_id; (void)user_data;
+    (void)arg;
+    if (s_ui_mode != 1u) return;
+    if (s_dwell > 0u) {                 /* dwell on the current dialogue */
+        s_dwell--;
+        return;
+    }
+    int showing = ui_run_until_text();
+    if (showing) {
+        s_dwell = 40u;                  /* ~2s at 50ms per tick */
+    } else {
+        s_ui_mode = 3u;
+        ui_set_dlg("故事播放完毕");
+        log_line("STORY-DONE");
+        log_flush();
+        if (s_timer != 0) {
+            ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+            s_timer = 0;
+        }
+    }
+}
+
+static void bsvm_tick(void *arg)
+{
+    (void)arg;
     run_slice(400u);
-    if (s_phase == 2u) {
+    if (s_phase == 2u && s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
         log_line("ALL-DONE");
         /* opcode histogram: only non-zero entries, format "opNN <count>" */
         for (uint32_t op = 0u; op < 256u; op++) {
@@ -831,135 +941,132 @@ static void bsvm_tick(const struct canopus_context_v1 *ctx, int32_t timer_id,
         log_kv("bad", s_runs_bad);
         log_kv("steps", s_total_steps);
         log_flush();
-        if (s_ctx != 0 && s_ctx->time != 0 && s_timer_id >= 0) {
-            (void)s_ctx->time->timer_destroy(s_ctx, s_timer_id);
-            s_timer_id = -1;
+        if (s_label != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM OK");
         }
     }
 }
 
-/* ---------------- story UI: ctx->ui semantic tree ---------------- */
-static uint32_t str_len(const char *s) { uint32_t n = 0; while (s[n]) n++; return n; }
-
-/* Build the current story tree. One page: title, dialogue body (auto-wrapped
- * by the backend), a progress row and a "next" action. Rendering is a pure
- * function of the story buffers, so on_open / on_event share it. */
-static int32_t story_render(const struct canopus_context_v1 *ctx,
-                            struct canopus_ui_context_v1 *ui)
+/* ---------------- page lifecycle (native-app-demo pattern) ---------------- */
+static int bsvm_on_signal(void *page, uint32_t event, void *payload)
 {
-    struct canopus_ui_tree_v1 *tree = 0;
-    char progress[32];
-    int32_t rc;
-    if (ctx->ui == 0 || ui == 0) return CANOPUS_SVC_ERR_UNSUPPORTED;
-    rc = ctx->ui->tree_begin(ui, &tree);
-    if (rc != CANOPUS_UI_OK) return rc;
-    {
-        struct canopus_ui_navigation_page_props_v1 page = {
-            sizeof(page), "BSVM 剧情", str_len("BSVM 剧情") };
-        rc = ctx->ui->navigation_page(tree, 1u, &page);
-    }
-    if (rc == CANOPUS_UI_OK) {
-        struct canopus_ui_text_props_v1 title = {
-            sizeof(title), s_scene_buf, str_len(s_scene_buf), CANOPUS_UI_TEXT_TITLE };
-        rc = ctx->ui->text(tree, 2u, &title);
-    }
-    if (rc == CANOPUS_UI_OK) {
-        struct canopus_ui_text_props_v1 body = {
-            sizeof(body), s_dlg_buf, str_len(s_dlg_buf), CANOPUS_UI_TEXT_BODY };
-        rc = ctx->ui->text(tree, 3u, &body);
-    }
-    if (rc == CANOPUS_UI_OK) {
-        progress[0] = 'E';
-        u32_to_dec(progress + 1, s_entry_idx);
-        {
-            struct canopus_ui_status_row_props_v1 row = {
-                sizeof(row), "进度", str_len("进度"), progress, str_len(progress) };
-            rc = ctx->ui->status_row(tree, 4u, &row);
-        }
-    }
-    if (rc == CANOPUS_UI_OK) {
-        struct canopus_ui_action_row_props_v1 next = {
-            sizeof(next), "下一句", str_len("下一句"),
-            s_ui_mode == 1u ? "继续剧情" : "已播放完毕",
-            str_len(s_ui_mode == 1u ? "继续剧情" : "已播放完毕"),
-            EV_NEXT, s_ui_mode == 1u ? 1u : 0u };
-        rc = ctx->ui->action_row(tree, 5u, &next);
-    }
-    if (rc == CANOPUS_UI_OK) return ctx->ui->tree_commit(tree);
-    ctx->ui->tree_abort(tree);
-    return rc;
+    (void)page; (void)event; (void)payload;
+    return 0;
 }
 
-static void log_load_failure(int rc)
+static int bsvm_on_create(void *page, void *root, void *start_data)
 {
-    log_line("LOAD-FAIL");
-    log_kv("code", (uint32_t)(-rc));
-    log_kv("d0", rd32(s_dir));
-    log_kv("e0", rd32(s_evt));
-    log_kv("b0", rd32(s_db));
-    log_kv("snr", s_strn_raw);
-    log_kv("mnr", s_mapn_raw);
+    (void)page; (void)start_data;
+    s_label = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
+    label_center(s_label);
+    if (s_label != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM");
+    }
+    s_ok_init = 0;
+    log_line("BSVM create");
     log_flush();
-}
-
-static int32_t story_on_open(const struct canopus_context_v1 *ctx,
-                             struct canopus_ui_context_v1 *ui, void *user_data)
-{
-    (void)user_data;
-    s_ui_ctx = ui;
-    if (!s_ok_init) { ui_set_dlg("游戏数据未加载"); return story_render(ctx, ui); }
-    if (s_ui_mode == 0u) {
-        ui_set_scene("BSVM 剧情");
-        ui_pick_story();
-        if (!ui_run_until_text()) {
-            s_ui_mode = 3u;
-            ui_set_dlg("故事播放完毕");
+    int rc = bsvm_load();
+    if (rc == 0) {
+        s_ok_init = 1u;
+        s_root = root;
+        log_line("BSVM start");
+        log_kv("entries", s_total_entries);
+        log_kv("fsize", s_probe_size);
+        log_kv("evt", s_evt_len);
+        log_kv("db", s_db_len);
+        log_kv("dir", s_dir_len_v);
+        log_kv("strn", s_strn);
+        /* headless escape hatch: /data/bsvm_headless.txt present => old full run */
+        {
+            int hfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_headless.txt", O_RDONLY);
+            if (hfd >= 0) {
+                ((posix_close_fn)vfn(FW_POSIX_CLOSE))(hfd);
+                log_line("MODE headless");
+                log_flush();
+                s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+                    bsvm_tick, 50u, 0);
+            } else {
+                log_line("MODE story-ui");
+                /* CJK font: watchfaces render Chinese with MiSans; the native
+                 * default font has no CJK glyphs (boxes on device) */
+                log_line("font-create");
+                log_flush();
+                s_cjk_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
+                    "MiSans-Regular", 18u, 0u);
+                log_kv("font", (uint32_t)(uintptr_t)s_cjk_font);
+                /* build the UI: scene line + wrapped dialogue label; widths
+                 * stay inside the ~192px screen so page gestures keep working */
+                s_scene = ui_label(root, 14, 96, 164, 30, 0);
+                s_dlg   = ui_label(root, 14, 150, 164, 260, 1);
+                ui_set_scene("BSVM 剧情");
+                ui_pick_story();
+                log_flush();
+                s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+                    ui_tick, 50u, 0);
+            }
         }
+    } else {
+        /* short label: round-screen bezel clips long text */
+        char msg[12];
+        char vb[12];
+        u32_to_dec(vb, (uint32_t)(-rc));
+        msg[0] = 'L';
+        str_copy(msg + 1, vb, sizeof(msg) - 1);
+        if (s_label != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, msg);
+        }
+        log_line("LOAD-FAIL");
+        log_kv("code", (uint32_t)(-rc));
+        /* pool-content probes: expected d0=7195 dm=147 de=0 e0=21 b0=65873.
+         * d0==e0 => bss aliasing; d0 ok but dm wrong => chunked-read corruption */
+        log_kv("d0", rd32(s_dir));
+        log_kv("dm", rd32(s_dir + 31268u));
+        log_kv("de", rd32(s_dir + ((s_dir_len_v > 4u) ? (s_dir_len_v - 4u) : 0u)));
+        log_kv("e0", rd32(s_evt));
+        log_kv("b0", rd32(s_db));
+        log_kv("snr", s_strn_raw);
+        log_kv("mnr", s_mapn_raw);
         log_flush();
     }
-    return story_render(ctx, ui);
+    return 0;
 }
 
-static int32_t story_on_event(const struct canopus_context_v1 *ctx,
-                              struct canopus_ui_context_v1 *ui,
-                              const struct canopus_ui_event_v1 *event, void *user_data)
+static int bsvm_on_resume(void *page)
 {
-    (void)user_data;
-    if (event->type != CANOPUS_UI_EVENT_ACTIVATE) return CANOPUS_UI_OK;
-    if (event->event_id != EV_NEXT) return CANOPUS_UI_ERR_ARGUMENT;
-    if (s_ui_mode == 1u) {
-        if (!ui_run_until_text()) {
-            s_ui_mode = 3u;
-            ui_set_dlg("故事播放完毕");
-            log_line("STORY-DONE");
-            log_flush();
-        }
+    (void)page;
+    if (s_ok_init && s_timer == 0 && s_phase != 2u) {
+        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+            bsvm_tick, 50u, 0);
     }
-    return story_render(ctx, ui);
+    return 0;
 }
 
-static int32_t story_on_back(const struct canopus_context_v1 *ctx,
-                             struct canopus_ui_context_v1 *ui, void *user_data)
+static int bsvm_on_pause(void *page)
 {
-    (void)ctx; (void)ui; (void)user_data;
-    return 1; /* let the page close */
-}
-
-static void story_on_close(const struct canopus_context_v1 *ctx, void *user_data)
-{
-    (void)user_data;
-    s_ui_ctx = 0;
+    (void)page;
     log_flush();
-    (void)ctx;
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    return 0;
 }
 
-static const struct canopus_ui_entry_v1 s_story_entry = {
-    sizeof(struct canopus_ui_entry_v1), "BSVM 剧情",
-    story_on_open, story_on_event, story_on_back, story_on_close,
-    0, 0, 0, 0,
-};
+static int bsvm_on_ui_destroy(void *page)
+{
+    (void)page;
+    log_flush();
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    return 0;
+}
 
 /* ---------------- module lifecycle ---------------- */
+static uint16_t s_app_id;
+static const char s_display_name[] = "BSVM";
+
 static int32_t bsvm_prepare(const struct canopus_context_v1 *ctx)
 {
     s_ctx = ctx;
@@ -969,63 +1076,18 @@ static int32_t bsvm_prepare(const struct canopus_context_v1 *ctx)
 static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
 {
     s_ctx = ctx;
-    s_ok_init = 0;
-    log_line("BSVM activate");
-    log_flush();
-    int rc = bsvm_load();
-    if (rc != 0) { log_load_failure(rc); return 0; }
-    s_ok_init = 1u;
-    log_line("BSVM start");
-    log_kv("entries", s_total_entries);
-    log_kv("evt", s_evt_len);
-    log_kv("db", s_db_len);
-    log_kv("dir", s_dir_len_v);
-    log_kv("strn", s_strn);
-    log_kv("ce", s_ce_n);
-    log_kv("pg", s_pg_n);
-    log_kv("troop", s_troop_pg_n);
-    log_flush();
-
-    /* headless escape hatch: /data/bsvm_headless.txt present => full run */
-    int headless = 0;
-    if (ctx->fs != 0 && ctx->fs->exists != 0) {
-        headless = ctx->fs->exists(ctx, "/data/bsvm_headless.txt") > 0;
-    }
-    if (headless) {
-        log_line("MODE headless");
-        if (ctx->time != 0 && ctx->time->timer_create != 0) {
-            s_timer_id = ctx->time->timer_create(ctx, 50u, 1, bsvm_tick, 0);
-            if (s_timer_id >= 0 && ctx->time->timer_start != 0)
-                (void)ctx->time->timer_start(ctx, s_timer_id);
-            else log_line("TIMER-FAIL");
-        } else log_line("NO-TIME-SERVICE");
-        log_flush();
-    } else {
-        log_line("MODE story-ui");
-        if (ctx->ui != 0 && ctx->ui->set_entry != 0) {
-            int32_t urc = ctx->ui->set_entry(ctx, &s_story_entry);
-            log_kv("set-entry", (uint32_t)urc);
-        } else log_line("NO-UI-SERVICE");
-        log_flush();
-    }
     return 0;
 }
 
 static int32_t bsvm_deactivate(const struct canopus_context_v1 *ctx)
 {
-    if (s_timer_id >= 0 && ctx->time != 0 && ctx->time->timer_destroy != 0) {
-        (void)ctx->time->timer_destroy(ctx, s_timer_id);
-        s_timer_id = -1;
-    }
-    if (ctx->ui != 0 && ctx->ui->set_entry != 0) (void)ctx->ui->set_entry(ctx, 0);
-    s_ui_ctx = 0;
-    log_flush();
+    (void)ctx;
     return 0;
 }
 
 static int32_t bsvm_stop(const struct canopus_context_v1 *ctx)
 {
-    (void)bsvm_deactivate(ctx);
+    (void)ctx;
     s_ctx = 0;
     return 0;
 }
@@ -1036,13 +1098,59 @@ static int32_t bsvm_query(struct canopus_status_writer_v1 *writer)
     return 0;
 }
 
+static struct firmware_page_descriptor s_bsvm_page;
+
+static int32_t bsvm_publish_native_app_stage(const struct canopus_context_v1 *ctx,
+                                             uint32_t stage)
+{
+    if (stage == 1u) {
+        void *pages[1];
+        struct canopus_app_entry_v1 entry;
+        int32_t app_id;
+        if (!canopus_services_has(ctx, CANOPUS_SVC_LAUNCHER, 1) ||
+            ctx->launcher == 0 || ctx->launcher->register_app == 0) {
+            return CANOPUS_SVC_ERR_UNSUPPORTED;
+        }
+        if (s_app_id != 0u) return 0;
+
+        canopus_memset(&s_bsvm_page, 0, sizeof(s_bsvm_page));
+        s_bsvm_page.page_name = (void *)"bsvm_main";
+        s_bsvm_page.page_id = 0u;
+        s_bsvm_page.on_signal = (void *)bsvm_on_signal;
+        s_bsvm_page.on_create = (void *)bsvm_on_create;
+        s_bsvm_page.on_resume = (void *)bsvm_on_resume;
+        s_bsvm_page.on_pause = (void *)bsvm_on_pause;
+        s_bsvm_page.on_ui_destroy = (void *)bsvm_on_ui_destroy;
+
+        pages[0] = &s_bsvm_page;
+        canopus_memset(&entry, 0, sizeof(entry));
+        entry.struct_size = sizeof(entry);
+        entry.label = s_display_name;
+        entry.icon = 0;
+        entry.pages = pages;
+        entry.page_count = 1u;
+        app_id = ctx->launcher->register_app(ctx, &entry);
+        if (app_id < 0) return app_id;
+        s_app_id = (uint16_t)app_id;
+        return 0;
+    }
+    if (stage == 2u) {
+        if (s_app_id == 0u) return CANOPUS_SVC_ERR_STATE;
+        (void)((void (*)(uint32_t, uint32_t, uint32_t, uint32_t))(
+            uintptr_t)VENA(FW_PAGE_GOTO))((uint32_t)s_app_id << 16, 0u, 0u, 0u);
+        return 0;
+    }
+    return CANOPUS_SVC_ERR_ARGUMENT;
+}
+
 static const struct canopus_module_descriptor_v1 s_descriptor = {
     sizeof(struct canopus_module_descriptor_v1),
     CANOPUS_ABI_MAJOR,
     CANOPUS_ABI_MINOR,
-    0u,
+    CANOPUS_FLAG_HAS_NATIVE_APP | CANOPUS_FLAG_REGISTERS_LAUNCHER_ENTRY |
+        CANOPUS_FLAG_APP_UNREGISTER_REBOOT_REQUIRED,
     BSVM_MODULE_ID,
-    "0.4.0",
+    "0.3.2",
     "bsvm",
     CANOPUS_TARGET_ID,
     bsvm_prepare,
@@ -1051,7 +1159,7 @@ static const struct canopus_module_descriptor_v1 s_descriptor = {
     bsvm_stop,
     bsvm_query,
     0,
-    0,
+    bsvm_publish_native_app_stage,
 };
 
 CANOPUS_MODULE_ENTRY(s_descriptor)

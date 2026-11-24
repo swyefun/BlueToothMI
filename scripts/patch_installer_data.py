@@ -94,14 +94,13 @@ if 'data recheck' not in s:
     assert anchor3 in s, 'result anchor missing'
     s = s.replace(anchor3, new3, 1)
 
-# 4. on-screen log viewer buttons (head/tail of /data/bsvm_log.txt; the v0.4
-#    module writes its log through ctx->fs to /data, not /data/canopus).
+# 4. on-screen log viewer buttons (head/tail of /data/canopus/bsvm_log.txt).
 if 'log viewer' not in s:
     L = []
     a = L.append
     a('-- bsvm log viewer: paged reader over the whole log (O(1) memory)\n')
     a('do\n')
-    a('    local LOGP = "/data/bsvm_log.txt"\n')
+    a('    local LOGP = "/data/canopus/bsvm_log.txt"\n')
     a('    local MARKP = "/data/bsvm_ld.txt"\n')
     a('    local MAXL, CHUNK, LINEMAX = 13, 1600, 56\n')
     a('    local cur, size = 0, 0\n')
