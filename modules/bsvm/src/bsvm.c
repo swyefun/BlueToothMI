@@ -46,6 +46,18 @@ static const struct canopus_context_v1 *s_ctx;
 /* CJK font: private-ABI calendar font port (approved, device-unproven) */
 #define FW_FONT_CREATE  0x0c4950b1u /* void *calendar_font_create(family,size,style) */
 #define FW_TEXT_FONT    0x0c387ebbu /* void calendar_text_font(obj, font, selector)  */
+/* UI v0.7: title screen — addresses cross-checked against the manager's own
+ * band11 mappings (target_config.rs) and the 139 symbol table */
+#define FW_IMAGE_CREATE 0x0c3ae1d1u /* void *lv_image_create(parent)                 */
+#define FW_IMAGE_SET_SRC 0x0c3b2c29u /* void lv_image_set_src(obj, const char *path) */
+#define FW_OBJ_ADD_FLAG 0x0c38404du /* void lvx_object_add_flag(obj, flag)           */
+#define FW_OBJ_CLEAR_FLAG 0x0c3840d9u /* void lv_obj_clear_flag(obj, flag)           */
+#define FW_EVENT_ADD    0x0c37fc1du /* void *lv_obj_add_event_cb(obj,cb,code,ud)     */
+#define FW_PAGE_FINISH  0x0c69b5adu /* int32 page_finish(struct page_descriptor *)   */
+#define LV_FLAG_HIDDEN    1u        /* firmware family: HIDDEN=0x01, SCROLLABLE=0x10 */
+#define LV_FLAG_CLICKABLE 2u        /* (manager host_set_hidden/host_object_flag)    */
+#define LV_EVENT_CLICKED  7u        /* manager HOST_EVENT_CLICKED                    */
+#define TITLE_PATH      "/data/bsvm_title.bin"
 
 #define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
 
@@ -134,6 +146,26 @@ static struct canopus_ui_context_v1 *s_ui_ctx; /* live semantic page */
 /* manager fs maps a relative name into the module data dir
  * (/data/canopus/m.bsvm/), which is writable; absolute /data/canopus is not */
 static const char LOG_NAME_CTX[] = "bsvm_log.txt";
+
+/* ---- UI v0.7: title screen (original Scene_Title layout) ----
+ * mist.png stretched full-screen + "BLACK SOULS" (upper half, centered) +
+ * command rows NEW GAME / CONTINUE / END below center, exactly the stock
+ * scene: title1_name empty (black under-layer), title2_name "Mist",
+ * opt_draw_title, Window_TitleCommand at (width-160)/2, y=(h*1.6-w)/2.
+ * CONTINUE is shown but inert: no save system on the band yet (the stock
+ * code also adds it disabled when no save exists). Tap NEW GAME or wait —
+ * a 12s countdown auto-starts, so the game runs even if page clicks never
+ * reach module objects on this firmware. */
+static void *s_title_img;
+static void *s_title_lbl;
+static void *s_menu_ng;
+static void *s_menu_cont;
+static void *s_menu_end;
+static void *s_title_font;
+static uint8_t s_started;       /* 0 title, 1 story running */
+static uint32_t s_countdown;    /* title auto-start seconds */
+struct firmware_page_descriptor;
+static struct firmware_page_descriptor s_bsvm_page;  /* fwd: defined below */
 
 /* ---- UI v0.3: auto story player (display-only, timer-driven) ---- */
 static void *s_root;
@@ -272,7 +304,8 @@ static void label_center(void *obj)
 }
 
 /* UI: label at absolute position, with optional long-text wrap */
-static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int32_t h, int wrap)
+static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int32_t h,
+                      int wrap, void *font)
 {
     void *obj = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
     if (obj == 0) return 0;
@@ -285,9 +318,9 @@ static void *ui_label(void *root, int32_t x, int32_t y, int32_t w, int32_t h, in
         ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_LABEL_LONG))(
             obj, LV_LABEL_LONG_WRAP);
     }
-    if (s_cjk_font != 0) {
+    if (font != 0) {
         ((void (*)(void *, const void *, uint32_t))(uintptr_t)VENA(FW_TEXT_FONT))(
-            obj, s_cjk_font, 0u);
+            obj, font, 0u);
     }
     return obj;
 }
@@ -940,6 +973,80 @@ static void ui_tick(void *arg)
     }
 }
 
+/* ---------------- v0.7 title screen ---------------- */
+static void ui_start_game(void);
+
+static void obj_hide(void *obj)
+{
+    if (obj != 0) {
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+            obj, LV_FLAG_HIDDEN);
+    }
+}
+
+static void cb_new_game(void *e)
+{
+    (void)e;
+    if (s_started) return;
+    log_line("TITLE-NEWGAME");
+    log_flush();
+    ui_start_game();
+}
+
+static void cb_continue(void *e)
+{
+    (void)e;
+    /* stock scene: disabled when no save exists — band has no save system */
+    log_line("TITLE-CONTINUE");
+    log_flush();
+}
+
+static void cb_end(void *e)
+{
+    (void)e;
+    log_line("TITLE-END");
+    log_flush();
+    /* stock command_shutdown: leave the scene (page_finish takes the
+     * module's own page descriptor, as the manager does) */
+    (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
+}
+
+static void title_tick(void *arg)
+{
+    (void)arg;
+    if (s_started) return;
+    if (s_countdown > 0u) { s_countdown--; return; }
+    log_line("TITLE-AUTOSTART");
+    log_flush();
+    ui_start_game();
+}
+
+/* NEW GAME: hide the title layer, bring up the story player, swap the
+ * 1s countdown timer for the 50ms story tick */
+static void ui_start_game(void)
+{
+    if (s_started || !s_ok_init) return;
+    s_started = 1u;
+    s_ui_mode = 1u;
+    obj_hide(s_title_img);
+    obj_hide(s_title_lbl);
+    obj_hide(s_menu_ng);
+    obj_hide(s_menu_cont);
+    obj_hide(s_menu_end);
+    /* story labels: widths stay inside the ~192px round-screen safe area */
+    s_scene = ui_label(s_root, 14, 96, 164, 30, 0, s_cjk_font);
+    s_dlg   = ui_label(s_root, 14, 150, 164, 260, 1, s_cjk_font);
+    ui_set_scene("BLACK SOULS");
+    ui_pick_story();
+    log_flush();
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+        ui_tick, 50u, 0);
+}
+
 static void bsvm_tick(void *arg)
 {
     (void)arg;
@@ -1010,23 +1117,72 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
                 s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
                     bsvm_tick, 50u, 0);
             } else {
-                log_line("MODE story-ui");
+                log_line("MODE title");
                 /* CJK font: watchfaces render Chinese with MiSans; the native
                  * default font has no CJK glyphs (boxes on device) */
                 log_line("font-create");
                 log_flush();
                 s_cjk_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
                     "MiSans-Regular", 18u, 0u);
+                s_title_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
+                    "MiSans-Regular", 26u, 0u);
                 log_kv("font", (uint32_t)(uintptr_t)s_cjk_font);
-                /* build the UI: scene line + wrapped dialogue label; widths
-                 * stay inside the ~192px screen so page gestures keep working */
-                s_scene = ui_label(root, 14, 96, 164, 30, 0);
-                s_dlg   = ui_label(root, 14, 150, 164, 260, 1);
-                ui_set_scene("BSVM 剧情");
-                ui_pick_story();
+                log_kv("tfont", (uint32_t)(uintptr_t)s_title_font);
+                /* background: /data/bsvm_title.bin (mist.png pre-stretched to
+                 * 212x520 in the firmware GPU-decoder format; decoded by the
+                 * firmware render task, zero module RAM) */
+                s_title_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(root);
+                if (s_title_img != 0) {
+                    ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                        s_title_img, 212, 520);
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_title_img, ALIGN_TOP_LEFT, 0, 0);
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                        s_title_img, TITLE_PATH);
+                }
+                log_kv("img", (uint32_t)(uintptr_t)s_title_img);
+                /* game title text, upper half, centered (stock draw_game_title) */
+                s_title_lbl = ui_label(root, 0, 0, 0, 0, 0, s_title_font);
+                if (s_title_lbl != 0) {
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                        s_title_lbl, "BLACK SOULS");
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_title_lbl, ALIGN_CENTER, 0, -140);
+                }
+                /* command rows (Window_TitleCommand: lower-middle, centered) */
+                s_menu_ng = ui_label(root, 0, 0, 0, 0, 0, s_cjk_font);
+                if (s_menu_ng != 0) {
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                        s_menu_ng, "NEW GAME");
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_menu_ng, ALIGN_CENTER, 0, 40);
+                    ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                        s_menu_ng, LV_FLAG_CLICKABLE);
+                    (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(uintptr_t)VENA(FW_EVENT_ADD))(
+                        s_menu_ng, cb_new_game, LV_EVENT_CLICKED, 0);
+                }
+                s_menu_cont = ui_label(root, 0, 0, 0, 0, 0, s_cjk_font);
+                if (s_menu_cont != 0) {
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                        s_menu_cont, "CONTINUE");
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_menu_cont, ALIGN_CENTER, 0, 90);
+                }
+                s_menu_end = ui_label(root, 0, 0, 0, 0, 0, s_cjk_font);
+                if (s_menu_end != 0) {
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                        s_menu_end, "END");
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_menu_end, ALIGN_CENTER, 0, 140);
+                    ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                        s_menu_end, LV_FLAG_CLICKABLE);
+                    (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(uintptr_t)VENA(FW_EVENT_ADD))(
+                        s_menu_end, cb_end, LV_EVENT_CLICKED, 0);
+                }
+                s_countdown = 12u;
                 log_flush();
                 s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
-                    ui_tick, 50u, 0);
+                    title_tick, 1000u, 0);
             }
         }
     } else {
@@ -1343,8 +1499,6 @@ static int32_t bsvm_query(struct canopus_status_writer_v1 *writer)
     (void)writer;
     return 0;
 }
-
-static struct firmware_page_descriptor s_bsvm_page;
 
 static int32_t bsvm_publish_native_app_stage(const struct canopus_context_v1 *ctx,
                                              uint32_t stage)
