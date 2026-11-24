@@ -13,6 +13,7 @@
 
 #include "canopus_module_entry.h"
 #include "canopus_memory.h"
+#include "canopus_ui.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -120,6 +121,20 @@ static void *s_label;
 static void *s_timer;
 static char  s_status[72];
 
+/* ---- v0.5: dual path ----
+ * .139 real device (Arstobox): native-app + firmware veneers, exactly the
+ * v0.3.2 behavior that is verified on hardware. Other targets (.155/.179,
+ * manager/emulator): ctx->ui semantic tree, ctx->fs log, ctx->time timer.
+ * Chosen at activate by CANOPUS_TARGET_ID, never by service probing, so the
+ * .139 path cannot be hijacked by a partially-implemented ui service. */
+static uint8_t s_is_139;
+static int32_t s_timer_id_ctx = -1;  /* ctx->time timer (non-.139 headless) */
+enum { EV_NEXT = 1 };
+static struct canopus_ui_context_v1 *s_ui_ctx; /* live semantic page */
+/* manager fs maps a relative name into the module data dir
+ * (/data/canopus/m.bsvm/), which is writable; absolute /data/canopus is not */
+static const char LOG_NAME_CTX[] = "bsvm_log.txt";
+
 /* ---- UI v0.3: auto story player (display-only, timer-driven) ---- */
 static void *s_root;
 static void *s_dlg;          /* dialogue text label (long-mode wrap) */
@@ -173,11 +188,27 @@ static int  s_logn;
 static void log_flush(void)
 {
     if (s_logn <= 0) return;
-    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(LOG_PATH, O_RDWR | O_CREAT, 0666);
-    if (fd >= 0) {
-        ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
-        ((posix_write_fn)vfn(FW_POSIX_WRITE))(fd, s_logbuf, (uint32_t)s_logn);
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    if (!s_is_139) {
+        /* manager/emulator: sanctioned fs service, relative name lands in
+         * the module data dir; WRITE|APPEND keeps existing content */
+        const struct canopus_fs_obj *fs = (s_ctx != 0) ? s_ctx->fs : 0;
+        if (fs != 0 && fs->open != 0 && fs->write != 0 && fs->close != 0) {
+            int32_t fd = fs->open(s_ctx, LOG_NAME_CTX,
+                                  CANOPUS_FS_WRITE | CANOPUS_FS_APPEND);
+            if (fd >= 0) {
+                (void)fs->write(s_ctx, fd, s_logbuf, (uint32_t)s_logn);
+                (void)fs->close(s_ctx, fd);
+            }
+        }
+    } else {
+        /* .139 device: raw posix veneers (verified on hardware); the
+         * installer-face log viewer reads this exact path */
+        int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(LOG_PATH, O_RDWR | O_CREAT, 0666);
+        if (fd >= 0) {
+            ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+            ((posix_write_fn)vfn(FW_POSIX_WRITE))(fd, s_logbuf, (uint32_t)s_logn);
+            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        }
     }
     s_logn = 0;
 }
@@ -1063,6 +1094,169 @@ static int bsvm_on_ui_destroy(void *page)
     return 0;
 }
 
+/* ---------------- v0.5: manager/emulator path (ctx->ui semantic tree) ---------------- */
+static uint32_t str_len(const char *s) { uint32_t n = 0; while (s[n]) n++; return n; }
+
+static uint8_t target_is_139(void)
+{
+    const char *t = CANOPUS_TARGET_ID;
+    const char *m = "xiaomi-band-11-4.100.139";
+    uint32_t i = 0;
+    while (m[i]) {
+        if (t[i] != m[i]) return 0;
+        i++;
+    }
+    return t[i] == '\0';
+}
+
+/* headless full-run on manager targets: one slice per ctx->time fire */
+static void bsvm_tick_ctx(const struct canopus_context_v1 *ctx, int32_t timer_id,
+                          void *user_data)
+{
+    (void)timer_id; (void)user_data;
+    run_slice(400u);
+    if (s_phase == 2u) {
+        log_line("ALL-DONE");
+        for (uint32_t op = 0u; op < 256u; op++) {
+            if (s_opcnt[op] == 0u) continue;
+            char key[8];
+            key[0] = 'o'; key[1] = 'p';
+            uint32_t v = op;
+            key[2] = (v >> 4) < 10u ? (char)('0' + (v >> 4)) : (char)('A' + (v >> 4) - 10u);
+            key[3] = (v & 15u) < 10u ? (char)('0' + (v & 15u)) : (char)('A' + (v & 15u) - 10u);
+            key[4] = '\0';
+            log_kv(key, s_opcnt[op]);
+        }
+        log_kv("entries", s_total_entries);
+        log_kv("done", s_runs_done);
+        log_kv("bad", s_runs_bad);
+        log_kv("steps", s_total_steps);
+        log_flush();
+        if (s_timer_id_ctx >= 0 && ctx->time != 0 && ctx->time->timer_destroy != 0) {
+            (void)ctx->time->timer_destroy(ctx, s_timer_id_ctx);
+            s_timer_id_ctx = -1;
+        }
+    }
+}
+
+/* Build the current story tree. Pure function of the story buffers, so
+ * on_open / on_event share it. Always renders something (even a load-error
+ * notice) — a visible page is the anti-black-screen guarantee. */
+static int32_t story_render(const struct canopus_context_v1 *ctx,
+                            struct canopus_ui_context_v1 *ui)
+{
+    struct canopus_ui_tree_v1 *tree = 0;
+    char progress[32];
+    int32_t rc;
+    if (ctx->ui == 0 || ui == 0) return CANOPUS_SVC_ERR_UNSUPPORTED;
+    rc = ctx->ui->tree_begin(ui, &tree);
+    if (rc != CANOPUS_UI_OK) return rc;
+    {
+        struct canopus_ui_navigation_page_props_v1 page = {
+            sizeof(page), "BSVM 剧情", str_len("BSVM 剧情") };
+        rc = ctx->ui->navigation_page(tree, 1u, &page);
+    }
+    if (rc == CANOPUS_UI_OK) {
+        struct canopus_ui_text_props_v1 title = {
+            sizeof(title), s_scene_buf, str_len(s_scene_buf), CANOPUS_UI_TEXT_TITLE };
+        rc = ctx->ui->text(tree, 2u, &title);
+    }
+    if (rc == CANOPUS_UI_OK) {
+        struct canopus_ui_text_props_v1 body = {
+            sizeof(body), s_dlg_buf, str_len(s_dlg_buf), CANOPUS_UI_TEXT_BODY };
+        rc = ctx->ui->text(tree, 3u, &body);
+    }
+    if (rc == CANOPUS_UI_OK) {
+        progress[0] = 'E';
+        u32_to_dec(progress + 1, s_entry_idx);
+        {
+            struct canopus_ui_status_row_props_v1 row = {
+                sizeof(row), "进度", str_len("进度"), progress, str_len(progress) };
+            rc = ctx->ui->status_row(tree, 4u, &row);
+        }
+    }
+    if (rc == CANOPUS_UI_OK) {
+        struct canopus_ui_action_row_props_v1 next = {
+            sizeof(next), "下一句", str_len("下一句"),
+            s_ui_mode == 1u ? "继续剧情" : "已播放完毕",
+            str_len(s_ui_mode == 1u ? "继续剧情" : "已播放完毕"),
+            EV_NEXT, s_ui_mode == 1u ? 1u : 0u };
+        rc = ctx->ui->action_row(tree, 5u, &next);
+    }
+    if (rc == CANOPUS_UI_OK) return ctx->ui->tree_commit(tree);
+    ctx->ui->tree_abort(tree);
+    return rc;
+}
+
+static void log_load_failure(int rc)
+{
+    log_line("LOAD-FAIL");
+    log_kv("code", (uint32_t)(-rc));
+    log_kv("d0", rd32(s_dir));
+    log_kv("e0", rd32(s_evt));
+    log_kv("b0", rd32(s_db));
+    log_kv("snr", s_strn_raw);
+    log_kv("mnr", s_mapn_raw);
+    log_flush();
+}
+
+static int32_t story_on_open(const struct canopus_context_v1 *ctx,
+                             struct canopus_ui_context_v1 *ui, void *user_data)
+{
+    (void)user_data;
+    s_ui_ctx = ui;
+    if (!s_ok_init) { ui_set_dlg("游戏数据未加载"); return story_render(ctx, ui); }
+    if (s_ui_mode == 0u) {
+        ui_set_scene("BSVM 剧情");
+        ui_pick_story();
+        if (!ui_run_until_text()) {
+            s_ui_mode = 3u;
+            ui_set_dlg("故事播放完毕");
+        }
+        log_flush();
+    }
+    return story_render(ctx, ui);
+}
+
+static int32_t story_on_event(const struct canopus_context_v1 *ctx,
+                              struct canopus_ui_context_v1 *ui,
+                              const struct canopus_ui_event_v1 *event, void *user_data)
+{
+    (void)user_data;
+    if (event->type != CANOPUS_UI_EVENT_ACTIVATE) return CANOPUS_UI_OK;
+    if (event->event_id != EV_NEXT) return CANOPUS_UI_ERR_ARGUMENT;
+    if (s_ui_mode == 1u) {
+        if (!ui_run_until_text()) {
+            s_ui_mode = 3u;
+            ui_set_dlg("故事播放完毕");
+            log_line("STORY-DONE");
+            log_flush();
+        }
+    }
+    return story_render(ctx, ui);
+}
+
+static int32_t story_on_back(const struct canopus_context_v1 *ctx,
+                             struct canopus_ui_context_v1 *ui, void *user_data)
+{
+    (void)ctx; (void)ui; (void)user_data;
+    return 1; /* let the page close */
+}
+
+static void story_on_close(const struct canopus_context_v1 *ctx, void *user_data)
+{
+    (void)user_data;
+    s_ui_ctx = 0;
+    log_flush();
+    (void)ctx;
+}
+
+static const struct canopus_ui_entry_v1 s_story_entry = {
+    sizeof(struct canopus_ui_entry_v1), "BSVM 剧情",
+    story_on_open, story_on_event, story_on_back, story_on_close,
+    0, 0, 0, 0,
+};
+
 /* ---------------- module lifecycle ---------------- */
 static uint16_t s_app_id;
 static const char s_display_name[] = "BSVM";
@@ -1070,24 +1264,83 @@ static const char s_display_name[] = "BSVM";
 static int32_t bsvm_prepare(const struct canopus_context_v1 *ctx)
 {
     s_ctx = ctx;
+    s_is_139 = target_is_139();
     return 0;
 }
 
 static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
 {
     s_ctx = ctx;
+    s_is_139 = target_is_139();
+    log_line("BSVM activate");
+    log_kv("t139", s_is_139);
+    log_flush();
+
+    if (s_is_139) return 0;   /* .139: load happens in on_create (v0.3.2 flow) */
+
+    /* manager/emulator: load here and ALWAYS publish the semantic page,
+     * so a missing data file shows an error page instead of a black screen */
+    s_ok_init = 0;
+    int rc = bsvm_load();
+    if (rc == 0) {
+        s_ok_init = 1u;
+        log_line("BSVM start");
+        log_kv("entries", s_total_entries);
+        log_kv("evt", s_evt_len);
+        log_kv("db", s_db_len);
+        log_kv("dir", s_dir_len_v);
+        log_kv("strn", s_strn);
+    } else {
+        log_load_failure(rc);
+    }
+
+    /* headless escape hatch: /data/bsvm_headless.txt present => full run */
+    int headless = 0;
+    if (ctx->fs != 0 && ctx->fs->exists != 0) {
+        headless = ctx->fs->exists(ctx, "/data/bsvm_headless.txt") > 0;
+    }
+    if (headless && s_ok_init) {
+        log_line("MODE headless");
+        if (ctx->time != 0 && ctx->time->timer_create != 0) {
+            s_timer_id_ctx = ctx->time->timer_create(ctx, 50u, 1, bsvm_tick_ctx, 0);
+            if (s_timer_id_ctx >= 0 && ctx->time->timer_start != 0)
+                (void)ctx->time->timer_start(ctx, s_timer_id_ctx);
+            else log_line("TIMER-FAIL");
+        } else {
+            log_line("NO-TIME-SERVICE");
+        }
+    } else if (headless) {
+        log_line("HEADLESS-NODATA");
+    } else {
+        log_line("MODE story-ui");
+    }
+    if (ctx->ui != 0 && ctx->ui->set_entry != 0) {
+        int32_t urc = ctx->ui->set_entry(ctx, &s_story_entry);
+        log_kv("set-entry", (uint32_t)urc);
+    } else {
+        log_line("NO-UI-SERVICE");
+    }
+    log_flush();
     return 0;
 }
 
 static int32_t bsvm_deactivate(const struct canopus_context_v1 *ctx)
 {
-    (void)ctx;
+    if (!s_is_139) {
+        if (s_timer_id_ctx >= 0 && ctx->time != 0 && ctx->time->timer_destroy != 0) {
+            (void)ctx->time->timer_destroy(ctx, s_timer_id_ctx);
+            s_timer_id_ctx = -1;
+        }
+        if (ctx->ui != 0 && ctx->ui->set_entry != 0) (void)ctx->ui->set_entry(ctx, 0);
+        s_ui_ctx = 0;
+    }
+    log_flush();
     return 0;
 }
 
 static int32_t bsvm_stop(const struct canopus_context_v1 *ctx)
 {
-    (void)ctx;
+    (void)bsvm_deactivate(ctx);
     s_ctx = 0;
     return 0;
 }
@@ -1104,6 +1357,10 @@ static int32_t bsvm_publish_native_app_stage(const struct canopus_context_v1 *ct
                                              uint32_t stage)
 {
     if (stage == 1u) {
+        /* non-.139 (manager/emulator): no launcher app — the page callbacks
+         * below drive .139 firmware veneers and would crash on other targets.
+         * UI is published via ctx->ui->set_entry in activate instead. */
+        if (!s_is_139) return CANOPUS_SVC_ERR_UNSUPPORTED;
         void *pages[1];
         struct canopus_app_entry_v1 entry;
         int32_t app_id;

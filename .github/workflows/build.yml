@@ -313,9 +313,15 @@ jobs:
       - name: Verify ELF against target pack
         working-directory: canopus
         run: |
-          elf=$(find modules/bsvm/build -name '*.elf' | head -1)
-          echo "verifying $elf"
-          target/release/canopus verify "$elf" --target "$TARGET_ID" --targets-dir targets 2>&1 | tee modules/bsvm/verify.log
+          for tid in xiaomi-band-11-4.100.139 xiaomi-band-11-4.100.155 xiaomi-band-11-4.100.179; do
+            elf="modules/bsvm/build/$tid/bsvm.elf"
+            if [ ! -f "$elf" ]; then
+              echo "MISSING $elf" | tee -a modules/bsvm/verify.log
+              exit 1
+            fi
+            echo "verifying $elf against $tid"
+            target/release/canopus verify "$elf" --target "$tid" --targets-dir targets 2>&1 | tee -a modules/bsvm/verify.log
+          done
 
       - name: Build .139 Supervisor + Band 11 framework installer watchface
         working-directory: canopus
@@ -328,11 +334,16 @@ jobs:
         run: |
           mkdir -p out inbox installer-watchface-bsvm
           find canopus/modules/bsvm -name '*.canopus' -exec cp {} out/ \;
-          find canopus/modules/bsvm/build -name '*.elf' -exec cp {} out/bsvm.elf \;
+          # Keep one ELF per target for emulator use (no overwrite).
+          for tid in xiaomi-band-11-4.100.139 xiaomi-band-11-4.100.155 xiaomi-band-11-4.100.179; do
+            elf="canopus/modules/bsvm/build/$tid/bsvm.elf"
+            [ -f "$elf" ] && cp "$elf" "out/bsvm-$tid.elf"
+          done
           pkg=$(find out -name '*.canopus' | head -1)
           tar -xf "$pkg" -C out
-          cp out/receipts/*.cmi "inbox/${MODULE_ID}.cmi.next"
-          cp out/artifacts/*/module.elf "inbox/${MODULE_ID}.ko.next"
+          # installer face inbox stays on .139 (the face targets that device)
+          cp out/receipts/xiaomi-band-11-4.100.139.cmi "inbox/${MODULE_ID}.cmi.next"
+          cp out/artifacts/xiaomi-band-11-4.100.139/module.elf "inbox/${MODULE_ID}.ko.next"
           if [ -d canopus/watchfaces/canopus-installer-prod/xiaomi-band-11 ]; then
             cp -r canopus/watchfaces/canopus-installer-prod/xiaomi-band-11/* installer-watchface-bsvm/
           fi
