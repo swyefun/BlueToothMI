@@ -315,7 +315,7 @@ jobs:
         run: |
           : > modules/bsvm/verify.log
           for tid in xiaomi-band-11-4.100.139 xiaomi-band-11-4.100.155 xiaomi-band-11-4.100.179; do
-            elf="modules/bsvm/build/$tid/module.elf"
+            elf="modules/bsvm/build/$tid/bsvm.elf"
             if [ ! -f "$elf" ]; then
               echo "MISSING $elf" | tee -a modules/bsvm/verify.log
               exit 1
@@ -339,7 +339,7 @@ jobs:
           find canopus/modules/bsvm -name '*.canopus' -exec cp {} out/ \;
           # Keep one ELF per target for emulator use (no overwrite).
           for tid in xiaomi-band-11-4.100.139 xiaomi-band-11-4.100.155 xiaomi-band-11-4.100.179; do
-            elf="canopus/modules/bsvm/build/$tid/module.elf"
+            elf="canopus/modules/bsvm/build/$tid/bsvm.elf"
             [ -f "$elf" ] && cp "$elf" "out/bsvm-$tid.elf"
           done
           pkg=$(find out -name '*.canopus' | head -1)
