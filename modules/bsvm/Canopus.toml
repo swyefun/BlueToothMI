@@ -8,7 +8,7 @@ kind = "target"
 language = "c"
 lifecycle = "removable"
 canopus_abi = "2"
-description = "BlackSoul VM: native RMVA runtime app (Band 11 4.100.139) - headless validator v0.1"
+description = "BlackSoul VM: RMVA runtime app via ctx services (Band 11 .139/.155/.179), v0.4"
 
 [build]
 sources = [
@@ -18,4 +18,6 @@ sources = [
 [targets]
 include = [
   "xiaomi-band-11-4.100.139",
+  "xiaomi-band-11-4.100.155",
+  "xiaomi-band-11-4.100.179",
 ]
