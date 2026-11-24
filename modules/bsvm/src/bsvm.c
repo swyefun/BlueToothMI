@@ -14,6 +14,7 @@
 #include "canopus_module_entry.h"
 #include "canopus_memory.h"
 #include "canopus_ui.h"
+#include "bsvm_prologue.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -171,12 +172,12 @@ static struct firmware_page_descriptor s_bsvm_page;  /* fwd: defined below */
 static void *s_root;
 static void *s_dlg;          /* dialogue text label (long-mode wrap) */
 static void *s_scene;        /* scene / location line */
+static uint32_t s_dwell;     /* story picker dwell ticks (non-.139 path) */
 static uint8_t s_ui_mode;    /* 0 boot, 1 story, 3 done */
 static char  s_dlg_buf[256];
 static char  s_scene_buf[64];
 static uint32_t s_story_off; /* bytecode offset of the story entry being played */
 static uint32_t s_story_end; /* end offset */
-static uint32_t s_dwell;     /* timer ticks before auto-advance */
 static void *s_cjk_font;     /* created once, must outlive all labels */
 
 /* ---------------- helpers ---------------- */
@@ -950,31 +951,7 @@ static int ui_run_until_text(void)
     return 0;
 }
 
-static void ui_tick(void *arg)
-{
-    (void)arg;
-    if (s_ui_mode != 1u) return;
-    if (s_dwell > 0u) {                 /* dwell on the current dialogue */
-        s_dwell--;
-        return;
-    }
-    int showing = ui_run_until_text();
-    if (showing) {
-        s_dwell = 40u;                  /* ~2s at 50ms per tick */
-    } else {
-        s_ui_mode = 3u;
-        ui_set_dlg("故事播放完毕");
-        log_line("STORY-DONE");
-        log_flush();
-        if (s_timer != 0) {
-            ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
-            s_timer = 0;
-        }
-    }
-}
-
-/* ---------------- v0.7 title screen ---------------- */
-static void ui_start_game(void);
+static void prologue_start(void);
 
 static void obj_hide(void *obj)
 {
@@ -984,19 +961,24 @@ static void obj_hide(void *obj)
     }
 }
 
-static void cb_new_game(void *e)
+static void obj_show(void *obj)
 {
-    (void)e;
-    if (s_started) return;
-    log_line("TITLE-NEWGAME");
-    log_flush();
-    ui_start_game();
+    if (obj != 0) {
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_CLEAR_FLAG))(
+            obj, LV_FLAG_HIDDEN);
+    }
+}
+
+static void ui_show(void *obj, int show)
+{
+    if (show) obj_show(obj);
+    else obj_hide(obj);
 }
 
 static void cb_continue(void *e)
 {
     (void)e;
-    /* stock scene: disabled when no save exists — band has no save system */
+    /* stock scene: disabled when no save exists - band has no save system */
     log_line("TITLE-CONTINUE");
     log_flush();
 }
@@ -1006,8 +988,6 @@ static void cb_end(void *e)
     (void)e;
     log_line("TITLE-END");
     log_flush();
-    /* stock command_shutdown: leave the scene (page_finish takes the
-     * module's own page descriptor, as the manager does) */
     (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
 }
 
@@ -1018,33 +998,424 @@ static void title_tick(void *arg)
     if (s_countdown > 0u) { s_countdown--; return; }
     log_line("TITLE-AUTOSTART");
     log_flush();
-    ui_start_game();
+    prologue_start();
 }
 
-/* NEW GAME: hide the title layer, bring up the story player, swap the
- * 1s countdown timer for the 50ms story tick */
-static void ui_start_game(void)
+static void cb_new_game(void *e)
 {
-    if (s_started || !s_ok_init) return;
-    s_started = 1u;
-    s_ui_mode = 1u;
+    (void)e;
+    if (s_started) return;
+    log_line("TITLE-NEWGAME");
+    log_flush();
+    prologue_start();
+}
+
+/* ---------------- v0.8 prologue engine (Map097 character make) ----------------
+ * Map view (pre-rendered /data/bsvm_map.bin, knight baked in) + RMVA-style
+ * textbox (/data/bsvm_box.bin) + alice portrait (/data/bsvm_face.bin).
+ * Steps come from bsvm_prologue.h (verbatim Map097 EV001 page0 texts).
+ * Click map/box advances; TEXT steps auto-advance after 4s; choices are
+ * tappable rows; name input uses an on-band letter keyboard (the firmware
+ * IME page is not exposed to modules - no symbols in the 139 table).
+ * Origin choice: every option yields the knight, per spec. */
+static void *s_map_img;
+static void *s_box_img;
+static void *s_face_img;
+static void *s_plate_lbl;
+static void *s_ptext_lbl;
+static void *s_card_lbl;
+static void *s_name_lbl;
+static void *s_choice_lbl[4];
+static void *s_key_lbl[28];
+static void *s_pro_font;
+static uint8_t  s_pro_on;    /* prologue running */
+static uint8_t  s_pro_kb;    /* keyboard visible */
+static uint16_t s_pro_idx;   /* current step index */
+static uint8_t  s_pro_wait;  /* auto-advance countdown, TEXT only */
+static uint8_t  s_pname_n;
+static char     s_pname[24];
+static char     s_ptextbuf[512];
+
+#define MAP_PATH   "/data/bsvm_map.bin"
+#define BOX_PATH   "/data/bsvm_box.bin"
+#define FACE_PATH  "/data/bsvm_face.bin"
+#define BOX_Y      404
+#define PNAME_DEFAULT "\xe6\xa0\xbc\xe6\x9e\x97"  /* 格林 */
+
+static void prologue_show_step(void);
+static void prologue_tick(void *arg);
+
+static void prologue_key(int n);
+static void prologue_pick(int n);
+
+#define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; prologue_key(n); }
+PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
+PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
+PKEY_FN(8)  PKEY_FN(9)  PKEY_FN(10) PKEY_FN(11)
+PKEY_FN(12) PKEY_FN(13) PKEY_FN(14) PKEY_FN(15)
+PKEY_FN(16) PKEY_FN(17) PKEY_FN(18) PKEY_FN(19)
+PKEY_FN(20) PKEY_FN(21) PKEY_FN(22) PKEY_FN(23)
+PKEY_FN(24) PKEY_FN(25) PKEY_FN(26) PKEY_FN(27)
+#undef PKEY_FN
+static void (*const s_key_cbs[28])(void *) = {
+    cb_key_0,  cb_key_1,  cb_key_2,  cb_key_3,  cb_key_4,  cb_key_5,  cb_key_6,
+    cb_key_7,  cb_key_8,  cb_key_9,  cb_key_10, cb_key_11, cb_key_12, cb_key_13,
+    cb_key_14, cb_key_15, cb_key_16, cb_key_17, cb_key_18, cb_key_19, cb_key_20,
+    cb_key_21, cb_key_22, cb_key_23, cb_key_24, cb_key_25, cb_key_26, cb_key_27,
+};
+
+#define PCHOICE_FN(n) static void cb_choice_##n(void *e) { (void)e; prologue_pick(n); }
+PCHOICE_FN(0) PCHOICE_FN(1) PCHOICE_FN(2) PCHOICE_FN(3)
+static void (*const s_choice_cbs[4])(void *) = {
+    cb_choice_0, cb_choice_1, cb_choice_2, cb_choice_3,
+};
+
+static void cb_advance(void *e)
+{
+    (void)e;
+    if (!s_pro_on || s_pro_kb) return;
+    if (s_prologue[s_pro_idx].type != PSTEP_TEXT) return;
+    log_line("PRO-ADVANCE");
+    s_pro_wait = 0;
+    s_pro_idx++;
+    prologue_show_step();
+}
+
+static void prologue_hide_all(void)
+{
+    obj_hide(s_map_img);
+    obj_hide(s_box_img);
+    obj_hide(s_face_img);
+    obj_hide(s_plate_lbl);
+    obj_hide(s_ptext_lbl);
+    obj_hide(s_card_lbl);
+    obj_hide(s_name_lbl);
+    for (int i = 0; i < 4; i++) obj_hide(s_choice_lbl[i]);
+    for (int i = 0; i < 28; i++) obj_hide(s_key_lbl[i]);
+}
+
+/* <NAME> -> chosen name (default 格林) */
+static const char *prologue_text(uint16_t id)
+{
+    const char *src = (id < sizeof(s_prologue_texts) / sizeof(s_prologue_texts[0]))
+                          ? s_prologue_texts[id] : "";
+    uint32_t o = 0;
+    for (uint32_t i = 0; src[i] != '\0' && o + 12 < sizeof(s_ptextbuf); i++) {
+        if (src[i] == '<' && src[i + 1] == 'N' && src[i + 2] == 'A') {
+            const char *nm = (s_pname_n > 0) ? s_pname : PNAME_DEFAULT;
+            for (uint32_t j = 0; nm[j] != '\0'; j++) s_ptextbuf[o++] = nm[j];
+            i += 5;
+            continue;
+        }
+        s_ptextbuf[o++] = src[i];
+    }
+    s_ptextbuf[o] = '\0';
+    return s_ptextbuf;
+}
+
+static void prologue_stop(int back_to_title)
+{
+    prologue_hide_all();
+    s_pro_on = 0;
+    s_pro_kb = 0;
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    if (back_to_title) {
+        obj_show(s_title_img);
+        obj_show(s_title_lbl);
+        obj_show(s_menu_ng);
+        obj_show(s_menu_cont);
+        obj_show(s_menu_end);
+        s_started = 0;
+        s_countdown = 12u;
+        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
+            title_tick, 1000u, 0);
+        log_line("PROLOGUE-DONE");
+    }
+    log_flush();
+}
+
+static void prologue_key(int n)
+{
+    if (!s_pro_kb) return;
+    if (n < 26) {
+        if (s_pname_n < 20) s_pname[s_pname_n++] = (char)('A' + n);
+    } else if (n == 26) {              /* backspace */
+        if (s_pname_n > 0) s_pname[--s_pname_n] = '\0';
+    } else {                           /* done */
+        if (s_pname_n == 0) {
+            const char *def = PNAME_DEFAULT;
+            uint32_t j = 0;
+            for (; def[j] != '\0'; j++) s_pname[j] = def[j];
+            s_pname_n = (uint8_t)j;
+        }
+        s_pname[s_pname_n] = '\0';
+        s_pro_kb = 0;
+        log_kv("pro-name", s_pname_n);
+        obj_show(s_map_img);
+        obj_show(s_box_img);
+        for (int i = 0; i < 28; i++) obj_hide(s_key_lbl[i]);
+        ui_show(s_name_lbl, 0);
+        s_pro_idx++;
+        prologue_show_step();
+        return;
+    }
+    s_pname[s_pname_n] = '\0';
+    {
+        char disp[40];
+        uint32_t o = 0;
+        const char *pre = "\xe5\x90\x8d\xe5\xad\x97: ";  /* 名字: */
+        for (uint32_t j = 0; pre[j] != '\0'; j++) disp[o++] = pre[j];
+        for (uint8_t j = 0; j < s_pname_n && o < 36; j++) disp[o++] = s_pname[j];
+        disp[o] = '\0';
+        if (s_name_lbl != 0)
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_name_lbl, disp);
+    }
+}
+
+static void prologue_pick(int n)
+{
+    const PrologueStep *st = &s_prologue[s_pro_idx];
+    if (!s_pro_on || n >= st->nchoice) return;
+    log_kv("pro-choice", (uint32_t)n);
+    log_kv("pro-choice-t", st->choice_text[n]);
+    log_flush();
+    s_pro_idx = st->choice_next[n];
+    prologue_show_step();
+}
+
+static void prologue_show_step(void)
+{
+    const PrologueStep *st = &s_prologue[s_pro_idx];
+    prologue_hide_all();
+    log_kv("pro-step", s_pro_idx);
+    log_kv("pro-type", st->type);
+
+    if (st->type == PSTEP_END) {
+        prologue_stop(1);
+        return;
+    }
+
+    int has_face = 0;
+    if (st->type == PSTEP_CARD) {
+        /* black screen + big logo; box below for the prompt */
+        ui_show(s_card_lbl, 1);
+        if (s_card_lbl != 0)
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_card_lbl, "BLACK SOULS");
+    } else {
+        ui_show(s_map_img, 1);
+        ui_show(s_box_img, 1);
+        has_face = (st->face != 0);
+        if (has_face) ui_show(s_face_img, 1);
+    }
+
+    if (st->text != 0xFFFF) {
+        const char *txt = prologue_text(st->text);
+        if (s_ptext_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_ptext_lbl, txt);
+            if (st->type == PSTEP_CARD) {
+                /* title-card prompt: centered under the logo */
+                ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                    s_ptext_lbl, 194, 40);
+                ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                    s_ptext_lbl, ALIGN_CENTER, 0, 30);
+            } else {
+                ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                    s_ptext_lbl, has_face ? 126 : 194, 94);
+                ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                    s_ptext_lbl, ALIGN_TOP_LEFT, has_face ? 78 : 8, BOX_Y + 6);
+            }
+            ui_show(s_ptext_lbl, 1);
+        }
+    }
+
+    if (st->plate != 0xFFFF && st->type != PSTEP_CARD) {
+        if (s_plate_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_plate_lbl, s_prologue_texts[st->plate]);
+            ui_show(s_plate_lbl, 1);
+        }
+    }
+
+    /* choices (above the box; card step shows them mid-screen) */
+    if (st->nchoice > 0) {
+        int base = (st->type == PSTEP_CARD) ? 300 : (BOX_Y - st->nchoice * 34 - 8);
+        for (int i = 0; i < st->nchoice; i++) {
+            void *lbl = s_choice_lbl[i];
+            if (lbl == 0) continue;
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                lbl, s_prologue_texts[st->choice_text[i]]);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                lbl, ALIGN_CENTER, 0, base + i * 34 - 260);
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                lbl, LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(lbl, s_choice_cbs[i],
+                                              LV_EVENT_CLICKED, 0);
+            ui_show(lbl, 1);
+        }
+    }
+
+    if (st->type == PSTEP_NAME) {
+        s_pro_kb = 1;
+        ui_show(s_name_lbl, 1);
+        for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 1);
+        s_pro_wait = 0;
+    } else {
+        s_pro_wait = (st->type == PSTEP_TEXT) ? 4u : 0u;
+    }
+    log_flush();
+}
+
+static void prologue_start(void)
+{
+    if (s_pro_on || !s_ok_init) return;
+    s_pro_on = 1;
+    s_pro_idx = 0;
+    s_pname_n = 0;
+    s_pname[0] = '\0';
+    log_line("PROLOGUE-START");
+    log_flush();
+
+    /* hide the title layer */
     obj_hide(s_title_img);
     obj_hide(s_title_lbl);
     obj_hide(s_menu_ng);
     obj_hide(s_menu_cont);
     obj_hide(s_menu_end);
-    /* story labels: widths stay inside the ~192px round-screen safe area */
-    s_scene = ui_label(s_root, 14, 96, 164, 30, 0, s_cjk_font);
-    s_dlg   = ui_label(s_root, 14, 150, 164, 260, 1, s_cjk_font);
-    ui_set_scene("BLACK SOULS");
-    ui_pick_story();
-    log_flush();
+
+    if (s_map_img == 0) {
+        s_map_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(s_root);
+        if (s_map_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_map_img, 212, 384);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_map_img, ALIGN_TOP_LEFT, 0, 0);
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_map_img, MAP_PATH);
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                s_map_img, LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(s_map_img, cb_advance,
+                                              LV_EVENT_CLICKED, 0);
+        }
+        s_box_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(s_root);
+        if (s_box_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_box_img, 212, 110);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_box_img, ALIGN_TOP_LEFT, 0, BOX_Y);
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_box_img, BOX_PATH);
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                s_box_img, LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(s_box_img, cb_advance,
+                                              LV_EVENT_CLICKED, 0);
+        }
+        s_face_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(s_root);
+        if (s_face_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_face_img, 64, 64);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_face_img, ALIGN_TOP_LEFT, 8, BOX_Y + 8);
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_face_img, FACE_PATH);
+        }
+        s_pro_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
+            "MiSans-Regular", 16u, 0u);
+        s_plate_lbl = ui_label(s_root, 8, 378, 120, 24, 0, s_cjk_font);
+        s_ptext_lbl = ui_label(s_root, 8, BOX_Y + 6, 194, 94, 1, s_pro_font);
+        s_card_lbl = ui_label(s_root, 0, 0, 0, 0, 0, s_title_font);
+        if (s_card_lbl != 0)
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_card_lbl, ALIGN_CENTER, 0, -80);
+        s_name_lbl = ui_label(s_root, 0, 0, 0, 0, 0, s_title_font);
+        if (s_name_lbl != 0)
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_name_lbl, ALIGN_CENTER, 0, -140);
+        for (int i = 0; i < 4; i++) {
+            s_choice_lbl[i] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+        }
+        /* keyboard: 26 letters + backspace + done, 4 rows x 7 cols */
+        {
+            char buf[8];
+            for (int i = 0; i < 26; i++) {
+                buf[0] = (char)('A' + i);
+                buf[1] = '\0';
+                s_key_lbl[i] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+                if (s_key_lbl[i] == 0) continue;
+                ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                    s_key_lbl[i], buf);
+                ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                    s_key_lbl[i], ALIGN_TOP_LEFT, 10 + (i % 7) * 28, 190 + (i / 7) * 44);
+                ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                    s_key_lbl[i], LV_FLAG_CLICKABLE);
+                (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                    uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[i], s_key_cbs[i],
+                                                  LV_EVENT_CLICKED, 0);
+                obj_hide(s_key_lbl[i]);
+            }
+            {
+                const char *bk = "\xe9\x80\x80\xe6\xa0\xbc";      /* 退格 */
+                const char *dn = "\xe5\xae\x8c\xe6\x88\x90";      /* 完成 */
+                s_key_lbl[26] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+                s_key_lbl[27] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+                if (s_key_lbl[26] != 0) {
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                        s_key_lbl[26], bk);
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_key_lbl[26], ALIGN_TOP_LEFT, 10 + 5 * 28, 190 + 3 * 44);
+                    ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                        s_key_lbl[26], LV_FLAG_CLICKABLE);
+                    (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                        uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[26], s_key_cbs[26],
+                                                      LV_EVENT_CLICKED, 0);
+                    obj_hide(s_key_lbl[26]);
+                }
+                if (s_key_lbl[27] != 0) {
+                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                        s_key_lbl[27], dn);
+                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                        s_key_lbl[27], ALIGN_TOP_LEFT, 10 + 6 * 28, 190 + 3 * 44);
+                    ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                        s_key_lbl[27], LV_FLAG_CLICKABLE);
+                    (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                        uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[27], s_key_cbs[27],
+                                                      LV_EVENT_CLICKED, 0);
+                    obj_hide(s_key_lbl[27]);
+                }
+            }
+        }
+    }
+
+    /* 1s prologue tick (auto-advance) */
     if (s_timer != 0) {
         ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
         s_timer = 0;
     }
     s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
-        ui_tick, 50u, 0);
+        prologue_tick, 1000u, 0);
+    prologue_show_step();
+}
+
+static void prologue_tick(void *arg)
+{
+    (void)arg;
+    if (!s_pro_on || s_pro_kb) return;
+    const PrologueStep *st = &s_prologue[s_pro_idx];
+    if (st->type != PSTEP_TEXT || s_pro_wait == 0u) return;
+    s_pro_wait--;
+    if (s_pro_wait == 0u) {
+        log_line("PRO-AUTO");
+        s_pro_idx++;
+        prologue_show_step();
+    }
 }
 
 static void bsvm_tick(void *arg)
