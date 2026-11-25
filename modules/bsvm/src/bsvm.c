@@ -15,6 +15,7 @@
 #include "canopus_memory.h"
 #include "canopus_ui.h"
 #include "bsvm_prologue.h"
+#include "bsvm_atrects.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -1043,6 +1044,7 @@ static char     s_ptextbuf[512];
 #define PNAME_DEFAULT "\xe6\xa0\xbc\xe6\x9e\x97"  /* 格林 */
 
 static void prologue_show_step(void);
+static int map_compose(void);
 static void prologue_tick(void *arg);
 
 static void prologue_key(int n);
@@ -1296,8 +1298,14 @@ static void prologue_start(void)
                 s_map_img, 212, 384);
             ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
                 s_map_img, ALIGN_TOP_LEFT, 0, 0);
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
-                s_map_img, MAP_PATH);
+            /* compose the GPU frame at runtime from the compact tile lib */
+            int mc = map_compose();
+            log_kv("map-compose", (uint32_t)(mc == 0 ? 1u : 0u));
+            log_flush();
+            if (mc == 0) {
+                ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                    s_map_img, MAP_PATH);
+            }
             ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
                 s_map_img, LV_FLAG_CLICKABLE);
             (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
@@ -1456,9 +1464,33 @@ static int bsvm_on_signal(void *page, uint32_t event, void *payload)
     return 0;
 }
 
+/* map-viewer / streaming composer paths (v2 self-describing mapdata) */
+#define MAPDATA_PATH "/data/bsvm_mapdata.bin"
+#define SEISEN_PATH  "/data/bsvm_seisen_mapdata.bin"
+#define VIEW_A_PATH  "/data/bsvm_view_a.bin"
+#define VIEW_B_PATH  "/data/bsvm_view_b.bin"
+
+static int md_load(const char *path);
+static void viewer_start(void *root);
+
 static int bsvm_on_create(void *page, void *root, void *start_data)
 {
     (void)page; (void)start_data;
+    /* map-viewer test mode: triggered by the seisen mapdata file */
+    {
+        int tfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(SEISEN_PATH, O_RDONLY);
+        if (tfd >= 0) {
+            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(tfd);
+            log_line("MODE viewer");
+            log_flush();
+            if (md_load(SEISEN_PATH) == 0) {
+                viewer_start(root);
+                return 0;
+            }
+            log_line("MV-LOAD-FAIL");
+            log_flush();
+        }
+    }
     s_label = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
     label_center(s_label);
     if (s_label != 0) {
@@ -1776,6 +1808,552 @@ static const struct canopus_ui_entry_v1 s_story_entry = {
     story_on_open, story_on_event, story_on_back, story_on_close,
     0, 0, 0, 0,
 };
+
+/* ---- on-band map composition (v1.0, v2 self-describing mapdata) ----
+ * Any map ships as one v2 bsvm_mapdata.bin (header carries dims; the
+ * tail carries the id/at tables and player spawn), composed here at
+ * runtime into a GPU-decoder ARGB8888 file:
+ *   - tilemap rows are streamed from the file per strip (no RAM copy)
+ *   - normal cells are streamed per blit (1KB read each)
+ *   - autotile blocks live in a small LRU cache (8 x 6KB)
+ * RAM: palette 1K + tables ~1.3K + at cache 48K + 212x32 band 27K. */
+#define MD_VIEW_W    212u              /* band width (camera crop) */
+#define MD_CAM_X     94u               /* prologue camera x0 */
+#define MD_AT_MAX    24u               /* autotile blocks per map */
+#define MD_AT_CACHE  8u                /* LRU slots */
+
+static uint8_t  s_md_pal[256][4];            /* BGRA words, [0] unused */
+static uint16_t s_md_id[256];                /* tile id per normal cell */
+static uint16_t s_md_nfl[256];               /* flags: bit4 over-player */
+static uint16_t s_md_normal_n;
+static uint16_t s_md_at_n;
+static uint16_t s_md_at_base[MD_AT_MAX];
+static uint16_t s_md_at_idx[MD_AT_MAX];
+static uint16_t s_md_at_h[MD_AT_MAX];        /* block height in tiles */
+static uint16_t s_md_at_fl[MD_AT_MAX];       /* bit0 waterfall, bit7 table */
+static int32_t  s_md_cells_off;              /* file offset: first cell */
+static int32_t  s_md_atoff[MD_AT_MAX];       /* file offset per block */
+static int32_t  s_md_tm_off;                 /* file offset: tilemap */
+static uint16_t s_md_x, s_md_y;              /* map dims in tiles */
+static int16_t  s_md_ptx, s_md_pty;          /* player spawn tile, -1 = none */
+static int      s_md_fd = -1;                /* open mapdata fd */
+static int      s_md_cx0;                    /* window x0 in view px */
+/* LRU autotile-block cache */
+static uint8_t  s_at_cache[MD_AT_CACHE][96u * 64u];
+static int16_t  s_at_slot_blk[MD_AT_CACHE];
+static uint32_t s_at_slot_tick[MD_AT_CACHE];
+static uint32_t s_at_tick;
+static uint32_t s_md_band[212u * 32u];        /* one 212x32 strip */
+static int      s_md_band_y0;                 /* view-y of strip top */
+
+typedef int (*md_rd_fn)(int, void *, uint32_t);
+
+static const uint8_t *md_at_ptr(int blk)
+{
+    /* LRU cache: fetch the 64px-wide autotile block into RAM */
+    int slot = -1;
+    for (int i = 0; i < MD_AT_CACHE; i++) {
+        if (s_at_slot_blk[i] == blk) {
+            s_at_slot_tick[i] = ++s_at_tick;
+            return s_at_cache[i];
+        }
+        if (s_at_slot_blk[i] < 0 || slot < 0 ||
+            s_at_slot_tick[i] < s_at_slot_tick[slot]) slot = i;
+    }
+    if (slot < 0) slot = 0;
+    uint32_t bytes = (uint32_t)s_md_at_h[blk] * 2048u;
+    if (bytes > 96u * 64u) bytes = 96u * 64u;
+    ((posix_lseek_fn)vfn(FW_LSEEK))(s_md_fd, (int64_t)s_md_atoff[blk], SEEK_SET);
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(s_md_fd, s_at_cache[slot], bytes) <
+        (int)bytes) return 0;
+    s_at_slot_blk[slot] = (int16_t)blk;
+    s_at_slot_tick[slot] = ++s_at_tick;
+    return s_at_cache[slot];
+}
+
+static void md_rect_blit_any(int tx, int ty, int vx0, int vy0, int vw, int vh,
+                             int blk, uint16_t off, int sw, int sh)
+{
+    /* draw a view-space sub-rect (vx0/vy0/vw/vh in view px) sampling
+     * sw x sh source pixels at byte offset off inside the 64px-wide
+     * 8bpp autotile block, at half resolution. */
+    const uint8_t *base = md_at_ptr(blk);
+    if (base == 0) return;
+    int sx = off % 64u, sy = off / 64u;
+    int bh = s_md_at_h[blk] * 32u;
+    int bx = (int)(tx * 16u) + vx0 - s_md_cx0;
+    int by0 = ty * 16u + vy0 - s_md_band_y0;
+    for (int yy = 0; yy < vh; yy++) {
+        int r = by0 + yy;
+        if (r < 0 || r >= 32) continue;
+        int syy = sy + (yy * sh) / vh;
+        if (syy >= bh) syy = bh - 1;
+        uint32_t *row = s_md_band + (uint32_t)r * MD_VIEW_W;
+        const uint8_t *src = base + (uint32_t)syy * 64u;
+        for (int xx = 0; xx < vw; xx++) {
+            int vx = bx + xx;
+            if (vx < 0 || vx >= (int)MD_VIEW_W) continue;
+            int sxx = sx + (xx * sw) / vw;
+            if (sxx >= sx + sw) sxx = sx + sw - 1;
+            uint8_t c = src[sxx];
+            if (c != 0) row[vx] = *(const uint32_t *)s_md_pal[c];
+        }
+    }
+}
+
+static void md_rect_blit(int tx, int ty, int qx, int qy,
+                         uint8_t blk, uint16_t off, int sw)
+{
+    /* one autotile quadrant: 16px source quadrant -> 8x8 view px */
+    md_rect_blit_any(tx, ty, qx / 2, qy / 2, 8, 8, blk, off, sw, sw);
+}
+
+static void md_cell_blit(int fd, uint32_t cell_off, uint16_t idx,
+                         int tx, int ty)
+{
+    /* 32x32 8bpp cell -> 16x16 view (2x2 box downscale, opaque wins) */
+    uint8_t cell[1024];
+    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)cell_off + (uint32_t)idx * 1024u,
+                                    SEEK_SET);
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, cell, 1024u) < 1024) return;
+    int bx = (int)(tx * 16u) - s_md_cx0;
+    int by0 = ty * 16u - s_md_band_y0;
+    for (int yy = 0; yy < 16; yy++) {
+        int r = by0 + yy;
+        if (r < 0 || r >= 32) continue;
+        uint32_t *row = s_md_band + (uint32_t)r * MD_VIEW_W;
+        const uint8_t *s0 = cell + (yy * 2) * 32u;
+        const uint8_t *s1 = s0 + 32u;
+        for (int xx = 0; xx < 16; xx++) {
+            int vx = bx + xx;
+            if (vx < 0 || vx >= (int)MD_VIEW_W) continue;
+            uint8_t c = s0[xx * 2];
+            if (c == 0) c = s0[xx * 2 + 1];
+            if (c == 0) c = s1[xx * 2];
+            if (c == 0) c = s1[xx * 2 + 1];
+            if (c != 0) row[vx] = *(const uint32_t *)s_md_pal[c];
+        }
+    }
+}
+
+static int md_find_normal(uint16_t id)
+{
+    if (id == 0) return -1;
+    for (uint16_t k = 0; k < s_md_normal_n; k++) {
+        if (s_md_id[k] == id) return (int)k;
+    }
+    return -1;
+}
+
+static int md_find_at(uint16_t base, uint16_t at)
+{
+    for (uint16_t k = 0; k < s_md_at_n; k++) {
+        if (s_md_at_base[k] == base && s_md_at_idx[k] == at) return (int)k;
+    }
+    return -1;
+}
+
+static void md_draw_at(uint32_t tx, uint32_t ty, uint16_t v)
+{
+    /* mkxp tileatlasvx.cpp onTile dispatch: A1(0x800)/A2(0xB00)/
+     * A3(0x1100)/A4(0x1700). at fl: bit7 = A2 table (6-quad legs),
+     * bit0 = A1 waterfall C-type (2 half-width 16x32 quads). */
+    uint16_t base = (v < 0xB00u) ? 0x0800u :
+                    (v < 0x1100u) ? 0x0B00u :
+                    (v < 0x1700u) ? 0x1100u : 0x1700u;
+    int k = md_find_at(base, (uint16_t)((v - base) / 48u));
+    if (k < 0) return;
+    int blk = k;
+    uint16_t afl = s_md_at_fl[k];
+    uint16_t pat = (uint16_t)((v - base) % 48u);
+    static const int ax[4] = {0, 16, 0, 16};
+    static const int ay[4] = {0, 0, 16, 16};
+    if (base == 0x1100u) {
+        /* A3 wall: B table; shapes >= 16 render nothing (mkxp) */
+        if (pat < 16u) {
+            for (int i = 0; i < 4; i++)
+                md_rect_blit((int)tx, (int)ty, ax[i], ay[i],
+                             blk, bsva_at_b[pat * 4u + i], 15);
+        }
+    } else if (base == 0x0800u && (afl & 0x01u)) {
+        /* A1 waterfall C-type: 2 quads of 15x31 -> 16x32 halves */
+        if (pat < 4u) {
+            for (int i = 0; i < 2; i++)
+                md_rect_blit_any((int)tx, (int)ty, i * 8, 0, 8, 16,
+                                 blk, bsva_at_c[pat * 2u + i], 15, 31);
+        }
+    } else if (base == 0x0B00u && (afl & 0x80u)) {
+        /* A2 table tile: 6-quad layout, legs spill into the tile below */
+        uint8_t bits = bsva_a2_size[pat];
+        for (int i = 0; i < 6; i++) {
+            if (!((bits >> i) & 1u)) continue;
+            int qx, qy;
+            if (i < 4) { qx = ax[i]; qy = ay[i]; }
+            else { qx = (i == 4) ? 0 : 16; qy = 32; }
+            md_rect_blit((int)tx, (int)ty, qx, qy, blk,
+                         bsva_at_a2[pat * 6u + i], 16);
+        }
+    } else {
+        for (int i = 0; i < 4; i++)
+            md_rect_blit((int)tx, (int)ty, ax[i], ay[i],
+                         blk, bsva_at_a[pat * 4u + i], 15);
+    }
+}
+
+static int md_load(const char *path)
+{
+    /* open a v2 self-describing mapdata file and parse the tables */
+    if (s_md_fd >= 0) {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(s_md_fd);
+        s_md_fd = -1;
+    }
+    for (int i = 0; i < MD_AT_CACHE; i++) s_at_slot_blk[i] = -1;
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
+    if (fd < 0) return -1;
+    uint8_t hdr[16];
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, hdr, 16u) < 16 ||
+        hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'M' || hdr[3] != 'D') {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        return -2;
+    }
+    uint16_t pal_n = (uint16_t)(hdr[4] | (hdr[5] << 8));
+    uint16_t normal_n = (uint16_t)(hdr[6] | (hdr[7] << 8));
+    uint16_t at_n = (uint16_t)(hdr[8] | (hdr[9] << 8));
+    uint16_t mx = (uint16_t)(hdr[10] | (hdr[11] << 8));
+    uint16_t my = (uint16_t)(hdr[12] | (hdr[13] << 8));
+    if (pal_n > 256u || normal_n == 0u || normal_n > 256u ||
+        at_n == 0u || at_n > MD_AT_MAX ||
+        mx == 0u || my == 0u || mx > 512u || my > 512u) {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        return -3;
+    }
+    uint8_t praw[768];
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, praw, 768u) < 768) {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        return -4;
+    }
+    for (uint32_t k = 0; k < 256u; k++) {
+        uint8_t r = (k < pal_n) ? praw[k * 3u] : 0;
+        uint8_t g = (k < pal_n) ? praw[k * 3u + 1u] : 0;
+        uint8_t b = (k < pal_n) ? praw[k * 3u + 2u] : 0;
+        s_md_pal[k][0] = b;
+        s_md_pal[k][1] = g;
+        s_md_pal[k][2] = r;
+        s_md_pal[k][3] = 0xFF;
+    }
+    s_md_fd = fd;
+    s_md_normal_n = normal_n;
+    s_md_at_n = at_n;
+    s_md_x = mx;
+    s_md_y = my;
+    s_md_cells_off = 16 + 768;
+    /* the tail (backwards): spawn i16x2, at table 8B each, id table 4B each */
+    int64_t fsize = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, 0, SEEK_END);
+    int64_t need = 16 + 768 + (int64_t)normal_n * 1024 +
+                   (int64_t)4 * mx * my * 2 + normal_n * 4 + at_n * 8 + 4;
+    if (fsize < need) {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        s_md_fd = -1;
+        return -5;
+    }
+    uint8_t tmp[MD_AT_MAX * 8u];
+    int64_t pos = fsize - 4;
+    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
+    uint8_t spawn[4];
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, spawn, 4u) < 4) goto bad;
+    s_md_ptx = (int16_t)(spawn[0] | ((uint16_t)spawn[1] << 8));
+    s_md_pty = (int16_t)(spawn[2] | ((uint16_t)spawn[3] << 8));
+    pos -= (int64_t)at_n * 8;
+    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, tmp, at_n * 8u) < (int)(at_n * 8u))
+        goto bad;
+    for (uint16_t k = 0; k < at_n; k++) {
+        const uint8_t *e = tmp + (uint32_t)k * 8u;
+        s_md_at_base[k] = (uint16_t)(e[0] | ((uint16_t)e[1] << 8));
+        s_md_at_idx[k] = (uint16_t)(e[2] | ((uint16_t)e[3] << 8));
+        s_md_at_h[k] = (uint16_t)(e[4] | ((uint16_t)e[5] << 8));
+        s_md_at_fl[k] = (uint16_t)(e[6] | ((uint16_t)e[7] << 8));
+    }
+    pos -= (int64_t)normal_n * 4;
+    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
+    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, tmp, normal_n * 4u) <
+        (int)(normal_n * 4u)) goto bad;
+    for (uint16_t k = 0; k < normal_n; k++) {
+        const uint8_t *e = tmp + (uint32_t)k * 4u;
+        s_md_id[k] = (uint16_t)(e[0] | ((uint16_t)e[1] << 8));
+        s_md_nfl[k] = (uint16_t)(e[2] | ((uint16_t)e[3] << 8));
+    }
+    /* tilemap sits before the id table; at blocks before the tilemap */
+    int64_t ids_off = pos;
+    s_md_tm_off = ids_off - (int64_t)4 * mx * my * 2;
+    int64_t cur = s_md_tm_off;
+    for (int k = (int)at_n - 1; k >= 0; k--) {
+        cur -= (int64_t)s_md_at_h[k] * 2048;
+        s_md_atoff[k] = cur;
+    }
+    return 0;
+bad:
+    ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    s_md_fd = -1;
+    return -6;
+}
+
+static int md_tm_row(uint16_t z, uint16_t ty, uint16_t *row)
+{
+    /* stream one tilemap row (X entries) from the file */
+    if (ty >= s_md_y) return -1;
+    int64_t off = s_md_tm_off +
+        (int64_t)(z * s_md_y + ty) * s_md_x * 2;
+    ((posix_lseek_fn)vfn(FW_LSEEK))(s_md_fd, off, SEEK_SET);
+    return ((md_rd_fn)vfn(FW_POSIX_READ))(s_md_fd, row, s_md_x * 2u) <
+                   (int)(s_md_x * 2u) ? -1 : 0;
+}
+
+static int md_render_window(const char *out_path, int cx0, int cy0,
+                            int w, int h)
+{
+    /* stream-render the window in 32-view-row strips (GPU-decoder file) */
+    if (s_md_fd < 0) return -1;
+    int fo = ((posix_open_fn)vfn(FW_POSIX_OPEN))(out_path,
+                                                 O_RDWR | O_CREAT, 0666);
+    if (fo < 0) return -7;
+    uint8_t out_hdr[12] = {0x19, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    out_hdr[4] = (uint8_t)(w & 0xFF);
+    out_hdr[5] = (uint8_t)(w >> 8);
+    out_hdr[6] = (uint8_t)(h & 0xFF);
+    out_hdr[7] = (uint8_t)(h >> 8);
+    out_hdr[8] = (uint8_t)((w * 4u) & 0xFF);
+    out_hdr[9] = (uint8_t)(((w * 4u) >> 8) & 0xFF);
+    ((posix_write_fn)vfn(FW_POSIX_WRITE))(fo, out_hdr, 12u);
+    s_md_cx0 = cx0;
+    uint16_t row[512];
+    uint16_t over[32];
+    int wy = 0;
+    while (wy < h) {
+        int strip_h = (h - wy < 32) ? (h - wy) : 32;
+        for (uint32_t i = 0; i < MD_VIEW_W * 32u; i++) s_md_band[i] = 0xFF000000u;
+        s_md_band_y0 = cy0 + wy;
+        uint32_t t0 = (uint32_t)(s_md_band_y0 / 16);
+        uint32_t t1 = (uint32_t)((s_md_band_y0 + strip_h + 15) / 16);
+        if (t1 > s_md_y) t1 = s_md_y;
+        int over_n = 0;
+        for (int z = 0; z < 2; z++) {
+            for (uint32_t ty = t0; ty < t1; ty++) {
+                if (md_tm_row((uint16_t)z, (uint16_t)ty, row) != 0) continue;
+                for (uint16_t tx = 0; tx < s_md_x; tx++) {
+                    uint16_t v = row[tx];
+                    if (v == 0) continue;
+                    int ni = md_find_normal(v);
+                    if (ni >= 0) {
+                        if (s_md_nfl[ni] & 0x10u) {
+                            if (over_n < 16) {
+                                over[over_n * 2] = v;
+                                over[over_n * 2 + 1] =
+                                    (uint16_t)(tx | (ty << 8));
+                                over_n++;
+                            }
+                            continue;
+                        }
+                        md_cell_blit(s_md_fd, (uint32_t)s_md_cells_off,
+                                     (uint16_t)ni, (int)tx, (int)ty);
+                        continue;
+                    }
+                    if (v < 0x0800u) continue;
+                    md_draw_at(tx, ty, v);
+                }
+            }
+        }
+        /* table legs from the tile row above spill into the strip top */
+        if (t0 > 0 && md_tm_row(1u, (uint16_t)(t0 - 1u), row) == 0) {
+            for (uint16_t tx = 0; tx < s_md_x; tx++) {
+                uint16_t v = row[tx];
+                if (v == 0 || v < 0x0B00u || v >= 0x1100u) continue;
+                int k = md_find_at(0xB00u, (uint16_t)((v - 0x0B00u) / 48u));
+                if (k < 0 || !(s_md_at_fl[k] & 0x80u)) continue;
+                uint16_t pat = (uint16_t)((v - 0x0B00u) % 48u);
+                uint8_t bits = bsva_a2_size[pat];
+                for (int i = 4; i < 6; i++) {
+                    if (!((bits >> i) & 1u)) continue;
+                    int qx = (i == 4) ? 0 : 16;
+                    md_rect_blit((int)tx, (int)t0, qx, 0, k,
+                                 bsva_at_a2[pat * 6u + i], 16);
+                }
+            }
+        }
+        /* shadow nibbles (z3): quadrant halves -> 8x8, per-pixel clip */
+        for (uint32_t ty = t0; ty < t1; ty++) {
+            if (md_tm_row(3u, (uint16_t)ty, row) != 0) continue;
+            for (uint16_t tx = 0; tx < s_md_x; tx++) {
+                uint16_t v = row[tx] & 0xFu;
+                if (!v) continue;
+                for (int qy = 0; qy < 2; qy++) {
+                    for (int qx = 0; qx < 2; qx++) {
+                        if (!((v >> (qy * 2 + qx)) & 1u)) continue;
+                        int bx = (int)(tx * 16u + qx * 8u) - s_md_cx0;
+                        int by = (int)ty * 16u + qy * 8u - s_md_band_y0;
+                        for (int yy = 0; yy < 8; yy++) {
+                            int r = by + yy;
+                            if (r < 0 || r >= 32) continue;
+                            uint32_t *brow = s_md_band +
+                                (uint32_t)r * MD_VIEW_W;
+                            for (int xx = 0; xx < 8; xx++) {
+                                int vx = bx + xx;
+                                if (vx < 0 || vx >= (int)MD_VIEW_W) continue;
+                                uint32_t px = brow[vx];
+                                brow[vx] = ((px >> 1) & 0x7F7F7F7Fu) |
+                                           (px & 0xFF000000u);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        /* z2 */
+        for (uint32_t ty = t0; ty < t1; ty++) {
+            if (md_tm_row(2u, (uint16_t)ty, row) != 0) continue;
+            for (uint16_t tx = 0; tx < s_md_x; tx++) {
+                uint16_t v = row[tx];
+                if (v == 0) continue;
+                if (v < 0x0800u) {
+                    int ni = md_find_normal(v);
+                    if (ni >= 0) {
+                        md_cell_blit(s_md_fd, (uint32_t)s_md_cells_off,
+                                     (uint16_t)ni, (int)tx, (int)ty);
+                    }
+                    continue;
+                }
+                md_draw_at(tx, ty, v);
+            }
+        }
+        /* overPlayer tiles recorded from z0/z1 */
+        for (int k = 0; k < over_n; k++) {
+            uint16_t v = over[k * 2];
+            uint32_t tx = over[k * 2 + 1] & 0xFFu;
+            uint32_t ty = (over[k * 2 + 1] >> 8) & 0xFFu;
+            int ni = md_find_normal(v);
+            if (ni >= 0) {
+                md_cell_blit(s_md_fd, (uint32_t)s_md_cells_off,
+                             (uint16_t)ni, (int)tx, (int)ty);
+            }
+        }
+        /* player soul flame at the spawn tile (-1 = none) */
+        if (s_md_ptx >= 0 && t0 <= (uint32_t)s_md_pty &&
+            (uint32_t)s_md_pty < t1) {
+            md_cell_blit(s_md_fd, (uint32_t)s_md_cells_off,
+                         (uint16_t)(s_md_normal_n - 1u),
+                         (int)s_md_ptx, (int)s_md_pty);
+        }
+        for (int yy = 0; yy < strip_h; yy++) {
+            ((posix_write_fn)vfn(FW_POSIX_WRITE))(
+                fo, s_md_band + (uint32_t)yy * MD_VIEW_W,
+                (uint32_t)w * 4u);
+        }
+        wy += strip_h;
+    }
+    ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fo);
+    return 0;
+}
+
+static int map_compose(void)
+{
+    int rc = md_load(MAPDATA_PATH);
+    if (rc != 0) return rc;
+    return md_render_window(MAP_PATH, (int)MD_CAM_X, 0,
+                            (int)MD_VIEW_W, (int)s_md_y * 16);
+}
+
+/* ---------------- seisen map viewer (test page) ----------------
+ * Triggered by the presence of /data/bsvm_seisen_mapdata.bin.
+ * 212x420 map window + 5 buttons (pan / exit). Panning re-renders
+ * the window into one of two alternating files so the firmware
+ * re-decodes and shows the new view. Exit via FW_PAGE_FINISH. */
+#define MV_W 212
+#define MV_H 420
+#define MV_STEP_X 106
+#define MV_STEP_Y 140
+
+static void *s_mv_img;
+static void *s_mv_btn[5];
+static int s_mv_cx, s_mv_cy;
+static int s_mv_flip;
+
+static void mv_redraw(void)
+{
+    static const char *const paths[2] = {VIEW_A_PATH, VIEW_B_PATH};
+    const char *p = paths[s_mv_flip & 1];
+    s_mv_flip ^= 1;
+    if (md_render_window(p, s_mv_cx, s_mv_cy, MV_W, MV_H) != 0) return;
+    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+        s_mv_img, p);
+}
+
+static void mv_pan(int dx, int dy)
+{
+    int mwx = (int)s_md_x * 16 - MV_W;
+    int mwy = (int)s_md_y * 16 - MV_H;
+    s_mv_cx += dx;
+    s_mv_cy += dy;
+    if (s_mv_cx < 0) s_mv_cx = 0;
+    if (s_mv_cx > mwx) s_mv_cx = mwx;
+    if (s_mv_cy < 0) s_mv_cy = 0;
+    if (s_mv_cy > mwy) s_mv_cy = mwy;
+    mv_redraw();
+    log_kv("mvx", (uint32_t)s_mv_cx);
+    log_kv("mvy", (uint32_t)s_mv_cy);
+    log_flush();
+}
+
+static void cb_mv_left(void *e)  { (void)e; mv_pan(-MV_STEP_X, 0); }
+static void cb_mv_right(void *e) { (void)e; mv_pan(MV_STEP_X, 0); }
+static void cb_mv_up(void *e)    { (void)e; mv_pan(0, -MV_STEP_Y); }
+static void cb_mv_down(void *e)  { (void)e; mv_pan(0, MV_STEP_Y); }
+static void cb_mv_exit(void *e)
+{
+    (void)e;
+    log_line("MV-EXIT");
+    log_flush();
+    (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
+}
+
+static void viewer_start(void *root)
+{
+    s_mv_cx = 0;
+    s_mv_cy = 0;
+    s_mv_flip = 0;
+    void *font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)
+                  VENA(FW_FONT_CREATE))("MiSans-Regular", 18u, 0u);
+    s_mv_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(root);
+    if (s_mv_img != 0) {
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+            s_mv_img, MV_W, MV_H);
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+            FW_OBJ_ALIGN))(s_mv_img, ALIGN_TOP_LEFT, 0, 0);
+    }
+    /* 左 右 上 下 退出 (MiSans has CJK; ASCII arrows may be missing) */
+    static const char *const txt[5] = {
+        "\xE5\xB7\xA6", "\xE5\x8F\xB3", "\xE4\xB8\x8A", "\xE4\xB8\x8B",
+        "\xE9\x80\x80\xE5\x87\xBA"
+    };
+    static void (*const cbs[5])(void *) = {
+        cb_mv_left, cb_mv_right, cb_mv_up, cb_mv_down, cb_mv_exit
+    };
+    for (int i = 0; i < 5; i++) {
+        void *lbl = ui_label(root, i * 42, 424, 42, 40, 0, font);
+        s_mv_btn[i] = lbl;
+        if (lbl == 0) continue;
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+            lbl, txt[i]);
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+            lbl, LV_FLAG_CLICKABLE);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(lbl, cbs[i], LV_EVENT_CLICKED, 0);
+    }
+    mv_redraw();
+    log_line("MV-READY");
+    log_kv("mw", s_md_x * 16u);
+    log_kv("mh", s_md_y * 16u);
+    log_flush();
+}
 
 /* ---------------- module lifecycle ---------------- */
 static uint16_t s_app_id;

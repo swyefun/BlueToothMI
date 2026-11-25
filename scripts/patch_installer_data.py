@@ -79,6 +79,8 @@ if 'data stream call' not in s:
         '    asset_stream_write("m", "/data/bsvm_map.bin", 300000, "地图", checkpoint)\n'
         '    asset_stream_write("x", "/data/bsvm_box.bin", 80000, "文本框", checkpoint)\n'
         '    asset_stream_write("f", "/data/bsvm_face.bin", 15000, "头像", checkpoint)\n'
+        '    asset_stream_write("a", "/data/bsvm_mapdata.bin", 10000, "地图数据", checkpoint)\n'
+        '    asset_stream_write("b", "/data/bsvm_seisen_mapdata.bin", 10000, "圣森地图", checkpoint)\n'
         '    checkpoint("提交签名验证与安装请求")\n')
     assert anchor2 in s, 'submit checkpoint anchor missing'
     s = s.replace(anchor2, new2, 1)
