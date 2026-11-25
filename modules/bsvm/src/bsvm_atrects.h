@@ -5,7 +5,7 @@
 #define BSVM_ATRECTS_H
 
 /* 48 patterns x 4 quadrants (ground/wall-A type) */
-static const uint16_t bsva_at_a[48*4] = {
+static const uint32_t bsva_at_a[48*4] = {
     4193,4177,3169,3153,
     97,4177,3169,3153,
     4193,113,3169,3153,
@@ -57,7 +57,7 @@ static const uint16_t bsva_at_a[48*4] = {
 };
 
 /* 16 patterns x 4 quadrants (wall-B type, A4 odd bands) */
-static const uint16_t bsva_at_b[16*4] = {
+static const uint32_t bsva_at_b[16*4] = {
     2145,2129,1121,1105,
     2113,2129,1089,1105,
     97,81,1121,1105,
@@ -77,7 +77,7 @@ static const uint16_t bsva_at_b[16*4] = {
 };
 
 /* 48 patterns x 6 rects (A2 table type) + size bitmap (1=16px) */
-static const uint16_t bsva_at_a2[48*6] = {
+static const uint32_t bsva_at_a2[48*6] = {
     4193,4177,3169,3153,1089,1105,
     97,4177,3169,3153,1089,1105,
     4193,113,3169,3153,1089,1105,
@@ -138,7 +138,7 @@ static const uint8_t bsva_a2_size[48] = {
 
 /* 4 shapes x 2 quads (A1 waterfall C-type); 15x31 source mapped to
  * 16x32 halves (left/right) of the tile, no vertical spill */
-static const uint16_t bsva_at_c[4*2] = {
+static const uint32_t bsva_at_c[4*2] = {
     97, 81,
     64, 81,
     97, 113,

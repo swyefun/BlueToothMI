@@ -1872,7 +1872,7 @@ static const uint8_t *md_at_ptr(int blk)
 }
 
 static void md_rect_blit_any(int tx, int ty, int vx0, int vy0, int vw, int vh,
-                             int blk, uint16_t off, int sw, int sh)
+                             int blk, uint32_t off, int sw, int sh)
 {
     /* draw a view-space sub-rect (vx0/vy0/vw/vh in view px) sampling
      * sw x sh source pixels at byte offset off inside the 64px-wide
@@ -1902,7 +1902,7 @@ static void md_rect_blit_any(int tx, int ty, int vx0, int vy0, int vw, int vh,
 }
 
 static void md_rect_blit(int tx, int ty, int qx, int qy,
-                         uint8_t blk, uint16_t off, int sw)
+                         int blk, uint32_t off, int sw)
 {
     /* one autotile quadrant: 16px source quadrant -> 8x8 view px */
     md_rect_blit_any(tx, ty, qx / 2, qy / 2, 8, 8, blk, off, sw, sw);
