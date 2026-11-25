@@ -1298,14 +1298,14 @@ static void prologue_start(void)
                 s_map_img, 212, 384);
             ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
                 s_map_img, ALIGN_TOP_LEFT, 0, 0);
-            /* compose the GPU frame at runtime from the compact tile lib */
+            /* compose the GPU frame at runtime from the compact tile lib;
+             * on failure MAP_PATH still holds the installer-streamed baked
+             * map, so always point the widget at it */
             int mc = map_compose();
-            log_kv("map-compose", (uint32_t)(mc == 0 ? 1u : 0u));
+            log_kv("map-compose", (uint32_t)(mc == 0 ? 0u : (uint32_t)(-mc)));
             log_flush();
-            if (mc == 0) {
-                ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
-                    s_map_img, MAP_PATH);
-            }
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_map_img, MAP_PATH);
             ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
                 s_map_img, LV_FLAG_CLICKABLE);
             (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
@@ -1483,11 +1483,16 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
             ((posix_close_fn)vfn(FW_POSIX_CLOSE))(tfd);
             log_line("MODE viewer");
             log_flush();
-            if (md_load(SEISEN_PATH) == 0) {
+            int mrc = md_load(SEISEN_PATH);
+            if (mrc == 0) {
                 viewer_start(root);
                 return 0;
             }
             log_line("MV-LOAD-FAIL");
+            log_kv("mvload", (uint32_t)(-mrc));
+            log_flush();
+        } else {
+            log_line("seisen-miss");
             log_flush();
         }
     }
@@ -2056,7 +2061,9 @@ static int md_load(const char *path)
         s_md_fd = -1;
         return -5;
     }
-    uint8_t tmp[MD_AT_MAX * 8u];
+    /* tail-table scratch: id table is up to normal_n*4 = 1024 (normal_n is
+     * capped at 256 above); at table needs at_n*8 = MD_AT_MAX*8. */
+    uint8_t tmp[1024];
     int64_t pos = fsize - 4;
     ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
     uint8_t spawn[4];
