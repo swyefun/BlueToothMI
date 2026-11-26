@@ -1411,6 +1411,7 @@ static int bsvm_on_signal(void *page, uint32_t event, void *payload)
 
 static int md_load(const char *path);
 static int md_load_fd(int fd);
+static int md_open(const char *path);
 static void viewer_start(void *root);
 
 /* the .ko stays resident across app opens: every session-scoped static
@@ -1464,7 +1465,7 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
     {
         log_line("MODE viewer");
         log_flush();                     /* flush BEFORE opening the file */
-        int tfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(SEISEN_PATH, O_RDONLY);
+        int tfd = md_open(SEISEN_PATH);
         if (tfd >= 0) {
             int mrc = md_load_fd(tfd);   /* single open, owns tfd */
             if (mrc == 0) {
@@ -1798,6 +1799,59 @@ static int      s_md_band_y0;                 /* view-y of strip top */
 
 typedef int (*md_rd_fn)(int, void *, uint32_t);
 
+/* mapdata reads go through the ctx->fs service: the raw read() veneer
+ * serves small files but returns EOF (0 bytes) on larger ones -- device
+ * log showed mvsz=112468 with mvhdr0 on a 112KB file, while ctx->fs
+ * reads the 816KB game data fine. Chunked transfers keep the service
+ * happy (see read_full). */
+static const struct canopus_fs_obj *md_fs(void)
+{
+    return (s_ctx != 0) ? s_ctx->fs : 0;
+}
+
+static int md_open(const char *path)
+{
+    const struct canopus_fs_obj *fs = md_fs();
+    if (fs == 0 || fs->open == 0) return -1;
+    return (int)fs->open(s_ctx, path, CANOPUS_FS_READ);
+}
+
+static void md_close(int fd)
+{
+    const struct canopus_fs_obj *fs = md_fs();
+    if (fs != 0 && fs->close != 0) fs->close(s_ctx, fd);
+}
+
+static int md_seek(int fd, int64_t off)
+{
+    const struct canopus_fs_obj *fs = md_fs();
+    if (fs == 0 || fs->seek == 0) return -1;
+    return fs->seek(s_ctx, fd, off, CANOPUS_FS_SEEK_SET) < 0 ? -1 : 0;
+}
+
+static int64_t md_size(int fd)
+{
+    const struct canopus_fs_obj *fs = md_fs();
+    if (fs == 0 || fs->size == 0) return -1;
+    return fs->size(s_ctx, fd);
+}
+
+static int md_read(int fd, void *buf, uint32_t len)
+{
+    const struct canopus_fs_obj *fs = md_fs();
+    if (fs == 0 || fs->read == 0) return -1;
+    uint32_t got = 0;
+    uint8_t *p = (uint8_t *)buf;
+    while (got < len) {
+        uint32_t want = len - got;
+        if (want > 4096u) want = 4096u;
+        int r = fs->read(s_ctx, fd, p + got, want);
+        if (r <= 0) break;
+        got += (uint32_t)r;
+    }
+    return (int)got;
+}
+
 static const uint8_t *md_at_ptr(int blk)
 {
     /* LRU cache: fetch the 64px-wide autotile block into RAM */
@@ -1813,9 +1867,8 @@ static const uint8_t *md_at_ptr(int blk)
     if (slot < 0) slot = 0;
     uint32_t bytes = (uint32_t)s_md_at_h[blk] * 2048u;
     if (bytes > 96u * 64u) bytes = 96u * 64u;
-    ((posix_lseek_fn)vfn(FW_LSEEK))(s_md_fd, (int64_t)s_md_atoff[blk], SEEK_SET);
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(s_md_fd, s_at_cache[slot], bytes) <
-        (int)bytes) return 0;
+    md_seek(s_md_fd, (int64_t)s_md_atoff[blk]);
+    if (md_read(s_md_fd, s_at_cache[slot], bytes) < (int)bytes) return 0;
     s_at_slot_blk[slot] = (int16_t)blk;
     s_at_slot_tick[slot] = ++s_at_tick;
     return s_at_cache[slot];
@@ -1863,9 +1916,8 @@ static void md_cell_blit(int fd, uint32_t cell_off, uint16_t idx,
 {
     /* 32x32 8bpp cell -> 16x16 view (2x2 box downscale, opaque wins) */
     uint8_t cell[1024];
-    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)cell_off + (uint32_t)idx * 1024u,
-                                    SEEK_SET);
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, cell, 1024u) < 1024) return;
+    md_seek(fd, (int64_t)cell_off + (uint32_t)idx * 1024u);
+    if (md_read(fd, cell, 1024u) < 1024) return;
     int bx = (int)(tx * 16u) - s_md_cx0;
     int by0 = ty * 16u - s_md_band_y0;
     for (int yy = 0; yy < 16; yy++) {
@@ -1959,17 +2011,17 @@ static int md_load_fd(int fd)
 {
     s_md_fd = -1;
     for (int i = 0; i < MD_AT_CACHE; i++) s_at_slot_blk[i] = -1;
-    int64_t fsz = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+    int64_t fsz = md_size(fd);
     log_kv("mvsz", (uint32_t)(fsz < 0 ? 0u : (uint32_t)fsz));
-    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_SET);
+    md_seek(fd, 0);
     uint8_t hdr[16];
-    int rr = ((md_rd_fn)vfn(FW_POSIX_READ))(fd, hdr, 16u);
+    int rr = md_read(fd, hdr, 16u);
     if (rr < 16 || hdr[0] != 'B' || hdr[1] != 'S' ||
         hdr[2] != 'M' || hdr[3] != 'D') {
         log_kv("mvhdr", (uint32_t)(rr < 0 ? 0u : (uint32_t)rr));
         log_kv("mvb0", rd32(hdr));
         log_flush();
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        md_close(fd);
         return -2;
     }
     uint16_t pal_n = (uint16_t)(hdr[4] | (hdr[5] << 8));
@@ -1980,12 +2032,12 @@ static int md_load_fd(int fd)
     if (pal_n > 256u || normal_n == 0u || normal_n > 256u ||
         at_n == 0u || at_n > MD_AT_MAX ||
         mx == 0u || my == 0u || mx > 512u || my > 512u) {
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+        md_close(fd);
         return -3;
     }
     uint8_t praw[768];
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, praw, 768u) < 768) {
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    if (md_read(fd, praw, 768u) < 768) {
+        md_close(fd);
         return -4;
     }
     for (uint32_t k = 0; k < 256u; k++) {
@@ -2004,26 +2056,25 @@ static int md_load_fd(int fd)
     s_md_y = my;
     s_md_cells_off = 16 + 768;
     /* the tail (backwards): spawn i16x2, at table 8B each, id table 4B each */
-    int64_t fsize = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, 0, SEEK_END);
     int64_t need = 16 + 768 + (int64_t)normal_n * 1024 +
                    (int64_t)4 * mx * my * 2 + normal_n * 4 + at_n * 8 + 4;
-    if (fsize < need) {
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    if (fsz < need) {
+        md_close(fd);
         s_md_fd = -1;
         return -5;
     }
     /* tail-table scratch: id table is up to normal_n*4 = 1024 (normal_n is
      * capped at 256 above); at table needs at_n*8 = MD_AT_MAX*8. */
     uint8_t tmp[1024];
-    int64_t pos = fsize - 4;
-    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
+    int64_t pos = fsz - 4;
+    md_seek(fd, pos);
     uint8_t spawn[4];
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, spawn, 4u) < 4) goto bad;
+    if (md_read(fd, spawn, 4u) < 4) goto bad;
     s_md_ptx = (int16_t)(spawn[0] | ((uint16_t)spawn[1] << 8));
     s_md_pty = (int16_t)(spawn[2] | ((uint16_t)spawn[3] << 8));
     pos -= (int64_t)at_n * 8;
-    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, tmp, at_n * 8u) < (int)(at_n * 8u))
+    md_seek(fd, pos);
+    if (md_read(fd, tmp, at_n * 8u) < (int)(at_n * 8u))
         goto bad;
     for (uint16_t k = 0; k < at_n; k++) {
         const uint8_t *e = tmp + (uint32_t)k * 8u;
@@ -2033,9 +2084,8 @@ static int md_load_fd(int fd)
         s_md_at_fl[k] = (uint16_t)(e[6] | ((uint16_t)e[7] << 8));
     }
     pos -= (int64_t)normal_n * 4;
-    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, pos, SEEK_SET);
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, tmp, normal_n * 4u) <
-        (int)(normal_n * 4u)) goto bad;
+    md_seek(fd, pos);
+    if (md_read(fd, tmp, normal_n * 4u) < (int)(normal_n * 4u)) goto bad;
     for (uint16_t k = 0; k < normal_n; k++) {
         const uint8_t *e = tmp + (uint32_t)k * 4u;
         s_md_id[k] = (uint16_t)(e[0] | ((uint16_t)e[1] << 8));
@@ -2051,14 +2101,14 @@ static int md_load_fd(int fd)
     }
     return 0;
 bad:
-    ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+    md_close(fd);
     s_md_fd = -1;
     return -6;
 }
 
 static int md_load(const char *path)
 {
-    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
+    int fd = md_open(path);
     if (fd < 0) return -1;
     return md_load_fd(fd);   /* closes fd itself on failure */
 }
@@ -2069,8 +2119,8 @@ static int md_tm_row(uint16_t z, uint16_t ty, uint16_t *row)
     if (ty >= s_md_y) return -1;
     int64_t off = s_md_tm_off +
         (int64_t)(z * s_md_y + ty) * s_md_x * 2;
-    ((posix_lseek_fn)vfn(FW_LSEEK))(s_md_fd, off, SEEK_SET);
-    return ((md_rd_fn)vfn(FW_POSIX_READ))(s_md_fd, row, s_md_x * 2u) <
+    md_seek(s_md_fd, off);
+    return md_read(s_md_fd, row, s_md_x * 2u) <
                    (int)(s_md_x * 2u) ? -1 : 0;
 }
 
