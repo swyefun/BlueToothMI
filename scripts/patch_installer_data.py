@@ -171,16 +171,17 @@ if 'data recheck' not in s:
     assert anchor3 in s, 'result anchor missing'
     s = s.replace(anchor3, new3, 1)
 
-# 4. on-screen log viewer: whole log loaded into one scrollable view.
-if 'log viewer' not in s:
+# 4. log viewer (whole log, scrollable) + half-width clear-log button.
+if 'clearlog' not in s:
     L = []
     a = L.append
-    a('-- bsvm log viewer: whole log in one scrollable view\n')
+    a('-- bsvm log viewer: whole log in one scrollable view + clear button\n')
     a('do\n')
     a('    local LOGP = "/data/canopus/bsvm_log.txt"\n')
-    a('    local f = io.open(LOGP, "rb")\n')
-    a('    local blob\n')
-    a('    if f then\n')
+    a('    local loglabel\n')
+    a('    local function readlog()\n')
+    a('        local f = io.open(LOGP, "rb")\n')
+    a('        if not f then return nil end\n')
     a('        local acc = {}\n')
     a('        while true do\n')
     a('            local piece = f:read(4096)\n')
@@ -188,29 +189,75 @@ if 'log viewer' not in s:
     a('            acc[#acc + 1] = piece\n')
     a('        end\n')
     a('        pcall(f.close, f)\n')
-    a('        blob = table.concat(acc)\n')
+    a('        return table.concat(acc)\n')
     a('    end\n')
-    a('    if not blob or #blob == 0 then\n')
-    a('        status:set { text = "日志为空", text_color = 0xFF9A9A }\n')
-    a('    else\n')
+    a('    local function refresh()\n')
+    a('        local blob = readlog()\n')
+    a('        if not blob or #blob == 0 then\n')
+    a('            status:set { text = "日志为空", text_color = 0xFF9A9A }\n')
+    a('            if loglabel then loglabel:set { text = "" } end\n')
+    a('            return\n')
+    a('        end\n')
     a('        if #blob > 131072 then\n')
     a('            blob = "（仅显示最后 128KB）\\n" .. blob:sub(-131072)\n')
     a('        end\n')
     a('        status:set { text = "" }\n')
-    a('        local box = lvgl.Object(root, {\n')
-    a('            w = width - 32, h = height - 190,\n')
-    a('            bg_opa = lvgl.OPA(0), border_width = 0,\n')
-    a('            align = { type = lvgl.ALIGN.TOP_MID, x_ofs = 0, y_ofs = 106 },\n')
-    a('        })\n')
-    a('        if lvgl.FLAG.EVENT_BUBBLE then box:add_flag(lvgl.FLAG.EVENT_BUBBLE) end\n')
-    a('        lvgl.Label(box, {\n')
-    a('            text = blob, text_color = 0xBFD9FF,\n')
-    a('            text_font = lvgl.Font("MiSans-Regular", width < 300 and 14 or 16),\n')
-    a('            w = width - 44,\n')
-    a('        })\n')
+    a('        if loglabel then\n')
+    a('            loglabel:set { text = blob }\n')
+    a('        else\n')
+    a('            local box = lvgl.Object(root, {\n')
+    a('                w = width - 32, h = height - 190,\n')
+    a('                bg_opa = lvgl.OPA(0), border_width = 0,\n')
+    a('                align = { type = lvgl.ALIGN.TOP_MID, x_ofs = 0, y_ofs = 106 },\n')
+    a('            })\n')
+    a('            if lvgl.FLAG.EVENT_BUBBLE then box:add_flag(lvgl.FLAG.EVENT_BUBBLE) end\n')
+    a('            loglabel = lvgl.Label(box, {\n')
+    a('                text = blob, text_color = 0xBFD9FF,\n')
+    a('                text_font = lvgl.Font("MiSans-Regular", width < 300 and 14 or 16),\n')
+    a('                w = width - 44,\n')
+    a('            })\n')
+    a('        end\n')
     a('    end\n')
+    a('    refresh()\n')
+    a('    -- clear-log button: right half of the bottom row\n')
+    a('    local btn_w = (width - 48 - 8) / 2\n')
+    a('    local clearlog = lvgl.Object(root, {\n')
+    a('        w = btn_w, h = 48,\n')
+    a('        bg_color = 0x8A5014, bg_opa = lvgl.OPA(100), border_width = 0,\n')
+    a('        align = { type = lvgl.ALIGN.TOP_RIGHT, x_ofs = -24, y_ofs = height - 68 },\n')
+    a('    })\n')
+    a('    clearlog:clear_flag(lvgl.FLAG.SCROLLABLE)\n')
+    a('    clearlog:add_flag(lvgl.FLAG.CLICKABLE)\n')
+    a('    if lvgl.FLAG.EVENT_BUBBLE then clearlog:add_flag(lvgl.FLAG.EVENT_BUBBLE) end\n')
+    a('    lvgl.Label(clearlog, {\n')
+    a('        text = "清空日志", text_color = 0xFFFFFF,\n')
+    a('        text_font = lvgl.Font("MiSans-Regular", 16),\n')
+    a('        align = lvgl.ALIGN.CENTER,\n')
+    a('    })\n')
+    a('    clearlog:onevent(lvgl.EVENT.CLICKED, function()\n')
+    a('        local f = io.open(LOGP, "wb")\n')
+    a('        if f then pcall(f.close, f) end\n')
+    a('        refresh()\n')
+    a('    end)\n')
     a('end\n')
     s = s + '\n' + ''.join(L)
+
+# 5. install button shrinks to the left half of the bottom row.
+if 'clearlog' in s and 'x_ofs = 24, y_ofs = height - 68' not in s:
+    anchor5 = (
+        'local install_button = lvgl.Object(root, {\n'
+        '    w = width - 48, h = 48,\n'
+        '    bg_color = 0x14508A, bg_opa = lvgl.OPA(100), border_width = 0,\n'
+        '    align = { type = lvgl.ALIGN.TOP_MID, x_ofs = 0, y_ofs = height - 68 },\n'
+        '})\n')
+    new5 = (
+        'local install_button = lvgl.Object(root, {\n'
+        '    w = (width - 48 - 8) / 2, h = 48,\n'
+        '    bg_color = 0x14508A, bg_opa = lvgl.OPA(100), border_width = 0,\n'
+        '    align = { type = lvgl.ALIGN.TOP_LEFT, x_ofs = 24, y_ofs = height - 68 },\n'
+        '})\n')
+    assert anchor5 in s, 'install button anchor missing'
+    s = s.replace(anchor5, new5, 1)
 
 io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
 print('generated installer lua patched for streamed data payload + scrollable log viewer')
