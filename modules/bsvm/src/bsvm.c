@@ -53,11 +53,13 @@ static const struct canopus_context_v1 *s_ctx;
 #define FW_IMAGE_CREATE 0x0c3ae1d1u /* void *lv_image_create(parent)                 */
 #define FW_IMAGE_SET_SRC 0x0c3b2c29u /* void lv_image_set_src(obj, const char *path) */
 #define FW_OBJ_ADD_FLAG 0x0c38404du /* void lvx_object_add_flag(obj, flag)           */
+#define FW_OBJ_CREATE  0x0c380687u /* void *lvx_object_create(parent)               */
 #define FW_OBJ_CLEAR_FLAG 0x0c3840d9u /* void lv_obj_clear_flag(obj, flag)           */
 #define FW_EVENT_ADD    0x0c37fc1du /* void *lv_obj_add_event_cb(obj,cb,code,ud)     */
 #define FW_PAGE_FINISH  0x0c69b5adu /* int32 page_finish(struct page_descriptor *)   */
 #define LV_FLAG_HIDDEN    1u        /* firmware family: HIDDEN=0x01, SCROLLABLE=0x10 */
 #define LV_FLAG_CLICKABLE 2u        /* (manager host_set_hidden/host_object_flag)    */
+#define LV_FLAG_SCROLLABLE 0x10u
 #define LV_EVENT_CLICKED  7u        /* manager HOST_EVENT_CLICKED                    */
 #define TITLE_PATH      "/data/bsvm_title.bin"
 
@@ -1794,8 +1796,9 @@ static uint8_t  s_at_cache[MD_AT_CACHE][96u * 64u];
 static int16_t  s_at_slot_blk[MD_AT_CACHE];
 static uint32_t s_at_slot_tick[MD_AT_CACHE];
 static uint32_t s_at_tick;
-static uint32_t s_md_band[212u * 32u];        /* one 212x32 strip */
+static uint32_t s_md_band[512u * 32u];        /* strip buffer (viewer full-map width 512) */
 static int      s_md_band_y0;                 /* view-y of strip top */
+static int      s_md_w = 212;                 /* strip width in view px */
 
 typedef int (*md_rd_fn)(int, void *, uint32_t);
 
@@ -1891,11 +1894,11 @@ static void md_rect_blit_any(int tx, int ty, int vx0, int vy0, int vw, int vh,
         if (r < 0 || r >= 32) continue;
         int syy = sy + (yy * sh) / vh;
         if (syy >= bh) syy = bh - 1;
-        uint32_t *row = s_md_band + (uint32_t)r * MD_VIEW_W;
+        uint32_t *row = s_md_band + (uint32_t)r * s_md_w;
         const uint8_t *src = base + (uint32_t)syy * 64u;
         for (int xx = 0; xx < vw; xx++) {
             int vx = bx + xx;
-            if (vx < 0 || vx >= (int)MD_VIEW_W) continue;
+            if (vx < 0 || vx >= s_md_w) continue;
             int sxx = sx + (xx * sw) / vw;
             if (sxx >= sx + sw) sxx = sx + sw - 1;
             uint8_t c = src[sxx];
@@ -1923,12 +1926,12 @@ static void md_cell_blit(int fd, uint32_t cell_off, uint16_t idx,
     for (int yy = 0; yy < 16; yy++) {
         int r = by0 + yy;
         if (r < 0 || r >= 32) continue;
-        uint32_t *row = s_md_band + (uint32_t)r * MD_VIEW_W;
+        uint32_t *row = s_md_band + (uint32_t)r * s_md_w;
         const uint8_t *s0 = cell + (yy * 2) * 32u;
         const uint8_t *s1 = s0 + 32u;
         for (int xx = 0; xx < 16; xx++) {
             int vx = bx + xx;
-            if (vx < 0 || vx >= (int)MD_VIEW_W) continue;
+            if (vx < 0 || vx >= s_md_w) continue;
             uint8_t c = s0[xx * 2];
             if (c == 0) c = s0[xx * 2 + 1];
             if (c == 0) c = s1[xx * 2];
@@ -2129,6 +2132,8 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
 {
     /* stream-render the window in 32-view-row strips (GPU-decoder file) */
     if (s_md_fd < 0) return -1;
+    if (w <= 0 || w > 512) return -8;      /* strip buffer width cap */
+    s_md_w = w;
     int fo = ((posix_open_fn)vfn(FW_POSIX_OPEN))(out_path,
                                                  O_RDWR | O_CREAT, 0666);
     if (fo < 0) return -7;
@@ -2146,7 +2151,7 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
     int wy = 0;
     while (wy < h) {
         int strip_h = (h - wy < 32) ? (h - wy) : 32;
-        for (uint32_t i = 0; i < MD_VIEW_W * 32u; i++) s_md_band[i] = 0xFF000000u;
+        for (uint32_t i = 0; i < (uint32_t)s_md_w * 32u; i++) s_md_band[i] = 0xFF000000u;
         s_md_band_y0 = cy0 + wy;
         uint32_t t0 = (uint32_t)(s_md_band_y0 / 16);
         uint32_t t1 = (uint32_t)((s_md_band_y0 + strip_h + 15) / 16);
@@ -2210,10 +2215,10 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
                             int r = by + yy;
                             if (r < 0 || r >= 32) continue;
                             uint32_t *brow = s_md_band +
-                                (uint32_t)r * MD_VIEW_W;
+                                (uint32_t)r * s_md_w;
                             for (int xx = 0; xx < 8; xx++) {
                                 int vx = bx + xx;
-                                if (vx < 0 || vx >= (int)MD_VIEW_W) continue;
+                                if (vx < 0 || vx >= s_md_w) continue;
                                 uint32_t px = brow[vx];
                                 brow[vx] = ((px >> 1) & 0x7F7F7F7Fu) |
                                            (px & 0xFF000000u);
@@ -2260,7 +2265,7 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
         }
         for (int yy = 0; yy < strip_h; yy++) {
             ((posix_write_fn)vfn(FW_POSIX_WRITE))(
-                fo, s_md_band + (uint32_t)yy * MD_VIEW_W,
+                fo, s_md_band + (uint32_t)yy * s_md_w,
                 (uint32_t)w * 4u);
         }
         wy += strip_h;
@@ -2279,46 +2284,13 @@ static int map_compose(void)
 
 /* ---------------- seisen map viewer (test page) ----------------
  * Triggered by the presence of /data/bsvm_seisen_mapdata.bin.
- * 212x420 map window + 5 buttons (pan / exit). Panning re-renders
- * the window into one of two alternating files so the firmware
- * re-decodes and shows the new view. Exit via FW_PAGE_FINISH. */
-#define MV_W 212
-#define MV_H 420
-#define MV_STEP_X 106
-#define MV_STEP_Y 140
-
+ * The WHOLE map is composed once into one scrollable image (tiles are
+ * 16 view-px; seisen = 512x560 -> ~1.1MB GPU file) inside an LVGL
+ * scrollable container: panning is native touch drag, no re-render.
+ * Slim exit bar at the bottom via FW_PAGE_FINISH. */
+static void *s_mv_box;
 static void *s_mv_img;
-static void *s_mv_btn[5];
-static int s_mv_cx, s_mv_cy;
-static int s_mv_flip;
 
-static void mv_redraw(void)
-{
-    static const char *const paths[2] = {VIEW_A_PATH, VIEW_B_PATH};
-    const char *p = paths[s_mv_flip & 1];
-    s_mv_flip ^= 1;
-    if (md_render_window(p, s_mv_cx, s_mv_cy, MV_W, MV_H) != 0) return;
-    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
-        s_mv_img, p);
-}
-
-static void mv_pan(int dx, int dy)
-{
-    int mwx = (int)s_md_x * 16 - MV_W;
-    int mwy = (int)s_md_y * 16 - MV_H;
-    s_mv_cx += dx;
-    s_mv_cy += dy;
-    if (s_mv_cx < 0) s_mv_cx = 0;
-    if (s_mv_cx > mwx) s_mv_cx = mwx;
-    if (s_mv_cy < 0) s_mv_cy = 0;
-    if (s_mv_cy > mwy) s_mv_cy = mwy;
-    mv_redraw();
-}
-
-static void cb_mv_left(void *e)  { (void)e; mv_pan(-MV_STEP_X, 0); }
-static void cb_mv_right(void *e) { (void)e; mv_pan(MV_STEP_X, 0); }
-static void cb_mv_up(void *e)    { (void)e; mv_pan(0, -MV_STEP_Y); }
-static void cb_mv_down(void *e)  { (void)e; mv_pan(0, MV_STEP_Y); }
 static void cb_mv_exit(void *e)
 {
     (void)e;
@@ -2327,38 +2299,48 @@ static void cb_mv_exit(void *e)
 
 static void viewer_start(void *root)
 {
-    s_mv_cx = 0;
-    s_mv_cy = 0;
-    s_mv_flip = 0;
     void *font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)
                   VENA(FW_FONT_CREATE))("MiSans-Regular", 18u, 0u);
-    s_mv_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(root);
-    if (s_mv_img != 0) {
+    int mw = (int)s_md_x * 16;
+    int mh = (int)s_md_y * 16;
+    if (md_render_window(VIEW_A_PATH, 0, 0, mw, mh) != 0) {
+        void *lbl = ui_label(root, 0, 240, 212, 40, 0, font);
+        if (lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                lbl, "MV-RENDER-FAIL");
+        }
+        return;
+    }
+    /* scrollable viewport + full-map image (native drag pan) */
+    s_mv_box = ((void *(*)(void *))(uintptr_t)VENA(FW_OBJ_CREATE))(root);
+    if (s_mv_box != 0) {
         ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
-            s_mv_img, MV_W, MV_H);
+            s_mv_box, 212, 420);
         ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
-            FW_OBJ_ALIGN))(s_mv_img, ALIGN_TOP_LEFT, 0, 0);
-    }
-    /* 左 右 上 下 退出 (MiSans has CJK; ASCII arrows may be missing) */
-    static const char *const txt[5] = {
-        "\xE5\xB7\xA6", "\xE5\x8F\xB3", "\xE4\xB8\x8A", "\xE4\xB8\x8B",
-        "\xE9\x80\x80\xE5\x87\xBA"
-    };
-    static void (*const cbs[5])(void *) = {
-        cb_mv_left, cb_mv_right, cb_mv_up, cb_mv_down, cb_mv_exit
-    };
-    for (int i = 0; i < 5; i++) {
-        void *lbl = ui_label(root, i * 42, 424, 42, 40, 0, font);
-        s_mv_btn[i] = lbl;
-        if (lbl == 0) continue;
-        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-            lbl, txt[i]);
+            FW_OBJ_ALIGN))(s_mv_box, ALIGN_TOP_LEFT, 0, 0);
         ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-            lbl, LV_FLAG_CLICKABLE);
-        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-            uintptr_t)VENA(FW_EVENT_ADD))(lbl, cbs[i], LV_EVENT_CLICKED, 0);
+            s_mv_box, LV_FLAG_SCROLLABLE);
+        s_mv_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(s_mv_box);
+        if (s_mv_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_mv_img, mw, mh);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+                FW_OBJ_ALIGN))(s_mv_img, ALIGN_TOP_LEFT, 0, 0);
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_mv_img, VIEW_A_PATH);
+        }
     }
-    mv_redraw();
+    /* exit bar (sibling of the scroll box: stays fixed at the bottom) */
+    void *exit_lbl = ui_label(root, 0, 424, 212, 40, 0, font);
+    if (exit_lbl != 0) {
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+            exit_lbl, "\xE9\x80\x80\xE5\x87\xBA");
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+            exit_lbl, LV_FLAG_CLICKABLE);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(exit_lbl, cb_mv_exit,
+                                          LV_EVENT_CLICKED, 0);
+    }
 }
 
 /* ---------------- module lifecycle ---------------- */
