@@ -478,13 +478,6 @@ static int bsvm_load(void)
     /* all sections are in RAM now; close the service fd so raw-VFS log
      * writes during the run never overlap a framework handle */
     fs->close(s_ctx, fd);
-    /* pool-aliasing probe: if the loader under-allocated bss, s_dir
-     * overlaps s_evt and the first words match */
-    log_kv("d0", rd32(s_dir));
-    log_kv("e0", rd32(s_evt));
-    log_kv("b0", rd32(s_db));
-    log_flush();
-
     /* parse directory (bounds-checked; sub-markers pinpoint crashes) */
     uint32_t p = 0;
     s_strn = rd32(s_dir + p); p += 4;
@@ -765,8 +758,6 @@ static void run_slice(uint32_t budget)
         if (r != 0) {
             if (r < 0) log_kv("err-at", s_pc);
             s_batch_active = 0u;
-            log_kv("END entry", s_entry_idx);
-            if (s_steps > STEPS_PER_ENTRY) log_kv("LONG", s_steps);
             next_entry();
             if (s_phase == 2u) return;
             /* flush only when the buffer is near full or every 256 entries:
@@ -887,10 +878,6 @@ static void ui_pick_story(void)
     s_pc = s_story_off;
     s_ui_mode = 1u;
     s_dwell = 0u;
-    log_kv("story-ce", (uint32_t)best_ce);
-    log_kv("story-off", s_story_off);
-    log_kv("story-end", s_story_end);
-    log_kv("story-texts", best_texts);
 }
 
 static void ui_set_scene(const char *txt)
@@ -929,7 +916,6 @@ static int ui_run_until_text(void)
                                                  * continues after this line */
             if (str_get(idx, txt, (int)sizeof(txt)) >= 0) {
                 ui_set_dlg(txt);
-                log_line("SHOW-TEXT");
                 return 1;
             }
             continue;
@@ -980,15 +966,11 @@ static void cb_continue(void *e)
 {
     (void)e;
     /* stock scene: disabled when no save exists - band has no save system */
-    log_line("TITLE-CONTINUE");
-    log_flush();
 }
 
 static void cb_end(void *e)
 {
     (void)e;
-    log_line("TITLE-END");
-    log_flush();
     (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
 }
 
@@ -997,8 +979,6 @@ static void title_tick(void *arg)
     (void)arg;
     if (s_started) return;
     if (s_countdown > 0u) { s_countdown--; return; }
-    log_line("TITLE-AUTOSTART");
-    log_flush();
     prologue_start();
 }
 
@@ -1006,8 +986,6 @@ static void cb_new_game(void *e)
 {
     (void)e;
     if (s_started) return;
-    log_line("TITLE-NEWGAME");
-    log_flush();
     prologue_start();
 }
 
@@ -1077,7 +1055,6 @@ static void cb_advance(void *e)
     (void)e;
     if (!s_pro_on || s_pro_kb) return;
     if (s_prologue[s_pro_idx].type != PSTEP_TEXT) return;
-    log_line("PRO-ADVANCE");
     s_pro_wait = 0;
     s_pro_idx++;
     prologue_show_step();
@@ -1134,9 +1111,7 @@ static void prologue_stop(int back_to_title)
         s_countdown = 12u;
         s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
             title_tick, 1000u, 0);
-        log_line("PROLOGUE-DONE");
     }
-    log_flush();
 }
 
 static void prologue_key(int n)
@@ -1155,7 +1130,6 @@ static void prologue_key(int n)
         }
         s_pname[s_pname_n] = '\0';
         s_pro_kb = 0;
-        log_kv("pro-name", s_pname_n);
         obj_show(s_map_img);
         obj_show(s_box_img);
         for (int i = 0; i < 28; i++) obj_hide(s_key_lbl[i]);
@@ -1182,9 +1156,6 @@ static void prologue_pick(int n)
 {
     const PrologueStep *st = &s_prologue[s_pro_idx];
     if (!s_pro_on || n >= st->nchoice) return;
-    log_kv("pro-choice", (uint32_t)n);
-    log_kv("pro-choice-t", st->choice_text[n]);
-    log_flush();
     s_pro_idx = st->choice_next[n];
     prologue_show_step();
 }
@@ -1193,8 +1164,6 @@ static void prologue_show_step(void)
 {
     const PrologueStep *st = &s_prologue[s_pro_idx];
     prologue_hide_all();
-    log_kv("pro-step", s_pro_idx);
-    log_kv("pro-type", st->type);
 
     if (st->type == PSTEP_END) {
         prologue_stop(1);
@@ -1281,8 +1250,6 @@ static void prologue_start(void)
     s_pro_idx = 0;
     s_pname_n = 0;
     s_pname[0] = '\0';
-    log_line("PROLOGUE-START");
-    log_flush();
 
     /* hide the title layer */
     obj_hide(s_title_img);
@@ -1302,8 +1269,10 @@ static void prologue_start(void)
              * on failure MAP_PATH still holds the installer-streamed baked
              * map, so always point the widget at it */
             int mc = map_compose();
-            log_kv("map-compose", (uint32_t)(mc == 0 ? 0u : (uint32_t)(-mc)));
-            log_flush();
+            if (mc != 0) {
+                log_kv("map-compose", (uint32_t)(-mc));
+                log_flush();
+            }
             ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
                 s_map_img, MAP_PATH);
             ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
@@ -1420,7 +1389,6 @@ static void prologue_tick(void *arg)
     if (st->type != PSTEP_TEXT || s_pro_wait == 0u) return;
     s_pro_wait--;
     if (s_pro_wait == 0u) {
-        log_line("PRO-AUTO");
         s_pro_idx++;
         prologue_show_step();
     }
@@ -1433,24 +1401,6 @@ static void bsvm_tick(void *arg)
     if (s_phase == 2u && s_timer != 0) {
         ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
         s_timer = 0;
-        log_line("ALL-DONE");
-        /* opcode histogram: only non-zero entries, format "opNN <count>" */
-        for (uint32_t op = 0u; op < 256u; op++) {
-            if (s_opcnt[op] == 0u) continue;
-            char key[8];
-            key[0] = 'o'; key[1] = 'p';
-            uint32_t v = op;
-            char hex[2];
-            hex[0] = (v >> 4) < 10u ? (char)('0' + (v >> 4)) : (char)('A' + (v >> 4) - 10u);
-            hex[1] = (v & 15u) < 10u ? (char)('0' + (v & 15u)) : (char)('A' + (v & 15u) - 10u);
-            key[2] = hex[0]; key[3] = hex[1]; key[4] = '\0';
-            log_kv(key, s_opcnt[op]);
-        }
-        log_kv("entries", s_total_entries);
-        log_kv("done", s_runs_done);
-        log_kv("bad", s_runs_bad);
-        log_kv("steps", s_total_steps);
-        log_flush();
         if (s_label != 0) {
             ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM OK");
         }
@@ -1502,40 +1452,24 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
         ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_label, "BSVM");
     }
     s_ok_init = 0;
-    log_line("BSVM create");
-    log_flush();
     int rc = bsvm_load();
     if (rc == 0) {
         s_ok_init = 1u;
         s_root = root;
-        log_line("BSVM start");
-        log_kv("entries", s_total_entries);
-        log_kv("fsize", s_probe_size);
-        log_kv("evt", s_evt_len);
-        log_kv("db", s_db_len);
-        log_kv("dir", s_dir_len_v);
-        log_kv("strn", s_strn);
         /* headless escape hatch: /data/bsvm_headless.txt present => old full run */
         {
             int hfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_headless.txt", O_RDONLY);
             if (hfd >= 0) {
                 ((posix_close_fn)vfn(FW_POSIX_CLOSE))(hfd);
-                log_line("MODE headless");
-                log_flush();
                 s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
                     bsvm_tick, 50u, 0);
             } else {
-                log_line("MODE title");
                 /* CJK font: watchfaces render Chinese with MiSans; the native
                  * default font has no CJK glyphs (boxes on device) */
-                log_line("font-create");
-                log_flush();
                 s_cjk_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
                     "MiSans-Regular", 18u, 0u);
                 s_title_font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)VENA(FW_FONT_CREATE))(
                     "MiSans-Regular", 26u, 0u);
-                log_kv("font", (uint32_t)(uintptr_t)s_cjk_font);
-                log_kv("tfont", (uint32_t)(uintptr_t)s_title_font);
                 /* background: /data/bsvm_title.bin (mist.png pre-stretched to
                  * 212x520 in the firmware GPU-decoder format; decoded by the
                  * firmware render task, zero module RAM) */
@@ -1548,7 +1482,6 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
                     ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
                         s_title_img, TITLE_PATH);
                 }
-                log_kv("img", (uint32_t)(uintptr_t)s_title_img);
                 /* game title text, upper half, centered (stock draw_game_title) */
                 s_title_lbl = ui_label(root, 0, 0, 0, 0, 0, s_title_font);
                 if (s_title_lbl != 0) {
@@ -1673,22 +1606,6 @@ static void bsvm_tick_ctx(const struct canopus_context_v1 *ctx, int32_t timer_id
     (void)timer_id; (void)user_data;
     run_slice(400u);
     if (s_phase == 2u) {
-        log_line("ALL-DONE");
-        for (uint32_t op = 0u; op < 256u; op++) {
-            if (s_opcnt[op] == 0u) continue;
-            char key[8];
-            key[0] = 'o'; key[1] = 'p';
-            uint32_t v = op;
-            key[2] = (v >> 4) < 10u ? (char)('0' + (v >> 4)) : (char)('A' + (v >> 4) - 10u);
-            key[3] = (v & 15u) < 10u ? (char)('0' + (v & 15u)) : (char)('A' + (v & 15u) - 10u);
-            key[4] = '\0';
-            log_kv(key, s_opcnt[op]);
-        }
-        log_kv("entries", s_total_entries);
-        log_kv("done", s_runs_done);
-        log_kv("bad", s_runs_bad);
-        log_kv("steps", s_total_steps);
-        log_flush();
         if (s_timer_id_ctx >= 0 && ctx->time != 0 && ctx->time->timer_destroy != 0) {
             (void)ctx->time->timer_destroy(ctx, s_timer_id_ctx);
             s_timer_id_ctx = -1;
@@ -1786,8 +1703,6 @@ static int32_t story_on_event(const struct canopus_context_v1 *ctx,
         if (!ui_run_until_text()) {
             s_ui_mode = 3u;
             ui_set_dlg("故事播放完毕");
-            log_line("STORY-DONE");
-            log_flush();
         }
     }
     return story_render(ctx, ui);
@@ -2305,9 +2220,6 @@ static void mv_pan(int dx, int dy)
     if (s_mv_cy < 0) s_mv_cy = 0;
     if (s_mv_cy > mwy) s_mv_cy = mwy;
     mv_redraw();
-    log_kv("mvx", (uint32_t)s_mv_cx);
-    log_kv("mvy", (uint32_t)s_mv_cy);
-    log_flush();
 }
 
 static void cb_mv_left(void *e)  { (void)e; mv_pan(-MV_STEP_X, 0); }
@@ -2317,8 +2229,6 @@ static void cb_mv_down(void *e)  { (void)e; mv_pan(0, MV_STEP_Y); }
 static void cb_mv_exit(void *e)
 {
     (void)e;
-    log_line("MV-EXIT");
-    log_flush();
     (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
 }
 
@@ -2356,10 +2266,6 @@ static void viewer_start(void *root)
             uintptr_t)VENA(FW_EVENT_ADD))(lbl, cbs[i], LV_EVENT_CLICKED, 0);
     }
     mv_redraw();
-    log_line("MV-READY");
-    log_kv("mw", s_md_x * 16u);
-    log_kv("mh", s_md_y * 16u);
-    log_flush();
 }
 
 /* ---------------- module lifecycle ---------------- */
@@ -2377,9 +2283,6 @@ static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
 {
     s_ctx = ctx;
     s_is_139 = target_is_139();
-    log_line("BSVM activate");
-    log_kv("t139", s_is_139);
-    log_flush();
 
     if (s_is_139) return 0;   /* .139: load happens in on_create (v0.3.2 flow) */
 
@@ -2389,12 +2292,6 @@ static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
     int rc = bsvm_load();
     if (rc == 0) {
         s_ok_init = 1u;
-        log_line("BSVM start");
-        log_kv("entries", s_total_entries);
-        log_kv("evt", s_evt_len);
-        log_kv("db", s_db_len);
-        log_kv("dir", s_dir_len_v);
-        log_kv("strn", s_strn);
     } else {
         log_load_failure(rc);
     }
@@ -2405,7 +2302,6 @@ static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
         headless = ctx->fs->exists(ctx, "/data/bsvm_headless.txt") > 0;
     }
     if (headless && s_ok_init) {
-        log_line("MODE headless");
         if (ctx->time != 0 && ctx->time->timer_create != 0) {
             s_timer_id_ctx = ctx->time->timer_create(ctx, 50u, 1, bsvm_tick_ctx, 0);
             if (s_timer_id_ctx >= 0 && ctx->time->timer_start != 0)
@@ -2416,12 +2312,10 @@ static int32_t bsvm_activate(const struct canopus_context_v1 *ctx)
         }
     } else if (headless) {
         log_line("HEADLESS-NODATA");
-    } else {
-        log_line("MODE story-ui");
     }
     if (ctx->ui != 0 && ctx->ui->set_entry != 0) {
         int32_t urc = ctx->ui->set_entry(ctx, &s_story_entry);
-        log_kv("set-entry", (uint32_t)urc);
+        if (urc != 0) log_kv("set-entry", (uint32_t)urc);
     } else {
         log_line("NO-UI-SERVICE");
     }
