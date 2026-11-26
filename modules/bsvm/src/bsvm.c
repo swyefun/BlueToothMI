@@ -1441,16 +1441,13 @@ static int bsvm_on_signal(void *page, uint32_t event, void *payload)
     return 0;
 }
 
-/* map-viewer / streaming composer paths (v2 self-describing mapdata) */
+/* map paths (v2 self-describing mapdata) */
 #define MAPDATA_PATH "/data/bsvm_mapdata.bin"
-#define SEISEN_PATH  "/data/bsvm_seisen_mapdata.bin"
-#define VIEW_A_PATH  "/data/bsvm_view_a.bin"
-#define VIEW_B_PATH  "/data/bsvm_view_b.bin"
+#define SEISEN_PATH  "/data/bsvm_seisen_mapdata.bin"   /* Map010, walk mode */
 
 static int md_load(const char *path);
 static int md_load_fd(int fd);
 static int md_open(const char *path);
-static void viewer_start(void *root);
 
 /* the .ko stays resident across app opens: every session-scoped static
  * must be cleared on create or the next open inherits stale run state
@@ -1510,25 +1507,6 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
 {
     (void)page; (void)start_data;
     session_reset();
-    /* map-viewer test mode: triggered by the seisen mapdata file */
-    {
-        log_line("MODE viewer");
-        log_flush();                     /* flush BEFORE opening the file */
-        int tfd = md_open(SEISEN_PATH);
-        if (tfd >= 0) {
-            int mrc = md_load_fd(tfd);   /* single open, owns tfd */
-            if (mrc == 0) {
-                viewer_start(root);
-                return 0;
-            }
-            log_line("MV-LOAD-FAIL");
-            log_kv("mvload", (uint32_t)(-mrc));
-            log_flush();
-        } else {
-            log_line("seisen-miss");
-            log_flush();
-        }
-    }
     s_label = ((void *(*)(void *))(uintptr_t)VENA(FW_LABEL_CREATE))(root);
     label_center(s_label);
     if (s_label != 0) {
@@ -2361,67 +2339,6 @@ static int map_compose(void)
                             (int)MD_VIEW_W, (int)s_md_y * 16);
 }
 
-/* ---------------- seisen map viewer (test page) ----------------
- * Triggered by the presence of /data/bsvm_seisen_mapdata.bin.
- * The WHOLE map is composed once into one scrollable image (tiles are
- * 16 view-px; seisen = 512x560 -> ~1.1MB GPU file) inside an LVGL
- * scrollable container: panning is native touch drag, no re-render.
- * Slim exit bar at the bottom via FW_PAGE_FINISH. */
-static void *s_mv_box;
-static void *s_mv_img;
-
-static void cb_mv_exit(void *e)
-{
-    (void)e;
-    (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
-}
-
-static void viewer_start(void *root)
-{
-    void *font = ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)
-                  VENA(FW_FONT_CREATE))("MiSans-Regular", 18u, 0u);
-    int mw = (int)s_md_x * 16;
-    int mh = (int)s_md_y * 16;
-    if (md_render_window(VIEW_A_PATH, 0, 0, mw, mh) != 0) {
-        void *lbl = ui_label(root, 0, 240, 212, 40, 0, font);
-        if (lbl != 0) {
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                lbl, "MV-RENDER-FAIL");
-        }
-        return;
-    }
-    /* scrollable viewport + full-map image (native drag pan) */
-    s_mv_box = ((void *(*)(void *))(uintptr_t)VENA(FW_OBJ_CREATE))(root);
-    if (s_mv_box != 0) {
-        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
-            s_mv_box, 212, 420);
-        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
-            FW_OBJ_ALIGN))(s_mv_box, ALIGN_TOP_LEFT, 0, 0);
-        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-            s_mv_box, LV_FLAG_SCROLLABLE);
-        s_mv_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(s_mv_box);
-        if (s_mv_img != 0) {
-            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
-                s_mv_img, mw, mh);
-            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
-                FW_OBJ_ALIGN))(s_mv_img, ALIGN_TOP_LEFT, 0, 0);
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
-                s_mv_img, VIEW_A_PATH);
-        }
-    }
-    /* exit bar (sibling of the scroll box: stays fixed at the bottom) */
-    void *exit_lbl = ui_label(root, 0, 424, 212, 40, 0, font);
-    if (exit_lbl != 0) {
-        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-            exit_lbl, "\xE9\x80\x80\xE5\x87\xBA");
-        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-            exit_lbl, LV_FLAG_CLICKABLE);
-        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-            uintptr_t)VENA(FW_EVENT_ADD))(exit_lbl, cb_mv_exit,
-                                          LV_EVENT_CLICKED, 0);
-    }
-}
-
 /* ---------------- walk mode: joystick movement ----------------
  * Faithful to the extracted RGSS scripts: 640x480 screen (20x15 tiles),
  * player-centered clamped camera, Game_Map#check_passage semantics
@@ -2580,6 +2497,19 @@ static void walk_tick(void *arg)
 
 static void walk_start(void *root)
 {
+    if (s_md_fd < 0) return;
+    /* walk test happens on the seisen map (Map010): swap the loaded
+     * mapdata from the prologue map; on any failure keep the prologue
+     * map so the walk still starts instead of a black screen */
+    {
+        int old_fd = s_md_fd;
+        int sfd = md_open(SEISEN_PATH);
+        if (sfd >= 0 && md_load_fd(sfd) == 0) {
+            md_close(old_fd);
+        } else {
+            s_md_fd = old_fd;   /* md_load_fd clobbers s_md_fd on failure */
+        }
+    }
     if (s_md_fd < 0) return;
     s_walk_on = 1;
     s_wx = (s_md_ptx >= 0) ? (uint16_t)s_md_ptx : 12u;
