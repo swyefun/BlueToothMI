@@ -1410,6 +1410,7 @@ static int bsvm_on_signal(void *page, uint32_t event, void *payload)
 #define VIEW_B_PATH  "/data/bsvm_view_b.bin"
 
 static int md_load(const char *path);
+static int md_load_fd(int fd);
 static void viewer_start(void *root);
 
 /* the .ko stays resident across app opens: every session-scoped static
@@ -1461,12 +1462,11 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
     session_reset();
     /* map-viewer test mode: triggered by the seisen mapdata file */
     {
+        log_line("MODE viewer");
+        log_flush();                     /* flush BEFORE opening the file */
         int tfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(SEISEN_PATH, O_RDONLY);
         if (tfd >= 0) {
-            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(tfd);
-            log_line("MODE viewer");
-            log_flush();
-            int mrc = md_load(SEISEN_PATH);
+            int mrc = md_load_fd(tfd);   /* single open, owns tfd */
             if (mrc == 0) {
                 viewer_start(root);
                 return 0;
@@ -1950,17 +1950,18 @@ static void md_draw_at(uint32_t tx, uint32_t ty, uint16_t v)
     }
 }
 
-static int md_load(const char *path)
+/* parse an already-open v2 mapdata file; takes ownership of fd (kept
+ * open as the streaming source on success, closed on failure). Each file
+ * is opened exactly once per session: probe-open + re-open of the same
+ * path made the firmware VFS return 0 bytes on the second handle
+ * (device log mvhdr0). */
+static int md_load_fd(int fd)
 {
-    /* open a v2 self-describing mapdata file and parse the tables.
-     * s_md_fd from a previous session is NOT closed here: the .ko stays
-     * resident across app opens, so that handle is dead and closing a
-     * recycled fd number could hit an unrelated file. md_load runs at
-     * most once per session, so plain overwrite is safe. */
     s_md_fd = -1;
     for (int i = 0; i < MD_AT_CACHE; i++) s_at_slot_blk[i] = -1;
-    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
-    if (fd < 0) return -1;
+    int64_t fsz = ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_END);
+    log_kv("mvsz", (uint32_t)(fsz < 0 ? 0u : (uint32_t)fsz));
+    ((posix_lseek_fn)vfn(FW_LSEEK))(fd, (int64_t)0, SEEK_SET);
     uint8_t hdr[16];
     int rr = ((md_rd_fn)vfn(FW_POSIX_READ))(fd, hdr, 16u);
     if (rr < 16 || hdr[0] != 'B' || hdr[1] != 'S' ||
@@ -2053,6 +2054,13 @@ bad:
     ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
     s_md_fd = -1;
     return -6;
+}
+
+static int md_load(const char *path)
+{
+    int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
+    if (fd < 0) return -1;
+    return md_load_fd(fd);   /* closes fd itself on failure */
 }
 
 static int md_tm_row(uint16_t z, uint16_t ty, uint16_t *row)
