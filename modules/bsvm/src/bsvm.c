@@ -165,7 +165,6 @@ static void *s_menu_cont;
 static void *s_menu_end;
 static void *s_title_font;
 static uint8_t s_started;       /* 0 title, 1 story running */
-static uint32_t s_countdown;    /* title auto-start seconds */
 struct firmware_page_descriptor;
 static struct firmware_page_descriptor s_bsvm_page;  /* fwd: defined below */
 
@@ -974,14 +973,6 @@ static void cb_end(void *e)
     (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
 }
 
-static void title_tick(void *arg)
-{
-    (void)arg;
-    if (s_started) return;
-    if (s_countdown > 0u) { s_countdown--; return; }
-    prologue_start();
-}
-
 static void cb_new_game(void *e)
 {
     (void)e;
@@ -1108,9 +1099,6 @@ static void prologue_stop(int back_to_title)
         obj_show(s_menu_cont);
         obj_show(s_menu_end);
         s_started = 0;
-        s_countdown = 12u;
-        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
-            title_tick, 1000u, 0);
     }
 }
 
@@ -1247,6 +1235,7 @@ static void prologue_start(void)
 {
     if (s_pro_on || !s_ok_init) return;
     s_pro_on = 1;
+    s_started = 1;
     s_pro_idx = 0;
     s_pname_n = 0;
     s_pname[0] = '\0';
@@ -1423,9 +1412,53 @@ static int bsvm_on_signal(void *page, uint32_t event, void *payload)
 static int md_load(const char *path);
 static void viewer_start(void *root);
 
+/* the .ko stays resident across app opens: every session-scoped static
+ * must be cleared on create or the next open inherits stale run state
+ * (s_pro_on blocked NEW GAME) and dangling widget pointers from the
+ * previous (destroyed) page. */
+static void session_reset(void)
+{
+    s_timer = 0;
+    s_ok_init = 0;
+    s_started = 0;
+    s_label = 0;
+    s_root = 0;
+    s_cjk_font = 0;
+    s_title_font = 0;
+    s_title_img = 0;
+    s_title_lbl = 0;
+    s_menu_ng = 0;
+    s_menu_cont = 0;
+    s_menu_end = 0;
+    s_map_img = 0;
+    s_box_img = 0;
+    s_face_img = 0;
+    s_plate_lbl = 0;
+    s_ptext_lbl = 0;
+    s_card_lbl = 0;
+    s_name_lbl = 0;
+    for (int i = 0; i < 4; i++) s_choice_lbl[i] = 0;
+    for (int i = 0; i < 28; i++) s_key_lbl[i] = 0;
+    s_pro_font = 0;
+    s_pro_on = 0;
+    s_pro_kb = 0;
+    s_pro_idx = 0;
+    s_pro_wait = 0;
+    s_pname_n = 0;
+    s_pname[0] = '\0';
+    s_ui_mode = 0;
+    s_dwell = 0;
+    s_pc = 0;
+    s_sp = 0;
+    s_steps = 0;
+    s_phase = 0;
+    s_batch_active = 0;
+}
+
 static int bsvm_on_create(void *page, void *root, void *start_data)
 {
     (void)page; (void)start_data;
+    session_reset();
     /* map-viewer test mode: triggered by the seisen mapdata file */
     {
         int tfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(SEISEN_PATH, O_RDONLY);
@@ -1520,10 +1553,7 @@ static int bsvm_on_create(void *page, void *root, void *start_data)
                     (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(uintptr_t)VENA(FW_EVENT_ADD))(
                         s_menu_end, cb_end, LV_EVENT_CLICKED, 0);
                 }
-                s_countdown = 12u;
                 log_flush();
-                s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(FW_TIMER_CREATE))(
-                    title_tick, 1000u, 0);
             }
         }
     } else {
@@ -1922,17 +1952,22 @@ static void md_draw_at(uint32_t tx, uint32_t ty, uint16_t v)
 
 static int md_load(const char *path)
 {
-    /* open a v2 self-describing mapdata file and parse the tables */
-    if (s_md_fd >= 0) {
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(s_md_fd);
-        s_md_fd = -1;
-    }
+    /* open a v2 self-describing mapdata file and parse the tables.
+     * s_md_fd from a previous session is NOT closed here: the .ko stays
+     * resident across app opens, so that handle is dead and closing a
+     * recycled fd number could hit an unrelated file. md_load runs at
+     * most once per session, so plain overwrite is safe. */
+    s_md_fd = -1;
     for (int i = 0; i < MD_AT_CACHE; i++) s_at_slot_blk[i] = -1;
     int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDONLY);
     if (fd < 0) return -1;
     uint8_t hdr[16];
-    if (((md_rd_fn)vfn(FW_POSIX_READ))(fd, hdr, 16u) < 16 ||
-        hdr[0] != 'B' || hdr[1] != 'S' || hdr[2] != 'M' || hdr[3] != 'D') {
+    int rr = ((md_rd_fn)vfn(FW_POSIX_READ))(fd, hdr, 16u);
+    if (rr < 16 || hdr[0] != 'B' || hdr[1] != 'S' ||
+        hdr[2] != 'M' || hdr[3] != 'D') {
+        log_kv("mvhdr", (uint32_t)(rr < 0 ? 0u : (uint32_t)rr));
+        log_kv("mvb0", rd32(hdr));
+        log_flush();
         ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
         return -2;
     }
