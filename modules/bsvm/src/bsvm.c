@@ -1044,7 +1044,7 @@ static void    *s_walk_joy[4];
 #define MAP_PATH   "/data/bsvm_map.bin"
 #define BOX_PATH   "/data/bsvm_box.bin"
 #define FACE_PATH  "/data/bsvm_face.bin"
-#define BOX_Y      404
+#define BOX_Y      244
 #define PNAME_DEFAULT "\xe6\xa0\xbc\xe6\x9e\x97"  /* 格林 */
 
 static void prologue_show_step(void);
@@ -1184,15 +1184,29 @@ static void prologue_pick(int n)
     prologue_show_step();
 }
 
+/* one-shot boot: the walk swap (mapdata close/open) + 12 sprite files +
+ * full-map compose are far too heavy to run inside a click callback --
+ * on-device both skip-prologue choices hard-froze the watch there */
+static void cb_walk_boot(void *arg)
+{
+    (void)arg;
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    walk_start(s_root);
+}
+
 static void prologue_show_step(void)
 {
     const PrologueStep *st = &s_prologue[s_pro_idx];
     prologue_hide_all();
 
     if (st->type == PSTEP_END) {
-        /* dialogs over: free movement on the character-make map */
+        /* dialogs over: free movement, booted outside the callback */
         prologue_stop(0);
-        walk_start(s_root);
+        s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(
+            FW_TIMER_CREATE))(cb_walk_boot, 120u, 0);
         return;
     }
 
@@ -1260,6 +1274,12 @@ static void prologue_show_step(void)
 
     if (st->type == PSTEP_NAME) {
         s_pro_kb = 1;
+        /* the keyboard replaces the dialog box (original shows only the
+         * name window over the map) */
+        obj_hide(s_box_img);
+        obj_hide(s_face_img);
+        obj_hide(s_ptext_lbl);
+        obj_hide(s_plate_lbl);
         ui_show(s_name_lbl, 1);
         for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 1);
         s_pro_wait = 0;
@@ -1289,7 +1309,7 @@ static void prologue_start(void)
         s_map_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(s_root);
         if (s_map_img != 0) {
             ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
-                s_map_img, 212, 384);
+                s_map_img, 212, 240);
             ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
                 s_map_img, ALIGN_TOP_LEFT, 0, 0);
             /* compose the GPU frame at runtime from the compact tile lib;
@@ -1357,7 +1377,7 @@ static void prologue_start(void)
                 ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
                     s_key_lbl[i], buf);
                 ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
-                    s_key_lbl[i], ALIGN_TOP_LEFT, 10 + (i % 7) * 28, 190 + (i / 7) * 44);
+                    s_key_lbl[i], ALIGN_TOP_LEFT, 10 + (i % 7) * 28, 244 + (i / 7) * 44);
                 ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
                     s_key_lbl[i], LV_FLAG_CLICKABLE);
                 (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
@@ -1374,7 +1394,7 @@ static void prologue_start(void)
                     ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
                         s_key_lbl[26], bk);
                     ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
-                        s_key_lbl[26], ALIGN_TOP_LEFT, 10 + 5 * 28, 190 + 3 * 44);
+                        s_key_lbl[26], ALIGN_TOP_LEFT, 10 + 5 * 28, 244 + 3 * 44);
                     ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
                         s_key_lbl[26], LV_FLAG_CLICKABLE);
                     (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
@@ -1386,7 +1406,7 @@ static void prologue_start(void)
                     ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
                         s_key_lbl[27], dn);
                     ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
-                        s_key_lbl[27], ALIGN_TOP_LEFT, 10 + 6 * 28, 190 + 3 * 44);
+                        s_key_lbl[27], ALIGN_TOP_LEFT, 10 + 6 * 28, 244 + 3 * 44);
                     ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
                         s_key_lbl[27], LV_FLAG_CLICKABLE);
                     (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
@@ -1796,7 +1816,6 @@ static const struct canopus_ui_entry_v1 s_story_entry = {
  *   - autotile blocks live in a small LRU cache (8 x 6KB)
  * RAM: palette 1K + tables ~1.3K + at cache 48K + 212x32 band 27K. */
 #define MD_VIEW_W    212u              /* band width (camera crop) */
-#define MD_CAM_X     94u               /* prologue camera x0 */
 #define MD_AT_MAX    24u               /* autotile blocks per map */
 #define MD_AT_CACHE  8u                /* LRU slots */
 
@@ -1814,6 +1833,7 @@ static int32_t  s_md_atoff[MD_AT_MAX];       /* file offset per block */
 static int32_t  s_md_tm_off;                 /* file offset: tilemap */
 static uint16_t s_md_x, s_md_y;              /* map dims in tiles */
 static int16_t  s_md_ptx, s_md_pty;          /* player spawn tile, -1 = none */
+static int16_t  s_md_npx, s_md_npy;          /* npc sprite tile, -1 = none */
 static int      s_md_fd = -1;                /* open mapdata fd */
 static int16_t  s_md_ev[64];                 /* blocking events (x,y pairs) */
 static uint16_t s_md_ev_n;
@@ -2097,9 +2117,10 @@ static int md_load_fd(int fd)
     s_md_x = mx;
     s_md_y = my;
     s_md_cells_off = 16 + 768;
-    /* the tail (backwards): spawn i16x2, at table 8B each, id table 4B each */
+    /* the tail (backwards): spawn i16x2, npc i16x2, ev count, ev pairs,
+     * at table 8B each, id table 4B each */
     int64_t need = 16 + 768 + (int64_t)normal_n * 1024 +
-                   (int64_t)4 * mx * my * 2 + normal_n * 4 + at_n * 8 + 4;
+                   (int64_t)4 * mx * my * 2 + normal_n * 4 + at_n * 8 + 8;
     if (fsz < need) {
         md_close(fd);
         s_md_fd = -1;
@@ -2114,7 +2135,18 @@ static int md_load_fd(int fd)
     if (md_read(fd, spawn, 4u) < 4) goto bad;
     s_md_ptx = (int16_t)(spawn[0] | ((uint16_t)spawn[1] << 8));
     s_md_pty = (int16_t)(spawn[2] | ((uint16_t)spawn[3] << 8));
-    /* blocking events: pairs then u16 count (count at fsize-6) */
+    /* npc sprite tile just before the spawn (cell normal_n+12) */
+    pos -= 4;
+    md_seek(fd, pos);
+    uint8_t npcb[4];
+    if (md_read(fd, npcb, 4u) < 4) goto bad;
+    s_md_npx = (int16_t)(npcb[0] | ((uint16_t)npcb[1] << 8));
+    s_md_npy = (int16_t)(npcb[2] | ((uint16_t)npcb[3] << 8));
+    if (s_md_npx >= (int16_t)mx || s_md_npy >= (int16_t)my) {
+        s_md_npx = -1;
+        s_md_npy = -1;
+    }
+    /* blocking events: pairs then u16 count (count just before the npc) */
     pos -= 2;
     md_seek(fd, pos);
     uint8_t evb[2];
@@ -2320,6 +2352,14 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
                          (uint16_t)(s_md_normal_n - 1u),
                          (int)s_md_ptx, (int)s_md_pty);
         }
+        /* npc (alice) at its map tile; cell sits after the 12 knight
+         * walk frames (index normal_n + 12) */
+        if (s_md_npx >= 0 && t0 <= (uint32_t)s_md_npy &&
+            (uint32_t)s_md_npy < t1) {
+            md_cell_blit(s_md_fd, (uint32_t)s_md_cells_off,
+                         (uint16_t)(s_md_normal_n + 12u),
+                         (int)s_md_npx, (int)s_md_npy);
+        }
         for (int yy = 0; yy < strip_h; yy++) {
             ((posix_write_fn)vfn(FW_POSIX_WRITE))(
                 fo, s_md_band + (uint32_t)yy * s_md_w,
@@ -2335,8 +2375,23 @@ static int map_compose(void)
 {
     int rc = md_load(MAPDATA_PATH);
     if (rc != 0) return rc;
-    return md_render_window(MAP_PATH, (int)MD_CAM_X, 0,
-                            (int)MD_VIEW_W, (int)s_md_y * 16);
+    /* RGSS-faithful prologue view: the game screen is 640x480 = 20x15
+     * tiles (Graphics.resize_screen); at 16 view-px the band fits 15
+     * rows (212x240) and the camera centers on the player, clamped to
+     * the map edges (Game_Player#update_scroll). */
+    int vw = (int)MD_VIEW_W;
+    int vh = 15 * 16;
+    int px = (s_md_ptx >= 0) ? ((int)s_md_ptx * 16 + 8)
+                             : ((int)s_md_x * 16 / 2);
+    int py = (s_md_pty >= 0) ? ((int)s_md_pty * 16 + 8)
+                             : ((int)s_md_y * 16 / 2);
+    int cx0 = px - vw / 2;
+    int cy0 = py - vh / 2;
+    if (cx0 < 0) cx0 = 0;
+    if (cx0 > (int)s_md_x * 16 - vw) cx0 = (int)s_md_x * 16 - vw;
+    if (cy0 < 0) cy0 = 0;
+    if (cy0 > (int)s_md_y * 16 - vh) cy0 = (int)s_md_y * 16 - vh;
+    return md_render_window(MAP_PATH, cx0, cy0, vw, vh);
 }
 
 /* ---------------- walk mode: joystick movement ----------------
@@ -2495,22 +2550,45 @@ static void walk_tick(void *arg)
     }
 }
 
+static void walk_fail(void)
+{
+    s_walk_on = 0;
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+    /* back to a usable title so the user can retry NEW GAME */
+    obj_show(s_title_img);
+    obj_show(s_title_lbl);
+    obj_show(s_menu_ng);
+    obj_show(s_menu_cont);
+    obj_show(s_menu_end);
+    s_pro_on = 0;
+    s_started = 0;
+}
+
 static void walk_start(void *root)
 {
     if (s_md_fd < 0) return;
-    /* walk test happens on the seisen map (Map010): swap the loaded
-     * mapdata from the prologue map; on any failure keep the prologue
-     * map so the walk still starts instead of a black screen */
+    /* walk happens on the seisen map (Map010): swap the loaded mapdata
+     * from the prologue map. Close the prologue fd FIRST -- opening the
+     * second file while the first is still held can reuse the same
+     * handle number, and closing afterwards killed the live fd (device
+     * hard-freeze). On failure fall back to the prologue map. */
     {
         int old_fd = s_md_fd;
+        s_md_fd = -1;
+        if (old_fd >= 0) md_close(old_fd);
         int sfd = md_open(SEISEN_PATH);
-        if (sfd >= 0 && md_load_fd(sfd) == 0) {
-            md_close(old_fd);
-        } else {
-            s_md_fd = old_fd;   /* md_load_fd clobbers s_md_fd on failure */
+        if (!(sfd >= 0 && md_load_fd(sfd) == 0)) {
+            int pfd = md_open(MAPDATA_PATH);
+            if (pfd >= 0) (void)md_load_fd(pfd);
         }
     }
-    if (s_md_fd < 0) return;
+    if (s_md_fd < 0) {
+        walk_fail();
+        return;
+    }
     s_walk_on = 1;
     s_wx = (s_md_ptx >= 0) ? (uint16_t)s_md_ptx : 12u;
     s_wy = (s_md_pty >= 0) ? (uint16_t)s_md_pty : 18u;
@@ -2542,7 +2620,10 @@ static void walk_start(void *root)
         uint8_t cell[1024];
         md_seek(s_md_fd, (int64_t)s_md_cells_off +
                          (int64_t)(s_md_normal_n + f) * 1024);
-        if (md_read(s_md_fd, cell, 1024u) < 1024) return;
+        if (md_read(s_md_fd, cell, 1024u) < 1024) {
+            walk_fail();
+            return;
+        }
         uint8_t out[WALK_TILE * WALK_TILE * 4];
         for (int yy = 0; yy < WALK_TILE; yy++) {
             int sy0 = (yy * 32) / WALK_TILE;
@@ -2580,14 +2661,23 @@ static void walk_start(void *root)
         path[13] = (char)('0' + (f % 10));
         int fo = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDWR | O_CREAT,
                                                      0666);
-        if (fo >= 0) {
-            ((posix_write_fn)vfn(FW_POSIX_WRITE))(fo, out, sizeof(out));
-            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fo);
+        if (fo < 0) {
+            walk_fail();
+            return;
+        }
+        int wr = ((posix_write_fn)vfn(FW_POSIX_WRITE))(fo, out, sizeof(out));
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fo);
+        if (wr != (int)sizeof(out)) {
+            walk_fail();
+            return;
         }
     }
 
     /* full map at walk scale (one-shot compose, a couple of seconds) */
-    if (md_render_window(WALK_MAP_A, 0, 0, mw, mh) != 0) return;
+    if (md_render_window(WALK_MAP_A, 0, 0, mw, mh) != 0) {
+        walk_fail();
+        return;
+    }
 
     /* scrollable viewport + full-map image + knight sprite on top */
     s_walk_box = ((void *(*)(void *))(uintptr_t)VENA(FW_OBJ_CREATE))(root);
