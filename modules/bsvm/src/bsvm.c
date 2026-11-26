@@ -54,6 +54,8 @@ static const struct canopus_context_v1 *s_ctx;
 #define FW_IMAGE_SET_SRC 0x0c3b2c29u /* void lv_image_set_src(obj, const char *path) */
 #define FW_OBJ_ADD_FLAG 0x0c38404du /* void lvx_object_add_flag(obj, flag)           */
 #define FW_OBJ_CREATE  0x0c380687u /* void *lvx_object_create(parent)               */
+#define FW_SCROLL_TO_X 0x0c384d49u /* void lv_obj_scroll_to_x(obj, x, anim)         */
+#define FW_SCROLL_TO_Y 0x0c384d71u /* void lv_obj_scroll_to_y(obj, y, anim)         */
 #define FW_OBJ_CLEAR_FLAG 0x0c3840d9u /* void lv_obj_clear_flag(obj, flag)           */
 #define FW_EVENT_ADD    0x0c37fc1du /* void *lv_obj_add_event_cb(obj,cb,code,ud)     */
 #define FW_PAGE_FINISH  0x0c69b5adu /* int32 page_finish(struct page_descriptor *)   */
@@ -61,6 +63,10 @@ static const struct canopus_context_v1 *s_ctx;
 #define LV_FLAG_CLICKABLE 2u        /* (manager host_set_hidden/host_object_flag)    */
 #define LV_FLAG_SCROLLABLE 0x10u
 #define LV_EVENT_CLICKED  7u        /* manager HOST_EVENT_CLICKED                    */
+#define LV_EVENT_PRESSED  1u        /* lvgl v8/v9 enum order                         */
+#define LV_EVENT_PRESSING 2u
+#define LV_EVENT_PRESS_LOST 3u
+#define LV_EVENT_RELEASED 8u
 #define TITLE_PATH      "/data/bsvm_title.bin"
 
 #define VENA(addr) ((uintptr_t)(addr) ^ 0x06000000u)
@@ -1008,6 +1014,33 @@ static uint8_t  s_pname_n;
 static char     s_pname[24];
 static char     s_ptextbuf[512];
 
+/* ---- walk mode (joystick movement on the prologue map) ----
+ * View = the game's real screen (640x480 = 20x15 tiles via
+ * Graphics.resize_screen) scaled to 10 px/tile -> 200x150. The full map
+ * is composed once at walk scale into a scrollable image; the camera
+ * follows the player with lv_obj_scroll_to; the knight is a separate
+ * 10x10 sprite widget with the RMVA 3-frame walk pattern. */
+#define WALK_TILE   10
+#define WALK_VW     200
+#define WALK_VH     150
+#define WALK_MAPX   6               /* viewport x offset on the 212 screen */
+static uint8_t  s_walk_on;
+static uint16_t s_wx, s_wy;        /* player tile */
+static int16_t  s_wtx2, s_wty2;    /* step target tile */
+static uint8_t  s_wdir;            /* 0 down 1 left 2 right 3 up */
+static int16_t  s_wofs_x, s_wofs_y;/* px offset inside the step */
+static uint8_t  s_wmoving, s_wstep;
+static uint8_t  s_wpattern;        /* RMVA pattern 0..3 */
+static uint8_t  s_wanime;
+static int      s_wcam_x, s_wcam_y;
+static int16_t  s_wframe;          /* last sprite file shown, -1 none */
+static uint8_t  s_joy_dir;         /* 0 none, else RMVA d (2/4/6/8) */
+static void    *s_walk_map_img;
+static void    *s_walk_spr_img;
+static void    *s_walk_box;
+static void    *s_walk_lbl;
+static void    *s_walk_joy[4];
+
 #define MAP_PATH   "/data/bsvm_map.bin"
 #define BOX_PATH   "/data/bsvm_box.bin"
 #define FACE_PATH  "/data/bsvm_face.bin"
@@ -1015,6 +1048,7 @@ static char     s_ptextbuf[512];
 #define PNAME_DEFAULT "\xe6\xa0\xbc\xe6\x9e\x97"  /* 格林 */
 
 static void prologue_show_step(void);
+static void walk_start(void *root);
 static int map_compose(void);
 static void prologue_tick(void *arg);
 
@@ -1156,7 +1190,9 @@ static void prologue_show_step(void)
     prologue_hide_all();
 
     if (st->type == PSTEP_END) {
-        prologue_stop(1);
+        /* dialogs over: free movement on the character-make map */
+        prologue_stop(0);
+        walk_start(s_root);
         return;
     }
 
@@ -1457,6 +1493,17 @@ static void session_reset(void)
     s_steps = 0;
     s_phase = 0;
     s_batch_active = 0;
+    s_walk_on = 0;
+    s_joy_dir = 0;
+    s_wmoving = 0;
+    s_wpattern = 1;
+    s_wframe = -1;
+    s_walk_map_img = 0;
+    s_walk_spr_img = 0;
+    s_walk_box = 0;
+    s_walk_lbl = 0;
+    s_walk_joy[0] = 0; s_walk_joy[1] = 0;
+    s_walk_joy[2] = 0; s_walk_joy[3] = 0;
 }
 
 static int bsvm_on_create(void *page, void *root, void *start_data)
@@ -1783,13 +1830,15 @@ static uint16_t s_md_at_n;
 static uint16_t s_md_at_base[MD_AT_MAX];
 static uint16_t s_md_at_idx[MD_AT_MAX];
 static uint16_t s_md_at_h[MD_AT_MAX];        /* block height in tiles */
-static uint16_t s_md_at_fl[MD_AT_MAX];       /* bit0 waterfall, bit7 table */
+static uint16_t s_md_at_fl[MD_AT_MAX];       /* bit7 table, bit8 waterfall, bits0-3 passage */
 static int32_t  s_md_cells_off;              /* file offset: first cell */
 static int32_t  s_md_atoff[MD_AT_MAX];       /* file offset per block */
 static int32_t  s_md_tm_off;                 /* file offset: tilemap */
 static uint16_t s_md_x, s_md_y;              /* map dims in tiles */
 static int16_t  s_md_ptx, s_md_pty;          /* player spawn tile, -1 = none */
 static int      s_md_fd = -1;                /* open mapdata fd */
+static int16_t  s_md_ev[64];                 /* blocking events (x,y pairs) */
+static uint16_t s_md_ev_n;
 static int      s_md_cx0;                    /* window x0 in view px */
 /* LRU autotile-block cache */
 static uint8_t  s_at_cache[MD_AT_CACHE][96u * 64u];
@@ -1799,6 +1848,7 @@ static uint32_t s_at_tick;
 static uint32_t s_md_band[512u * 32u];        /* strip buffer (viewer full-map width 512) */
 static int      s_md_band_y0;                 /* view-y of strip top */
 static int      s_md_w = 212;                 /* strip width in view px */
+static int      s_md_tile = 16;               /* view px per tile (16 game / 10 walk) */
 
 typedef int (*md_rd_fn)(int, void *, uint32_t);
 
@@ -1887,8 +1937,8 @@ static void md_rect_blit_any(int tx, int ty, int vx0, int vy0, int vw, int vh,
     if (base == 0) return;
     int sx = off % 64u, sy = off / 64u;
     int bh = s_md_at_h[blk] * 32u;
-    int bx = (int)(tx * 16u) + vx0 - s_md_cx0;
-    int by0 = ty * 16u + vy0 - s_md_band_y0;
+    int bx = (int)(tx * (uint32_t)s_md_tile) + vx0 - s_md_cx0;
+    int by0 = (int)(ty * (uint32_t)s_md_tile) + vy0 - s_md_band_y0;
     for (int yy = 0; yy < vh; yy++) {
         int r = by0 + yy;
         if (r < 0 || r >= 32) continue;
@@ -1910,8 +1960,10 @@ static void md_rect_blit_any(int tx, int ty, int vx0, int vy0, int vw, int vh,
 static void md_rect_blit(int tx, int ty, int qx, int qy,
                          int blk, uint32_t off, int sw)
 {
-    /* one autotile quadrant: 16px source quadrant -> 8x8 view px */
-    md_rect_blit_any(tx, ty, qx / 2, qy / 2, 8, 8, blk, off, sw, sw);
+    /* one autotile quadrant: 16px source quadrant -> tile/2 view px */
+    int q = s_md_tile / 2;
+    md_rect_blit_any(tx, ty, (qx * s_md_tile) / 32, (qy * s_md_tile) / 32,
+                     q, q, blk, off, sw, sw);
 }
 
 static void md_cell_blit(int fd, uint32_t cell_off, uint16_t idx,
@@ -1921,21 +1973,29 @@ static void md_cell_blit(int fd, uint32_t cell_off, uint16_t idx,
     uint8_t cell[1024];
     md_seek(fd, (int64_t)cell_off + (uint32_t)idx * 1024u);
     if (md_read(fd, cell, 1024u) < 1024) return;
-    int bx = (int)(tx * 16u) - s_md_cx0;
-    int by0 = ty * 16u - s_md_band_y0;
-    for (int yy = 0; yy < 16; yy++) {
+    int t = s_md_tile;
+    int bx = (int)(tx * (uint32_t)t) - s_md_cx0;
+    int by0 = (int)(ty * (uint32_t)t) - s_md_band_y0;
+    for (int yy = 0; yy < t; yy++) {
         int r = by0 + yy;
         if (r < 0 || r >= 32) continue;
         uint32_t *row = s_md_band + (uint32_t)r * s_md_w;
-        const uint8_t *s0 = cell + (yy * 2) * 32u;
-        const uint8_t *s1 = s0 + 32u;
-        for (int xx = 0; xx < 16; xx++) {
+        int sy0 = (yy * 32) / t;
+        int sy1 = sy0 + 1;
+        if (((yy + 1) * 32 + t - 1) / t > sy1) sy1 = ((yy + 1) * 32 + t - 1) / t;
+        for (int xx = 0; xx < t; xx++) {
             int vx = bx + xx;
             if (vx < 0 || vx >= s_md_w) continue;
-            uint8_t c = s0[xx * 2];
-            if (c == 0) c = s0[xx * 2 + 1];
-            if (c == 0) c = s1[xx * 2];
-            if (c == 0) c = s1[xx * 2 + 1];
+            int sx0 = (xx * 32) / t;
+            int sx1 = sx0 + 1;
+            if (((xx + 1) * 32 + t - 1) / t > sx1) sx1 = ((xx + 1) * 32 + t - 1) / t;
+            uint8_t c = 0;
+            for (int sy = sy0; sy < sy1 && c == 0; sy++) {
+                for (int sx = sx0; sx < sx1; sx++) {
+                    uint8_t c2 = cell[sy * 32 + sx];
+                    if (c2 != 0) { c = c2; break; }
+                }
+            }
             if (c != 0) row[vx] = *(const uint32_t *)s_md_pal[c];
         }
     }
@@ -1980,7 +2040,7 @@ static void md_draw_at(uint32_t tx, uint32_t ty, uint16_t v)
                 md_rect_blit((int)tx, (int)ty, ax[i], ay[i],
                              blk, bsva_at_b[pat * 4u + i], 15);
         }
-    } else if (base == 0x0800u && (afl & 0x01u)) {
+    } else if (base == 0x0800u && (afl & 0x100u)) {
         /* A1 waterfall C-type: 2 quads of 15x31 -> 16x32 halves */
         if (pat < 4u) {
             for (int i = 0; i < 2; i++)
@@ -2013,6 +2073,7 @@ static void md_draw_at(uint32_t tx, uint32_t ty, uint16_t v)
 static int md_load_fd(int fd)
 {
     s_md_fd = -1;
+    s_md_tile = 16;
     for (int i = 0; i < MD_AT_CACHE; i++) s_at_slot_blk[i] = -1;
     int64_t fsz = md_size(fd);
     log_kv("mvsz", (uint32_t)(fsz < 0 ? 0u : (uint32_t)fsz));
@@ -2075,6 +2136,20 @@ static int md_load_fd(int fd)
     if (md_read(fd, spawn, 4u) < 4) goto bad;
     s_md_ptx = (int16_t)(spawn[0] | ((uint16_t)spawn[1] << 8));
     s_md_pty = (int16_t)(spawn[2] | ((uint16_t)spawn[3] << 8));
+    /* blocking events: pairs then u16 count (count at fsize-6) */
+    pos -= 2;
+    md_seek(fd, pos);
+    uint8_t evb[2];
+    if (md_read(fd, evb, 2u) < 2) goto bad;
+    uint16_t ev_n = (uint16_t)(evb[0] | ((uint16_t)evb[1] << 8));
+    if (ev_n > 32u) goto bad;
+    s_md_ev_n = ev_n;
+    if (ev_n) {
+        pos -= (int64_t)ev_n * 4;
+        md_seek(fd, pos);
+        if (md_read(fd, s_md_ev, (uint32_t)ev_n * 4u) < (int)(ev_n * 4u))
+            goto bad;
+    }
     pos -= (int64_t)at_n * 8;
     md_seek(fd, pos);
     if (md_read(fd, tmp, at_n * 8u) < (int)(at_n * 8u))
@@ -2153,8 +2228,9 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
         int strip_h = (h - wy < 32) ? (h - wy) : 32;
         for (uint32_t i = 0; i < (uint32_t)s_md_w * 32u; i++) s_md_band[i] = 0xFF000000u;
         s_md_band_y0 = cy0 + wy;
-        uint32_t t0 = (uint32_t)(s_md_band_y0 / 16);
-        uint32_t t1 = (uint32_t)((s_md_band_y0 + strip_h + 15) / 16);
+        uint32_t t0 = (uint32_t)(s_md_band_y0 / s_md_tile);
+        uint32_t t1 = (uint32_t)((s_md_band_y0 + strip_h + s_md_tile - 1) /
+                                 s_md_tile);
         if (t1 > s_md_y) t1 = s_md_y;
         int over_n = 0;
         for (int z = 0; z < 2; z++) {
@@ -2209,14 +2285,17 @@ static int md_render_window(const char *out_path, int cx0, int cy0,
                 for (int qy = 0; qy < 2; qy++) {
                     for (int qx = 0; qx < 2; qx++) {
                         if (!((v >> (qy * 2 + qx)) & 1u)) continue;
-                        int bx = (int)(tx * 16u + qx * 8u) - s_md_cx0;
-                        int by = (int)ty * 16u + qy * 8u - s_md_band_y0;
-                        for (int yy = 0; yy < 8; yy++) {
+                        int q = s_md_tile / 2;
+                        int bx = (int)(tx * (uint32_t)s_md_tile +
+                                       (uint32_t)(qx * q)) - s_md_cx0;
+                        int by = (int)(ty * (uint32_t)s_md_tile +
+                                       (uint32_t)(qy * q)) - s_md_band_y0;
+                        for (int yy = 0; yy < q; yy++) {
                             int r = by + yy;
                             if (r < 0 || r >= 32) continue;
                             uint32_t *brow = s_md_band +
                                 (uint32_t)r * s_md_w;
-                            for (int xx = 0; xx < 8; xx++) {
+                            for (int xx = 0; xx < q; xx++) {
                                 int vx = bx + xx;
                                 if (vx < 0 || vx >= s_md_w) continue;
                                 uint32_t px = brow[vx];
@@ -2341,6 +2420,323 @@ static void viewer_start(void *root)
             uintptr_t)VENA(FW_EVENT_ADD))(exit_lbl, cb_mv_exit,
                                           LV_EVENT_CLICKED, 0);
     }
+}
+
+/* ---------------- walk mode: joystick movement ----------------
+ * Faithful to the extracted RGSS scripts: 640x480 screen (20x15 tiles),
+ * player-centered clamped camera, Game_Map#check_passage semantics
+ * (layers z2->z0, star tiles skipped, bit set = blocked), events with
+ * priority 1 block, move_straight grid steps, 4-pattern walk anim. */
+static const char WALK_MAP_A[] = "/data/bsvm_walk_a.bin";
+
+static uint16_t md_tm_tile(int z, int tx, int ty)
+{
+    int64_t off = s_md_tm_off +
+        (int64_t)(z * (int)s_md_y + ty) * (int)s_md_x * 2 + (int64_t)tx * 2;
+    uint8_t b[2] = {0, 0};
+    md_seek(s_md_fd, off);
+    if (md_read(s_md_fd, b, 2u) < 2) return 0;
+    return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+}
+
+static int md_tile_flag(uint16_t v)
+{
+    if (v == 0) return -1;
+    for (uint16_t k = 0; k < s_md_normal_n; k++) {
+        if (s_md_id[k] == v) return (int)s_md_nfl[k];
+    }
+    if (v < 0x0800u) return -1;
+    uint16_t base = (v < 0xB00u) ? 0x0800u :
+                    (v < 0x1100u) ? 0x0B00u :
+                    (v < 0x1700u) ? 0x1100u : 0x1700u;
+    for (uint16_t k = 0; k < s_md_at_n; k++) {
+        if (s_md_at_base[k] == base &&
+            s_md_at_idx[k] == (uint16_t)((v - base) / 48u))
+            return (int)s_md_at_fl[k];
+    }
+    return -1;
+}
+
+static int md_check_passage(int tx, int ty, uint8_t bit)
+{
+    if (tx < 0 || ty < 0 || tx >= (int)s_md_x || ty >= (int)s_md_y) return 0;
+    for (int z = 2; z >= 0; z--) {
+        uint16_t v = md_tm_tile(z, tx, ty);
+        if (v == 0) continue;
+        int fl = md_tile_flag(v);
+        if (fl < 0) continue;
+        if (fl & 0x10) continue;            /* star: no passage effect */
+        if ((fl & bit) == 0) return 1;      /* passable */
+        return 0;                           /* blocked */
+    }
+    return 0;
+}
+
+static int md_ev_blocked(int tx, int ty)
+{
+    for (uint16_t k = 0; k < s_md_ev_n; k++) {
+        if (s_md_ev[k * 2] == tx && s_md_ev[k * 2 + 1] == ty) return 1;
+    }
+    return 0;
+}
+
+static int md_walk_passable(int tx, int ty, int d)
+{
+    /* d: 2 down 4 left 6 right 8 up; flag bit = 1 << (d/2-1) */
+    static const uint8_t bitf[4] = {1, 2, 4, 8};
+    static const uint8_t bitr[4] = {8, 4, 2, 1};
+    int idx = d / 2 - 1;
+    int x2 = tx + (d == 6 ? 1 : 0) - (d == 4 ? 1 : 0);
+    int y2 = ty + (d == 2 ? 1 : 0) - (d == 8 ? 1 : 0);
+    if (!md_check_passage(tx, ty, bitf[idx])) return 0;
+    if (!md_check_passage(x2, y2, bitr[idx])) return 0;
+    if (md_ev_blocked(x2, y2)) return 0;
+    return 1;
+}
+
+static void cb_joy_down(void *e)  { (void)e; s_joy_dir = 2; }
+static void cb_joy_left(void *e)  { (void)e; s_joy_dir = 4; }
+static void cb_joy_right(void *e) { (void)e; s_joy_dir = 6; }
+static void cb_joy_up(void *e)    { (void)e; s_joy_dir = 8; }
+static void cb_joy_rel_down(void *e)  { (void)e; if (s_joy_dir == 2) s_joy_dir = 0; }
+static void cb_joy_rel_left(void *e)  { (void)e; if (s_joy_dir == 4) s_joy_dir = 0; }
+static void cb_joy_rel_right(void *e) { (void)e; if (s_joy_dir == 6) s_joy_dir = 0; }
+static void cb_joy_rel_up(void *e)    { (void)e; if (s_joy_dir == 8) s_joy_dir = 0; }
+
+static void walk_tick(void *arg)
+{
+    (void)arg;
+    if (!s_walk_on) return;
+    if (!s_wmoving && s_joy_dir != 0) {
+        int d = s_joy_dir;
+        s_wdir = (uint8_t)(d / 2 - 1);
+        int x2 = (int)s_wx + (d == 6 ? 1 : 0) - (d == 4 ? 1 : 0);
+        int y2 = (int)s_wy + (d == 2 ? 1 : 0) - (d == 8 ? 1 : 0);
+        if (md_walk_passable((int)s_wx, (int)s_wy, d)) {
+            s_wtx2 = (int16_t)x2;
+            s_wty2 = (int16_t)y2;
+            s_wmoving = 1;
+            s_wstep = 0;
+        }
+    }
+    if (s_wmoving) {
+        s_wstep++;
+        s_wofs_x = (int16_t)(((int)s_wtx2 - (int)s_wx) * (WALK_TILE / 2) *
+                             (int)s_wstep);
+        s_wofs_y = (int16_t)(((int)s_wty2 - (int)s_wy) * (WALK_TILE / 2) *
+                             (int)s_wstep);
+        if (s_wstep >= 2) {
+            s_wx = (uint16_t)s_wtx2;
+            s_wy = (uint16_t)s_wty2;
+            s_wofs_x = 0;
+            s_wofs_y = 0;
+            s_wmoving = 0;
+        }
+        if (++s_wanime >= 2) {
+            s_wanime = 0;
+            s_wpattern = (uint8_t)((s_wpattern + 1) & 3);
+        }
+    } else {
+        s_wpattern = 1;
+        s_wanime = 0;
+    }
+    /* camera: player centered, clamped (Game_Player#update_scroll) */
+    int pcx = (int)s_wx * WALK_TILE + s_wofs_x + WALK_TILE / 2;
+    int pcy = (int)s_wy * WALK_TILE + s_wofs_y + WALK_TILE / 2;
+    int ncx = pcx - WALK_VW / 2;
+    int ncy = pcy - WALK_VH / 2;
+    int maxx = (int)s_md_x * WALK_TILE - WALK_VW;
+    int maxy = (int)s_md_y * WALK_TILE - WALK_VH;
+    if (ncx < 0) ncx = 0;
+    if (ncx > maxx) ncx = maxx;
+    if (ncy < 0) ncy = 0;
+    if (ncy > maxy) ncy = maxy;
+    if ((ncx != s_wcam_x || ncy != s_wcam_y) && s_walk_box != 0) {
+        s_wcam_x = ncx;
+        s_wcam_y = ncy;
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_SCROLL_TO_X))(
+            s_walk_box, ncx, 0);
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_SCROLL_TO_Y))(
+            s_walk_box, ncy, 0);
+    }
+    /* knight sprite: content coords inside the scroll box */
+    if (s_walk_spr_img != 0) {
+        int px = (int)s_wx * WALK_TILE + s_wofs_x;
+        int py = (int)s_wy * WALK_TILE + s_wofs_y;
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+            FW_OBJ_ALIGN))(s_walk_spr_img, ALIGN_TOP_LEFT, px, py);
+        static const int colmap[4] = {0, 1, 2, 1};
+        int frame = s_wdir * 3 + colmap[s_wpattern];
+        if (frame != s_wframe) {
+            char path[24] = "/data/bsvm_k00.bin";
+            path[12] = (char)('0' + (frame / 10));
+            path[13] = (char)('0' + (frame % 10));
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_walk_spr_img, path);
+            s_wframe = (int16_t)frame;
+        }
+    }
+}
+
+static void walk_start(void *root)
+{
+    if (s_md_fd < 0) return;
+    s_walk_on = 1;
+    s_wx = (s_md_ptx >= 0) ? (uint16_t)s_md_ptx : 12u;
+    s_wy = (s_md_pty >= 0) ? (uint16_t)s_md_pty : 18u;
+    s_wdir = 0;
+    s_wofs_x = s_wofs_y = 0;
+    s_wmoving = 0;
+    s_wstep = 0;
+    s_wpattern = 1;
+    s_wanime = 0;
+    s_wframe = -1;
+    s_joy_dir = 0;
+    prologue_hide_all();
+    obj_hide(s_title_img);
+    obj_hide(s_title_lbl);
+    obj_hide(s_menu_ng);
+    obj_hide(s_menu_cont);
+    obj_hide(s_menu_end);
+    if (s_timer != 0) {
+        ((void (*)(void *))(uintptr_t)VENA(FW_TIMER_DEL))(s_timer);
+        s_timer = 0;
+    }
+
+    s_md_tile = WALK_TILE;
+    int mw = (int)s_md_x * WALK_TILE;
+    int mh = (int)s_md_y * WALK_TILE;
+
+    /* knight walk frames -> 12 tiny sprite files */
+    for (int f = 0; f < 12; f++) {
+        uint8_t cell[1024];
+        md_seek(s_md_fd, (int64_t)s_md_cells_off +
+                         (int64_t)(s_md_normal_n + f) * 1024);
+        if (md_read(s_md_fd, cell, 1024u) < 1024) return;
+        uint8_t out[WALK_TILE * WALK_TILE * 4];
+        for (int yy = 0; yy < WALK_TILE; yy++) {
+            int sy0 = (yy * 32) / WALK_TILE;
+            int sy1 = sy0 + 1;
+            if (((yy + 1) * 32 + WALK_TILE - 1) / WALK_TILE > sy1)
+                sy1 = ((yy + 1) * 32 + WALK_TILE - 1) / WALK_TILE;
+            for (int xx = 0; xx < WALK_TILE; xx++) {
+                int sx0 = (xx * 32) / WALK_TILE;
+                int sx1 = sx0 + 1;
+                if (((xx + 1) * 32 + WALK_TILE - 1) / WALK_TILE > sx1)
+                    sx1 = ((xx + 1) * 32 + WALK_TILE - 1) / WALK_TILE;
+                uint8_t c = 0;
+                for (int sy = sy0; sy < sy1 && c == 0; sy++) {
+                    for (int sx = sx0; sx < sx1; sx++) {
+                        if (cell[sy * 32 + sx] != 0) {
+                            c = cell[sy * 32 + sx];
+                            break;
+                        }
+                    }
+                }
+                uint8_t *q = out + (yy * WALK_TILE + xx) * 4;
+                if (c != 0) {
+                    q[0] = s_md_pal[c][0];
+                    q[1] = s_md_pal[c][1];
+                    q[2] = s_md_pal[c][2];
+                    q[3] = 0xFF;
+                } else {
+                    q[0] = q[1] = q[2] = 0;
+                    q[3] = 0;
+                }
+            }
+        }
+        char path[24] = "/data/bsvm_k00.bin";
+        path[12] = (char)('0' + (f / 10));
+        path[13] = (char)('0' + (f % 10));
+        int fo = ((posix_open_fn)vfn(FW_POSIX_OPEN))(path, O_RDWR | O_CREAT,
+                                                     0666);
+        if (fo >= 0) {
+            ((posix_write_fn)vfn(FW_POSIX_WRITE))(fo, out, sizeof(out));
+            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fo);
+        }
+    }
+
+    /* full map at walk scale (one-shot compose, a couple of seconds) */
+    if (md_render_window(WALK_MAP_A, 0, 0, mw, mh) != 0) return;
+
+    /* scrollable viewport + full-map image + knight sprite on top */
+    s_walk_box = ((void *(*)(void *))(uintptr_t)VENA(FW_OBJ_CREATE))(root);
+    if (s_walk_box != 0) {
+        ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+            s_walk_box, WALK_VW, WALK_VH);
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+            FW_OBJ_ALIGN))(s_walk_box, ALIGN_TOP_LEFT, WALK_MAPX, 0);
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+            s_walk_box, LV_FLAG_SCROLLABLE);
+        s_walk_map_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(
+            s_walk_box);
+        if (s_walk_map_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_walk_map_img, mw, mh);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+                FW_OBJ_ALIGN))(s_walk_map_img, ALIGN_TOP_LEFT, 0, 0);
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_walk_map_img, WALK_MAP_A);
+        }
+        s_walk_spr_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(
+            s_walk_box);
+        if (s_walk_spr_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_walk_spr_img, WALK_TILE, WALK_TILE);
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+                s_walk_spr_img, "/data/bsvm_k01.bin");
+            s_wframe = 1;
+        }
+    }
+    /* camera init */
+    s_wcam_x = (int)s_wx * WALK_TILE + WALK_TILE / 2 - WALK_VW / 2;
+    s_wcam_y = (int)s_wy * WALK_TILE + WALK_TILE / 2 - WALK_VH / 2;
+    int maxx = mw - WALK_VW;
+    int maxy = mh - WALK_VH;
+    if (s_wcam_x < 0) s_wcam_x = 0;
+    if (s_wcam_x > maxx) s_wcam_x = maxx;
+    if (s_wcam_y < 0) s_wcam_y = 0;
+    if (s_wcam_y > maxy) s_wcam_y = maxy;
+    if (s_walk_box != 0) {
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_SCROLL_TO_X))(
+            s_walk_box, s_wcam_x, 0);
+        ((void (*)(void *, int32_t, uint32_t))(uintptr_t)VENA(FW_SCROLL_TO_Y))(
+            s_walk_box, s_wcam_y, 0);
+    }
+    /* joystick: hold-to-walk zones in the lower half */
+    void *font = (s_cjk_font != 0) ? s_cjk_font
+        : ((void *(*)(const char *, uint16_t, uint16_t))(uintptr_t)
+           VENA(FW_FONT_CREATE))("MiSans-Regular", 18u, 0u);
+    static const char *const jt[4] = {
+        "\xE4\xB8\x8A", "\xE4\xB8\x8B", "\xE5\xB7\xA6", "\xE5\x8F\xB3"
+    };
+    static const int jx[4] = {78, 78, 10, 146};
+    static const int jy[4] = {290, 466, 378, 378};
+    static void (*const jp[4])(void *) = {
+        cb_joy_up, cb_joy_down, cb_joy_left, cb_joy_right
+    };
+    static void (*const jr[4])(void *) = {
+        cb_joy_rel_up, cb_joy_rel_down, cb_joy_rel_left, cb_joy_rel_right
+    };
+    for (int i = 0; i < 4; i++) {
+        void *lbl = ui_label(root, jx[i], jy[i], 56, 44, 0, font);
+        s_walk_joy[i] = lbl;
+        if (lbl == 0) continue;
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+            lbl, jt[i]);
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+            lbl, LV_FLAG_CLICKABLE);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(lbl, jp[i], LV_EVENT_PRESSED, 0);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(lbl, jp[i], LV_EVENT_PRESSING, 0);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(lbl, jr[i], LV_EVENT_RELEASED, 0);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(lbl, jr[i], LV_EVENT_PRESS_LOST, 0);
+    }
+    s_timer = ((void *(*)(void *, uint32_t, void *))(uintptr_t)VENA(
+        FW_TIMER_CREATE))(walk_tick, 50u, 0);
 }
 
 /* ---------------- module lifecycle ---------------- */
