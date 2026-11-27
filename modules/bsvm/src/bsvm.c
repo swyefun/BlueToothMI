@@ -191,6 +191,13 @@ static void *s_story_lbl;    /* .139 firmware page: tap-to-continue target */
 static uint8_t s_story_on;   /* .139 firmware page: bytecode story player */
 static void *s_cjk_font;     /* created once, must outlive all labels */
 
+/* G0b: bytecode CHOICE rows (real texts from the string pool) */
+#define CHOICE_MAX 4u                  /* UI row cap; >4 options truncate */
+static void *s_stc_lbl[CHOICE_MAX];
+static uint32_t s_choice_tgt[CHOICE_MAX]; /* jump target per visible row */
+static uint8_t s_choice_n;   /* rows currently on screen */
+static uint8_t s_choice_wait;/* 1 = paused, waiting for a row tap */
+
 /* ---------------- helpers ---------------- */
 static void *vfn(uint32_t enc) { return (void *)(uintptr_t)VENA(enc); }
 
@@ -601,7 +608,8 @@ static int vm_step(void)
         return 0; }
     case 0x02: { /* CHOICE: headless picks option 0 */
         uint32_t n = s_evt[a];
-        uint32_t size = 1u + n * 6u + 2u;
+        uint32_t size = 6u * n + 4u;   /* 1 op + 1 n + 4n texts + 2n jumps
+                                        * + 2 cancel = 6n+4 (was off by 1) */
         s_pc += size;
         return 0; }
     case 0x03: { /* IF_SW: u16 sw, u8 val, s32 else_off */
@@ -842,7 +850,7 @@ static uint32_t story_dry_run(uint32_t off, uint32_t end, uint32_t budget)
                 uint32_t tgt = (uint32_t)((int32_t)field + rel);
                 if (tgt < s_evt_len) { s_pc = tgt; continue; }
             }
-            s_pc += 1u + n * 6u + 2u;
+            s_pc += 6u * n + 4u;                 /* full block = 6n+4 */
             continue;
         }
         if (vm_step() != 0) break;
@@ -942,6 +950,9 @@ static void ui_set_dlg(const char *txt)
 
 /* run bytecode until a TEXT is shown or the entry ends; returns 1 if a
  * dialogue is now on screen, 0 if entry finished */
+static void choice_ui(int show);        /* G0b: defined below (needs ui_show) */
+static void ui_set_choice_row(int row, const char *txt);
+
 static int ui_run_until_text(void)
 {
     for (uint32_t guard = 0; guard < 20000u; guard++) {
@@ -971,16 +982,34 @@ static int ui_run_until_text(void)
             }
             continue;
         }
-        if (op == 0x02u) {                      /* CHOICE: pick option 0 */
+        if (op == 0x02u) {                      /* CHOICE: pause on real rows
+                                                 * (G0b). Texts come from the
+                                                 * string pool; clicking row k
+                                                 * jumps to choice_next[k].
+                                                 * No recursion: the click
+                                                 * callback resumes the run. */
             uint32_t n = s_evt[a];
-            if (n > 0u) {
-                uint32_t field = a + 1u + 4u * n;
-                int32_t rel = (int32_t)rd16(s_evt + field);
-                uint32_t tgt = (uint32_t)((int32_t)field + rel);
-                if (tgt < s_evt_len) { s_pc = tgt; continue; }
+            uint32_t field = a + 1u + 4u * n;
+            uint32_t shown = 0u;
+            for (uint32_t k = 0; k < n && shown < CHOICE_MAX; k++) {
+                uint32_t tidx = rd32(s_evt + a + 1u + 4u * k);
+                char txt[64];
+                int32_t rel = (int32_t)rd16(s_evt + field + 2u * k);
+                uint32_t tgt = (uint32_t)((int32_t)(field + 2u * k) + rel);
+                if (tgt >= s_evt_len) continue;  /* bad target: skip row */
+                if (str_get(tidx, txt, (int)sizeof(txt)) < 0) continue;
+                ui_set_choice_row((int)shown, txt);
+                s_choice_tgt[shown] = tgt;
+                shown++;
             }
-            s_pc += 1u + n * 6u + 2u;
-            continue;
+            if (shown == 0u) {                  /* nothing displayable */
+                s_pc += 6u * n + 4u;            /* full block = 6n+4 */
+                continue;
+            }
+            s_choice_n = (uint8_t)shown;
+            s_choice_wait = 1u;
+            choice_ui(1);
+            return 1;                           /* rows on screen, wait */
         }
         /* reuse the VM step for all logic opcodes; it updates s_pc */
         int r = vm_step();
@@ -1037,11 +1066,52 @@ static void cb_story_next(void *e)
 {
     (void)e;
     if (!s_story_on || s_ui_mode != 1u) return;
+    if (s_choice_wait) return;               /* G0b: a row tap decides */
     if (!ui_run_until_text()) {
         s_ui_mode = 3u;                      /* entry finished */
         ui_set_dlg("故事播放完毕");
     }
 }
+
+/* ---------------- G0b: choice rows ---------------- */
+static void ui_set_choice_row(int row, const char *txt)
+{
+    if (row < 0 || (uint32_t)row >= CHOICE_MAX || s_stc_lbl[row] == 0) return;
+    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+        s_stc_lbl[row], txt);
+}
+
+static void choice_ui(int show)
+{
+    for (uint32_t k = 0; k < CHOICE_MAX; k++) {
+        if (s_stc_lbl[k] != 0) {
+            ui_show(s_stc_lbl[k], (int)(show != 0 && k < (uint32_t)s_choice_n));
+        }
+    }
+    ui_show(s_story_lbl, show == 0);         /* hide tap-to-continue while picking */
+}
+
+static void cb_choice(unsigned k)
+{
+    if (!s_choice_wait || k >= (unsigned)s_choice_n) return;
+    uint32_t tgt = s_choice_tgt[k];
+    s_choice_wait = 0u;
+    s_choice_n = 0u;
+    choice_ui(0);
+    s_pc = tgt;                              /* resume on the chosen branch;
+                                              * the run continues from this
+                                              * click callback, same depth as
+                                              * cb_story_next (no recursion) */
+    if (!ui_run_until_text()) {
+        s_ui_mode = 3u;
+        ui_set_dlg("故事播放完毕");
+    }
+}
+
+static void cb_choice_0(void *e) { (void)e; cb_choice(0u); }
+static void cb_choice_1(void *e) { (void)e; cb_choice(1u); }
+static void cb_choice_2(void *e) { (void)e; cb_choice(2u); }
+static void cb_choice_3(void *e) { (void)e; cb_choice(3u); }
 
 static void story_start(void *root)
 {
@@ -1072,6 +1142,20 @@ static void story_start(void *root)
             (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
                 uintptr_t)VENA(FW_EVENT_ADD))(taps[i], cb_story_next,
                                               LV_EVENT_CLICKED, 0);
+        }
+        /* G0b: choice rows (created once, hidden until a CHOICE pauses) */
+        static void (*const choice_cbs[CHOICE_MAX])(void *) = {
+            cb_choice_0, cb_choice_1, cb_choice_2, cb_choice_3 };
+        for (uint32_t k = 0; k < CHOICE_MAX; k++) {
+            s_stc_lbl[k] = ui_label(root, 6, 288 + (int)k * 46, 200, 42,
+                                       0, s_cjk_font);
+            if (s_stc_lbl[k] == 0) continue;
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                s_stc_lbl[k], LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(s_stc_lbl[k], choice_cbs[k],
+                                              LV_EVENT_CLICKED, 0);
+            obj_hide(s_stc_lbl[k]);
         }
     }
     obj_show(s_scene);
@@ -1635,6 +1719,9 @@ static void session_reset(void)
     s_story_ce = -1;
     s_story_lbl = 0;
     s_story_on = 0;
+    for (uint32_t k = 0; k < CHOICE_MAX; k++) s_stc_lbl[k] = 0;
+    s_choice_n = 0;
+    s_choice_wait = 0;
     s_dlg = 0;                       /* firmware-page widgets die with the
                                       * page; stale pointers here are the
                                       * v1.4 dead-buttons bug class */
