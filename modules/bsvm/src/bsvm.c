@@ -1108,10 +1108,10 @@ static void cb_choice(unsigned k)
     }
 }
 
-static void cb_choice_0(void *e) { (void)e; cb_choice(0u); }
-static void cb_choice_1(void *e) { (void)e; cb_choice(1u); }
-static void cb_choice_2(void *e) { (void)e; cb_choice(2u); }
-static void cb_choice_3(void *e) { (void)e; cb_choice(3u); }
+static void cb_stchoice_0(void *e) { (void)e; cb_choice(0u); }
+static void cb_stchoice_1(void *e) { (void)e; cb_choice(1u); }
+static void cb_stchoice_2(void *e) { (void)e; cb_choice(2u); }
+static void cb_stchoice_3(void *e) { (void)e; cb_choice(3u); }
 
 static void story_start(void *root)
 {
@@ -1145,7 +1145,7 @@ static void story_start(void *root)
         }
         /* G0b: choice rows (created once, hidden until a CHOICE pauses) */
         static void (*const choice_cbs[CHOICE_MAX])(void *) = {
-            cb_choice_0, cb_choice_1, cb_choice_2, cb_choice_3 };
+            cb_stchoice_0, cb_stchoice_1, cb_stchoice_2, cb_stchoice_3 };
         for (uint32_t k = 0; k < CHOICE_MAX; k++) {
             s_stc_lbl[k] = ui_label(root, 6, 288 + (int)k * 46, 200, 42,
                                        0, s_cjk_font);
