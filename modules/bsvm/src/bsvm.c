@@ -858,10 +858,79 @@ static uint32_t story_dry_run(uint32_t off, uint32_t end, uint32_t budget)
     return texts;
 }
 
+/* S0: resolve a (map_id, event_id) pair to its page-0 bytecode range by
+ * re-walking the dir map table held in RAM (no extra static state).
+ * Returns 0 and fills off/size on hit, -1 on miss. */
+static int find_map_page(uint32_t mid0, uint32_t eid0, uint32_t *poff,
+                         uint32_t *psize)
+{
+    uint32_t p = 0;
+    uint32_t dir_len = s_dir_len_v;
+    if (dir_len < 8u) return -1;
+    uint32_t strn = rd32(s_dir + p); p += 4;   /* RAW count: re-walk must
+                                                * match the writer layout */
+    p += strn * 4u;
+    if ((p + 8u) > dir_len) return -1;
+    uint32_t ce_n = rd32(s_dir + p); p += 4;
+    p += ce_n * 10u;
+    if ((p + 4u) > dir_len) return -1;
+    uint32_t map_n = rd32(s_dir + p); p += 4;
+    for (uint32_t m = 0; m < map_n; m++) {
+        if ((p + 8u) > dir_len) return -1;
+        uint32_t mid = rd16(s_dir + p); p += 2;
+        uint32_t evn = rd16(s_dir + p); p += 2;
+        p += 4;                                 /* reserved u32 */
+        for (uint32_t e = 0; e < evn; e++) {
+            if ((p + 12u) > dir_len) return -1;
+            uint32_t eid = rd16(s_dir + p); p += 2;
+            uint32_t pg = rd16(s_dir + p); p += 2;
+            uint32_t off = rd32(s_dir + p); p += 4;
+            uint32_t size = rd32(s_dir + p); p += 4;
+            if (mid == mid0 && eid == eid0 && pg == 0u) {
+                *poff = off;
+                *psize = size;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
 static void ui_pick_story(void)
 {
     uint32_t best_off = 0u, best_end = 0u, best_texts = 0u;
     int32_t best_ce = -1;
+    /* S0: map-page override /data/bsvm_entry_map.bin = u16 LE map_id +
+     * u16 LE event_id -> that event's page-0 bytecode. This is the
+     * generic way to point the player at ANY scene (e.g. the prologue
+     * lives in Map097 EV001, not in the CE list). */
+    {
+        int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))(
+            "/data/bsvm_entry_map.bin", O_RDONLY);
+        if (fd >= 0) {
+            uint8_t eb[4] = {0xFFu, 0xFFu, 0xFFu, 0xFFu};
+            ((posix_read_fn)vfn(FW_POSIX_READ))(fd, eb, 4u);
+            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+            uint32_t mid = (uint32_t)(eb[0] | ((uint32_t)eb[1] << 8));
+            uint32_t eid = (uint32_t)(eb[2] | ((uint32_t)eb[3] << 8));
+            uint32_t off = 0u, size = 0u;
+            if (mid != 0xFFFFu && eid != 0xFFFFu &&
+                find_map_page(mid, eid, &off, &size) == 0 && size > 0u) {
+                uint32_t t = story_dry_run(off, off + size, 2000u);
+                if (t > 0u) {
+                    s_story_off = off;
+                    s_story_end = (off + size > s_evt_len) ? s_evt_len
+                                                           : off + size;
+                    s_story_ce = -1;
+                    vm_reset();          /* dry run mutated VM state */
+                    s_pc = s_story_off;
+                    s_ui_mode = 1u;
+                    s_dwell = 0u;
+                    return;
+                }
+            }
+        }
+    }
     /* data-driven entry override (generic config, not a scene special
      * case): /data/bsvm_entry.bin u16 LE = CE index. Missing or 0xFFFF
      * or a zero-TEXT entry falls through to the auto scan. This is the
