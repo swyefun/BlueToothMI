@@ -186,6 +186,9 @@ static char  s_dlg_buf[256];
 static char  s_scene_buf[64];
 static uint32_t s_story_off; /* bytecode offset of the story entry being played */
 static uint32_t s_story_end; /* end offset */
+static int32_t s_story_ce;   /* picked entry id (-1 = map page), display only */
+static void *s_story_lbl;    /* .139 firmware page: tap-to-continue target */
+static uint8_t s_story_on;   /* .139 firmware page: bytecode story player */
 static void *s_cjk_font;     /* created once, must outlive all labels */
 
 /* ---------------- helpers ---------------- */
@@ -851,6 +854,35 @@ static void ui_pick_story(void)
 {
     uint32_t best_off = 0u, best_end = 0u, best_texts = 0u;
     int32_t best_ce = -1;
+    /* data-driven entry override (generic config, not a scene special
+     * case): /data/bsvm_entry.bin u16 LE = CE index. Missing or 0xFFFF
+     * or a zero-TEXT entry falls through to the auto scan. This is the
+     * "换入口不改 C" lever: drop a different id into the file. */
+    {
+        int fd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_entry.bin",
+                                                     O_RDONLY);
+        if (fd >= 0) {
+            uint8_t eb[2] = {0xFFu, 0xFFu};
+            ((posix_read_fn)vfn(FW_POSIX_READ))(fd, eb, 2u);
+            ((posix_close_fn)vfn(FW_POSIX_CLOSE))(fd);
+            uint32_t ce = (uint32_t)(eb[0] | ((uint32_t)eb[1] << 8));
+            if (ce != 0xFFFFu && ce < s_ce_n) {
+                uint32_t off = s_ce_off[ce];
+                uint32_t end = off + s_ce_len[ce];
+                uint32_t t = story_dry_run(off, end, 2000u);
+                if (t > 0u) {
+                    s_story_off = off;
+                    s_story_end = (end > s_evt_len) ? s_evt_len : end;
+                    s_story_ce = (int32_t)ce;
+                    vm_reset();          /* dry run mutated VM state */
+                    s_pc = s_story_off;
+                    s_ui_mode = 1u;
+                    s_dwell = 0u;
+                    return;
+                }
+            }
+        }
+    }
     /* CE entries: dry-run each, keep the one with the most real TEXTs */
     for (uint32_t i = 0; i < s_ce_n; i++) {
         uint32_t off = s_ce_off[i];
@@ -881,6 +913,7 @@ static void ui_pick_story(void)
     s_story_off = best_off;
     s_story_end = best_end;
     if (s_story_end > s_evt_len) s_story_end = s_evt_len;
+    s_story_ce = best_ce;
     vm_reset();                              /* dry runs mutated VM state */
     s_pc = s_story_off;
     s_ui_mode = 1u;
@@ -915,7 +948,18 @@ static int ui_run_until_text(void)
         if (s_pc >= s_story_end || s_pc >= s_evt_len) return 0;
         uint8_t op = s_evt[s_pc];
         uint32_t a = s_pc + 1u;
-        if (op == 0x00u) return 0;              /* END */
+        if (op == 0x00u) {                      /* END: subroutine returns,
+                                                 * only the outer END finishes
+                                                 * (same semantics as the
+                                                 * dry-run picker, otherwise
+                                                 * the shown TEXT count
+                                                 * diverges from the count
+                                                 * ui_pick_story computed) */
+            if (s_sp == 0u) return 0;
+            s_sp--;
+            s_pc = s_ret[s_sp];
+            continue;
+        }
         if (op == 0x01u) {                      /* TEXT */
             uint32_t idx = rd32(s_evt + a);
             char txt[240];
@@ -981,11 +1025,94 @@ static void cb_end(void *e)
     (void)((int32_t (*)(void *))(uintptr_t)VENA(FW_PAGE_FINISH))(&s_bsvm_page);
 }
 
+/* ---------------- G0a: bytecode story player (.139 firmware page) ----------------
+ * NEW GAME runs the story straight from bsvm.bin bytecode: ui_pick_story
+ * selects the entry from the data (dry-run TEXT count; /data/bsvm_entry.bin
+ * overrides), ui_run_until_text executes the bytecode and shows each TEXT.
+ * The hand-written prologue table is a transitional path kept behind the
+ * /data/bsvm_prologue.txt switch (G4 deletes it). */
+static void story_start(void *root);
+
+static void cb_story_next(void *e)
+{
+    (void)e;
+    if (!s_story_on || s_ui_mode != 1u) return;
+    if (!ui_run_until_text()) {
+        s_ui_mode = 3u;                      /* entry finished */
+        ui_set_dlg("故事播放完毕");
+    }
+}
+
+static void story_start(void *root)
+{
+    if (!s_ok_init || s_root == 0) return;   /* load-failed page stays */
+    s_started = 1;
+    s_story_on = 1;
+    obj_hide(s_title_img);
+    obj_hide(s_title_lbl);
+    obj_hide(s_menu_ng);
+    obj_hide(s_menu_cont);
+    obj_hide(s_menu_end);
+    if (s_dlg == 0) {
+        s_scene = ui_label(root, 0, 6, 212, 22, 0, s_cjk_font);
+        s_dlg = ui_label(root, 8, 40, 196, 424, 1, s_cjk_font);
+        s_story_lbl = ui_label(root, 0, 474, 212, 34, 0, s_cjk_font);
+        if (s_story_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_story_lbl, "点击继续");
+        }
+        /* both the text body and the hint row are tap targets */
+        void *taps[2];
+        taps[0] = s_dlg;
+        taps[1] = s_story_lbl;
+        for (int i = 0; i < 2; i++) {
+            if (taps[i] == 0) continue;
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                taps[i], LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(taps[i], cb_story_next,
+                                              LV_EVENT_CLICKED, 0);
+        }
+    }
+    obj_show(s_scene);
+    obj_show(s_dlg);
+    obj_show(s_story_lbl);
+    ui_set_scene("BSVM 剧情");
+    ui_set_dlg("");
+    ui_pick_story();                         /* data-driven entry selection */
+    if (s_story_ce >= 0) {
+        char hdr[40];
+        char vb[12];
+        int o = 0, n = 0;
+        const char *pre = "BSVM \xE5\x89\xA7\xE6\x83\x85 CE#";  /* 剧情 */
+        for (; pre[o]; o++) hdr[o] = pre[o];
+        u32_to_dec(vb, (uint32_t)s_story_ce);
+        n = 0;
+        while (vb[n] && o < (int)sizeof(hdr) - 2) hdr[o++] = vb[n++];
+        hdr[o] = '\0';
+        ui_set_scene(hdr);
+    }
+    if (!ui_run_until_text()) {              /* empty entry: still a page */
+        s_ui_mode = 3u;
+        ui_set_dlg("故事播放完毕");
+    }
+    log_flush();
+}
+
 static void cb_new_game(void *e)
 {
     (void)e;
     if (s_started) return;
-    prologue_start();
+    /* transitional switch: /data/bsvm_prologue.txt runs the hand-written
+     * table; default (file absent) is the bytecode story player */
+    int pfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_prologue.txt",
+                                                  O_RDONLY);
+    if (pfd >= 0) {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(pfd);
+        prologue_start();
+        return;
+    }
+    story_start(s_root);
 }
 
 /* ---------------- v0.8 prologue engine (Map097 character make) ----------------
@@ -1505,6 +1632,13 @@ static void session_reset(void)
     s_pname[0] = '\0';
     s_ui_mode = 0;
     s_dwell = 0;
+    s_story_ce = -1;
+    s_story_lbl = 0;
+    s_story_on = 0;
+    s_dlg = 0;                       /* firmware-page widgets die with the
+                                      * page; stale pointers here are the
+                                      * v1.4 dead-buttons bug class */
+    s_scene = 0;
     s_pc = 0;
     s_sp = 0;
     s_steps = 0;
