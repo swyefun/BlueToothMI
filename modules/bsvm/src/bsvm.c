@@ -90,10 +90,10 @@ static const char BIN_PATH_B[] = "/data/canopus/bsvm/bsvm.bin";   /* legacy prob
 static const char LOG_PATH[] = "/data/canopus/bsvm_log.txt";      /* /data/bsvm/ does not exist on device */
 
 /* ---------------- static pools ---------------- */
-#define EVT_MAX 178000u
+#define EVT_MAX 224000u                 /* S1 blob evt 213K */
 #define DB_MAX  115200u
 #define DIR_MAX 110000u
-#define STRN_MAX 7200u
+#define STRN_MAX 10800u                 /* S1 blob: 10190 strings */
 #define STEPS_PER_ENTRY 120000u
 
 static uint8_t  s_evt[EVT_MAX];
@@ -191,9 +191,18 @@ static void *s_story_lbl;    /* .139 firmware page: tap-to-continue target */
 static uint8_t s_story_on;   /* .139 firmware page: bytecode story player */
 static void *s_cjk_font;     /* created once, must outlive all labels */
 
+/* S2: actor name table (NAME/NAMECP ops) for \N[n] substitution */
+static char     s_names[8][24];
+static uint8_t  s_name_len[8];
+static uint8_t  s_selfsw[4];     /* self switches A/B/C/D (IF_SELF) */
+static uint8_t  s_kb_owner;      /* 0 none, 1 = story player keyboard */
+
 /* G0b: bytecode CHOICE rows (real texts from the string pool) */
 #define CHOICE_MAX 4u                  /* UI row cap; >4 options truncate */
 static void *s_stc_lbl[CHOICE_MAX];
+static void *s_stface_img;   /* story speaker portrait (FACE op) */
+static uint32_t s_kb_actor;  /* NAME op: actor id being named */
+static uint32_t s_kb_max;    /* NAME op: max chars */
 static uint32_t s_choice_tgt[CHOICE_MAX]; /* jump target per visible row */
 static uint8_t s_choice_n;   /* rows currently on screen */
 static uint8_t s_choice_wait;/* 1 = paused, waiting for a row tap */
@@ -709,10 +718,32 @@ static int vm_step(void)
     case 0x0F: s_pc += 2; return 0;  /* FADE */
     case 0x10: s_pc += 3; return 0;  /* WAIT */
     case 0x11: s_pc += 5; return 0;  /* TRANSFER */
-    case 0x12: s_pc += 3; return 0;  /* SELF_SW */
+    case 0x12: {                     /* SELF_SW: u8 letter, u8 val */
+        uint32_t letter = s_evt[a];
+        if (letter < 4u) s_selfsw[letter] = s_evt[a + 1];
+        s_pc += 3;
+        return 0; }
     case 0x13: s_pc += 5; return 0;  /* HP */
     case 0x14: s_pc += 5; return 0;  /* GOLD */
     case 0x15: s_pc += 5; return 0;  /* SCRIPT (skipped) */
+    case 0x1D: s_pc += 8; return 0;  /* FACE (display handled in the UI path) */
+    case 0x1E: s_pc += 3; return 0;  /* NAME (keyboard pauses the UI path) */
+    case 0x1F: {                     /* NAMECP: copy src name to dst */
+        uint32_t dst = s_evt[a], src = s_evt[a + 1];
+        if (dst < 8u && src < 8u) {
+            for (uint32_t j = 0; j < sizeof(s_names[0]); j++)
+                s_names[dst][j] = s_names[src][j];
+        }
+        s_pc += 3;
+        return 0; }
+    case 0x20: {                     /* IF_SELF: u8 letter, u8 val, s32 else */
+        uint32_t letter = s_evt[a];
+        uint32_t val = s_evt[a + 1];
+        int32_t eo = i32(s_evt + a + 2);
+        uint32_t cur = (letter < 4u) ? s_selfsw[letter] : 0u;
+        if (cur != val) s_pc = (uint32_t)((int32_t)(a + 2) + eo);
+        else s_pc += 7;
+        return 0; }
     case 0x18: { /* IF_RES */
         uint32_t want = s_evt[a];
         int32_t eo = i32(s_evt + a + 1);
@@ -1009,9 +1040,44 @@ static void ui_set_scene(const char *txt)
 
 static void ui_set_dlg(const char *txt)
 {
-    int i = 0;
-    while (txt[i] && i < (int)sizeof(s_dlg_buf) - 1) { s_dlg_buf[i] = txt[i]; i++; }
-    s_dlg_buf[i] = '\0';
+    /* RGSS message escapes (S2): \N[n] -> actor name (default \xE6\xA0\xBC\xE6\x9E\x97
+     * =格林), color/tag/control escapes stripped for the band label */
+    uint32_t o = 0;
+    for (int i = 0; txt[i] != '\0' && o + 8 < sizeof(s_dlg_buf); i++) {
+        char c = txt[i];
+        if (c != '\\') { s_dlg_buf[o++] = c; continue; }
+        char n = txt[i + 1];
+        if (n == 'N' && txt[i + 2] == '[') {
+            int k = i + 3;
+            int id = 0;
+            while (txt[k] >= '0' && txt[k] <= '9') { id = id * 10 + (txt[k] - '0'); k++; }
+            if (txt[k] == ']') {
+                const char *nm = (id > 0 && id < 8 && s_names[id][0] != '\0')
+                                     ? s_names[id]
+                                     : "\xE6\xA0\xBC\xE6\x9E\x97";
+                for (uint32_t j = 0; nm[j] != '\0'; j++) s_dlg_buf[o++] = nm[j];
+                i = k;
+                continue;
+            }
+            s_dlg_buf[o++] = c;
+        } else if (n == 'C' && txt[i + 2] == '[') {
+            int k = i + 3;
+            while (txt[k] != '\0' && txt[k] != ']') k++;
+            if (txt[k] == ']') { i = k; continue; }
+            s_dlg_buf[o++] = c;
+        } else if (n == '{' || n == '}' || n == '|' || n == '.' || n == '!' ||
+                   n == '>' || n == '<' || n == '$' || n == '%') {
+            i++;                                    /* drop control escapes */
+            continue;
+        } else if (n == '\\') {
+            s_dlg_buf[o++] = '\\';
+            i++;
+            continue;
+        } else {
+            s_dlg_buf[o++] = c;
+        }
+    }
+    s_dlg_buf[o] = '\0';
     if (s_dlg != 0) {
         ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(s_dlg, s_dlg_buf);
     }
@@ -1021,6 +1087,8 @@ static void ui_set_dlg(const char *txt)
  * dialogue is now on screen, 0 if entry finished */
 static void choice_ui(int show);        /* G0b: defined below (needs ui_show) */
 static void ui_set_choice_row(int row, const char *txt);
+static void story_face_show(const char *name);   /* S2 */
+static void story_name_start(uint32_t actor, uint32_t maxlen);
 
 static int ui_run_until_text(void)
 {
@@ -1080,6 +1148,23 @@ static int ui_run_until_text(void)
             choice_ui(1);
             return 1;                           /* rows on screen, wait */
         }
+        if (op == 0x1Du) {                      /* FACE: speaker portrait */
+            uint32_t fidx = rd32(s_evt + a);
+            char fname[32];
+            s_pc += 8u;
+            if (str_get(fidx, fname, (int)sizeof(fname)) < 0) fname[0] = '\0';
+            story_face_show(fname);
+            continue;
+        }
+        if (op == 0x1Eu) {                      /* NAME: pause on keyboard */
+            uint32_t actor = s_evt[a];
+            uint32_t maxlen = s_evt[a + 1];
+            s_pc += 3u;
+            if (actor > 0u && actor < 8u) {
+                story_name_start(actor, maxlen);
+            }
+            return 1;                           /* keyboard on screen, wait */
+        }
         /* reuse the VM step for all logic opcodes; it updates s_pc */
         int r = vm_step();
         if (r != 0) return 0;
@@ -1135,7 +1220,7 @@ static void cb_story_next(void *e)
 {
     (void)e;
     if (!s_story_on || s_ui_mode != 1u) return;
-    if (s_choice_wait) return;               /* G0b: a row tap decides */
+    if (s_choice_wait || s_kb_owner == 1u) return;   /* row tap / naming decides */
     if (!ui_run_until_text()) {
         s_ui_mode = 3u;                      /* entry finished */
         ui_set_dlg("故事播放完毕");
@@ -1182,6 +1267,117 @@ static void cb_stchoice_1(void *e) { (void)e; cb_choice(1u); }
 static void cb_stchoice_2(void *e) { (void)e; cb_choice(2u); }
 static void cb_stchoice_3(void *e) { (void)e; cb_choice(3u); }
 
+/* ---------------- S2: shared keyboard routing + naming ---------------- */
+static void story_key(int n);           /* defined below */
+
+static void kb_key(int n)
+{
+    if (s_kb_owner == 1u) story_key(n);
+    else prologue_key(n);               /* hand-written prologue owner */
+}
+
+static void story_face_show(const char *name)
+{
+    if (s_stface_img == 0) return;
+    if (name[0] == '\0') {               /* narrator / no portrait */
+        ui_show(s_stface_img, 0);
+        return;
+    }
+    /* data-driven path: /data/bsvm_face_<name>.bin; falls back to the
+     * shipped portrait file so today's single asset works for any name */
+    char path[64];
+    uint32_t o = 0;
+    const char *pre = "/data/bsvm_face_";
+    for (; pre[o] != '\0'; o++) path[o] = pre[o];
+    uint32_t j = 0;
+    for (; name[j] != '\0' && o < 48u; j++) path[o++] = name[j];
+    const char *suf = ".bin";
+    for (j = 0; suf[j] != '\0' && o < 56u; j++) path[o++] = suf[j];
+    path[o] = '\0';
+    if (probe_size(path) < 0) {
+        const char *fb = FACE_PATH;
+        o = 0;
+        for (; fb[o] != '\0'; o++) path[o] = fb[o];
+        path[o] = '\0';
+    }
+    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+        s_stface_img, path);
+    ui_show(s_stface_img, 1);
+}
+
+static void story_name_start(uint32_t actor, uint32_t maxlen)
+{
+    kb_ensure();                        /* shared keyboard, created lazily */
+    s_kb_owner = 1u;
+    s_kb_actor = actor;
+    s_kb_max = (maxlen > 0u && maxlen < 20u) ? maxlen : 20u;
+    s_choice_wait = 0u;
+    choice_ui(0);
+    ui_show(s_story_lbl, 0);            /* no tap-to-continue while naming */
+    ui_show(s_dlg, 0);                  /* kb taps must reach the key rows */
+    ui_show(s_stface_img, 0);
+    ui_show(s_name_lbl, 1);
+    for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 1);
+    /* name display line */
+    {
+        char disp[40];
+        uint32_t o = 0;
+        const char *pre = "\xE5\x90\x8D\xE5\xAD\x97: ";  /* 名字: */
+        for (; pre[o] != '\0'; o++) disp[o] = pre[o];
+        uint8_t n = s_name_len[actor];
+        for (uint8_t j = 0; j < n && o < 36u; j++) disp[o++] = s_names[actor][j];
+        disp[o] = '\0';
+        if (s_name_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_name_lbl, disp);
+        }
+    }
+}
+
+static void story_key(int n)
+{
+    char *buf = s_names[s_kb_actor];
+    if (n < 26) {
+        if (s_name_len[s_kb_actor] < s_kb_max &&
+            s_name_len[s_kb_actor] < 20u)
+            buf[s_name_len[s_kb_actor]++] = (char)('A' + n);
+    } else if (n == 26) {               /* backspace */
+        if (s_name_len[s_kb_actor] > 0u) s_name_len[s_kb_actor]--;
+    } else {                            /* done */
+        if (s_name_len[s_kb_actor] == 0u) {
+            const char *def = "\xE6\xA0\xBC\xE6\x9E\x97";  /* 格林 */
+            uint32_t j = 0;
+            for (; def[j] != '\0'; j++) buf[j] = def[j];
+            s_name_len[s_kb_actor] = (uint8_t)j;
+        }
+        buf[s_name_len[s_kb_actor]] = '\0';
+        for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 0);
+        ui_show(s_name_lbl, 0);
+        ui_show(s_dlg, 1);              /* restore the dialog layer */
+        s_kb_owner = 0u;
+        ui_show(s_story_lbl, 1);        /* restore tap-to-continue */
+        if (!ui_run_until_text()) {     /* resume at the same callback depth */
+            s_ui_mode = 3u;
+            ui_set_dlg("\xE6\x95\x85\xE4\xBA\x8B\xE6\x92\xAD\xE6\x94\xBE\xE5\xAE\x8C\xE6\xAF\x95");
+        }
+        return;
+    }
+    buf[s_name_len[s_kb_actor]] = '\0';
+    {
+        char disp[40];
+        uint32_t o = 0;
+        const char *pre = "\xE5\x90\x8D\xE5\xAD\x97: ";
+        for (; pre[o] != '\0'; o++) disp[o] = pre[o];
+        for (uint8_t j = 0; j < s_name_len[s_kb_actor] && o < 36u; j++)
+            disp[o++] = buf[j];
+        disp[o] = '\0';
+        if (s_name_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_name_lbl, disp);
+        }
+    }
+}
+
 static void story_start(void *root)
 {
     if (!s_ok_init || s_root == 0) return;   /* load-failed page stays */
@@ -1195,6 +1391,14 @@ static void story_start(void *root)
     if (s_dlg == 0) {
         s_scene = ui_label(root, 0, 6, 212, 22, 0, s_cjk_font);
         s_dlg = ui_label(root, 8, 40, 196, 424, 1, s_cjk_font);
+        s_stface_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(root);
+        if (s_stface_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_stface_img, 96, 96);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+                FW_OBJ_ALIGN))(s_stface_img, ALIGN_TOP_LEFT, 112, 4);
+            obj_hide(s_stface_img);
+        }
         s_story_lbl = ui_label(root, 0, 474, 212, 34, 0, s_cjk_font);
         if (s_story_lbl != 0) {
             ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
@@ -1335,7 +1539,7 @@ static void prologue_tick(void *arg);
 static void prologue_key(int n);
 static void prologue_pick(int n);
 
-#define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; prologue_key(n); }
+#define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
 PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
 PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
 PKEY_FN(8)  PKEY_FN(9)  PKEY_FN(10) PKEY_FN(11)
@@ -1569,6 +1773,60 @@ static void prologue_show_step(void)
     log_flush();
 }
 
+static void kb_ensure(void)
+{
+    if (s_key_lbl[0] != 0) return;          /* already created */
+{
+    char buf[8];
+    for (int i = 0; i < 26; i++) {
+        buf[0] = (char)('A' + i);
+        buf[1] = '\0';
+        s_key_lbl[i] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+        if (s_key_lbl[i] == 0) continue;
+        ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+            s_key_lbl[i], buf);
+        ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+            s_key_lbl[i], ALIGN_TOP_LEFT, 10 + (i % 7) * 28, 244 + (i / 7) * 44);
+        ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+            s_key_lbl[i], LV_FLAG_CLICKABLE);
+        (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+            uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[i], s_key_cbs[i],
+                                          LV_EVENT_CLICKED, 0);
+        obj_hide(s_key_lbl[i]);
+    }
+    {
+        const char *bk = "\xe9\x80\x80\xe6\xa0\xbc";      /* 退格 */
+        const char *dn = "\xe5\xae\x8c\xe6\x88\x90";      /* 完成 */
+        s_key_lbl[26] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+        s_key_lbl[27] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
+        if (s_key_lbl[26] != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_key_lbl[26], bk);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_key_lbl[26], ALIGN_TOP_LEFT, 10 + 5 * 28, 244 + 3 * 44);
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                s_key_lbl[26], LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[26], s_key_cbs[26],
+                                              LV_EVENT_CLICKED, 0);
+            obj_hide(s_key_lbl[26]);
+        }
+        if (s_key_lbl[27] != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_key_lbl[27], dn);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
+                s_key_lbl[27], ALIGN_TOP_LEFT, 10 + 6 * 28, 244 + 3 * 44);
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                s_key_lbl[27], LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[27], s_key_cbs[27],
+                                              LV_EVENT_CLICKED, 0);
+            obj_hide(s_key_lbl[27]);
+        }
+    }
+    }
+}
+
 static void prologue_start(void)
 {
     if (s_pro_on || !s_ok_init) return;
@@ -1646,56 +1904,7 @@ static void prologue_start(void)
         for (int i = 0; i < 4; i++) {
             s_choice_lbl[i] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
         }
-        /* keyboard: 26 letters + backspace + done, 4 rows x 7 cols */
-        {
-            char buf[8];
-            for (int i = 0; i < 26; i++) {
-                buf[0] = (char)('A' + i);
-                buf[1] = '\0';
-                s_key_lbl[i] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
-                if (s_key_lbl[i] == 0) continue;
-                ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                    s_key_lbl[i], buf);
-                ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
-                    s_key_lbl[i], ALIGN_TOP_LEFT, 10 + (i % 7) * 28, 244 + (i / 7) * 44);
-                ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-                    s_key_lbl[i], LV_FLAG_CLICKABLE);
-                (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-                    uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[i], s_key_cbs[i],
-                                                  LV_EVENT_CLICKED, 0);
-                obj_hide(s_key_lbl[i]);
-            }
-            {
-                const char *bk = "\xe9\x80\x80\xe6\xa0\xbc";      /* 退格 */
-                const char *dn = "\xe5\xae\x8c\xe6\x88\x90";      /* 完成 */
-                s_key_lbl[26] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
-                s_key_lbl[27] = ui_label(s_root, 0, 0, 0, 0, 0, s_cjk_font);
-                if (s_key_lbl[26] != 0) {
-                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                        s_key_lbl[26], bk);
-                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
-                        s_key_lbl[26], ALIGN_TOP_LEFT, 10 + 5 * 28, 244 + 3 * 44);
-                    ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-                        s_key_lbl[26], LV_FLAG_CLICKABLE);
-                    (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-                        uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[26], s_key_cbs[26],
-                                                      LV_EVENT_CLICKED, 0);
-                    obj_hide(s_key_lbl[26]);
-                }
-                if (s_key_lbl[27] != 0) {
-                    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                        s_key_lbl[27], dn);
-                    ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_ALIGN))(
-                        s_key_lbl[27], ALIGN_TOP_LEFT, 10 + 6 * 28, 244 + 3 * 44);
-                    ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-                        s_key_lbl[27], LV_FLAG_CLICKABLE);
-                    (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-                        uintptr_t)VENA(FW_EVENT_ADD))(s_key_lbl[27], s_key_cbs[27],
-                                                      LV_EVENT_CLICKED, 0);
-                    obj_hide(s_key_lbl[27]);
-                }
-            }
-        }
+        kb_ensure();                      /* shared keyboard (prologue) */
     }
 
     /* 1s prologue tick (auto-advance) */
@@ -1791,6 +2000,12 @@ static void session_reset(void)
     for (uint32_t k = 0; k < CHOICE_MAX; k++) s_stc_lbl[k] = 0;
     s_choice_n = 0;
     s_choice_wait = 0;
+    s_stface_img = 0;
+    s_kb_owner = 0;
+    s_kb_actor = 0;
+    s_kb_max = 0;
+    for (uint32_t k = 0; k < 8u; k++) { s_names[k][0] = '\0'; s_name_len[k] = 0; }
+    for (uint32_t k = 0; k < 4u; k++) s_selfsw[k] = 0;
     s_dlg = 0;                       /* firmware-page widgets die with the
                                       * page; stale pointers here are the
                                       * v1.4 dead-buttons bug class */
