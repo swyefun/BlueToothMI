@@ -1,0 +1,28 @@
+{
+  "artifacts": [
+    {
+      "firmware_sha256": "31ce82257f7c127950dc5070b86316730cf468a41f0d004559e41e7d923b2c74",
+      "path": "artifacts/xiaomi-band-11-4.100.139/module.elf",
+      "receipt_path": "receipts/xiaomi-band-11-4.100.139.cmi",
+      "receipt_sha256": "3a72648eab651385db9f176e3f3d254ec1f44f9bcd89babc734ea664ff90be8f",
+      "sha256": "e4bf6b67d5c4e779a727a73323113130c4183b51827d0a5089235f3e4a550d69",
+      "target_id": "xiaomi-band-11-4.100.139",
+      "target_pack_revision": 2
+    }
+  ],
+  "build_generation": 5,
+  "canopus_abi": "2",
+  "lifecycle": "removable",
+  "min_manager_version": "0.1.0",
+  "module_id": "toolbox",
+  "package_id": "toolbox",
+  "reboot_required": true,
+  "reproducibility": {
+    "build_environment": "canopus 0.2.1, sdk f196b200823f47780c73ae48c4c62da8fe5311df"
+  },
+  "schema": 1,
+  "target_pack_revision": 2,
+  "update_semantics": "staged next generation; switch at next load",
+  "version": "0.4.0",
+  "version_code": 5
+}

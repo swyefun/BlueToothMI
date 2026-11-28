@@ -1,0 +1,26 @@
+{
+  "product": "toolbox",
+  "targets": {
+    "4.100.139": {
+      "id": "xiaomi-band-11-4.100.139",
+      "firmware": "31ce82257f7c127950dc5070b86316730cf468a41f0d004559e41e7d923b2c74",
+      "runtime_pending": false,
+      "build": "user-4.100.139-cn-202608280000"
+    }
+  },
+  "device_status": "NOT_PROBED",
+  "resources": {
+    "main.lua": {
+      "size": 11946,
+      "sha256": "4477fc65210531d13b39407afb02f6c85ff2abb4804678119ead73ddc6bb23e3"
+    },
+    "toolbox-xiaomi-band-11-4.100.139.bin": {
+      "size": 19144,
+      "sha256": "e4bf6b67d5c4e779a727a73323113130c4183b51827d0a5089235f3e4a550d69"
+    },
+    "toolbox-xiaomi-band-11-4.100.139.cmi.bin": {
+      "size": 176,
+      "sha256": "3a72648eab651385db9f176e3f3d254ec1f44f9bcd89babc734ea664ff90be8f"
+    }
+  }
+}
