@@ -1,0 +1,117 @@
+./src/bsvm.c:1338:1: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1338 | PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
+      | ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1338:13: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1338 | PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
+      |             ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1338:25: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1338 | PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
+      |                         ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1338:37: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1338 | PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
+      |                                     ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1339:1: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1339 | PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
+      | ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1339:13: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1339 | PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
+      |             ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1339:25: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1339 | PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
+      |                         ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1339:37: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1339 | PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
+      |                                     ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1340:1: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1340 | PKEY_FN(8)  PKEY_FN(9)  PKEY_FN(10) PKEY_FN(11)
+      | ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1340:13: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1340 | PKEY_FN(8)  PKEY_FN(9)  PKEY_FN(10) PKEY_FN(11)
+      |             ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1340:25: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1340 | PKEY_FN(8)  PKEY_FN(9)  PKEY_FN(10) PKEY_FN(11)
+      |                         ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1340:37: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1340 | PKEY_FN(8)  PKEY_FN(9)  PKEY_FN(10) PKEY_FN(11)
+      |                                     ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1341:1: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1341 | PKEY_FN(12) PKEY_FN(13) PKEY_FN(14) PKEY_FN(15)
+      | ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1341:13: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1341 | PKEY_FN(12) PKEY_FN(13) PKEY_FN(14) PKEY_FN(15)
+      |             ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1341:25: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1341 | PKEY_FN(12) PKEY_FN(13) PKEY_FN(14) PKEY_FN(15)
+      |                         ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1341:37: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1341 | PKEY_FN(12) PKEY_FN(13) PKEY_FN(14) PKEY_FN(15)
+      |                                     ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1342:1: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1342 | PKEY_FN(16) PKEY_FN(17) PKEY_FN(18) PKEY_FN(19)
+      | ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1342:13: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1342 | PKEY_FN(16) PKEY_FN(17) PKEY_FN(18) PKEY_FN(19)
+      |             ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+./src/bsvm.c:1342:25: error: call to undeclared function 'kb_key'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+ 1342 | PKEY_FN(16) PKEY_FN(17) PKEY_FN(18) PKEY_FN(19)
+      |                         ^
+./src/bsvm.c:1337:63: note: expanded from macro 'PKEY_FN'
+ 1337 | #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
+      |                                                               ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.
+error: `clang` failed (exit status: 1) while compiling src/bsvm.c
