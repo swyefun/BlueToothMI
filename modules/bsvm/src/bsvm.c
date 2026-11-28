@@ -91,8 +91,8 @@ static const char LOG_PATH[] = "/data/canopus/bsvm_log.txt";      /* /data/bsvm/
 
 /* ---------------- static pools ---------------- */
 #define EVT_MAX 224000u                 /* S1 blob evt 213K */
-#define DB_MAX  115200u
-#define DIR_MAX 110000u
+#define DB_MAX  118000u                 /* S1 blob db 114.7K, headroom */
+#define DIR_MAX 132000u                 /* S1 blob dir 121.7K (strtab grew) */
 #define STRN_MAX 10800u                 /* S1 blob: 10190 strings */
 #define STEPS_PER_ENTRY 120000u
 
