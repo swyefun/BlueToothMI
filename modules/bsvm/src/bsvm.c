@@ -1267,211 +1267,6 @@ static void cb_stchoice_1(void *e) { (void)e; cb_choice(1u); }
 static void cb_stchoice_2(void *e) { (void)e; cb_choice(2u); }
 static void cb_stchoice_3(void *e) { (void)e; cb_choice(3u); }
 
-/* ---------------- S2: shared keyboard routing + naming ---------------- */
-static void story_key(int n);           /* defined below */
-
-static void kb_key(int n)
-{
-    if (s_kb_owner == 1u) story_key(n);
-    else prologue_key(n);               /* hand-written prologue owner */
-}
-
-static void story_face_show(const char *name)
-{
-    if (s_stface_img == 0) return;
-    if (name[0] == '\0') {               /* narrator / no portrait */
-        ui_show(s_stface_img, 0);
-        return;
-    }
-    /* data-driven path: /data/bsvm_face_<name>.bin; falls back to the
-     * shipped portrait file so today's single asset works for any name */
-    char path[64];
-    uint32_t o = 0;
-    const char *pre = "/data/bsvm_face_";
-    for (; pre[o] != '\0'; o++) path[o] = pre[o];
-    uint32_t j = 0;
-    for (; name[j] != '\0' && o < 48u; j++) path[o++] = name[j];
-    const char *suf = ".bin";
-    for (j = 0; suf[j] != '\0' && o < 56u; j++) path[o++] = suf[j];
-    path[o] = '\0';
-    if (probe_size(path) < 0) {
-        const char *fb = FACE_PATH;
-        o = 0;
-        for (; fb[o] != '\0'; o++) path[o] = fb[o];
-        path[o] = '\0';
-    }
-    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
-        s_stface_img, path);
-    ui_show(s_stface_img, 1);
-}
-
-static void story_name_start(uint32_t actor, uint32_t maxlen)
-{
-    kb_ensure();                        /* shared keyboard, created lazily */
-    s_kb_owner = 1u;
-    s_kb_actor = actor;
-    s_kb_max = (maxlen > 0u && maxlen < 20u) ? maxlen : 20u;
-    s_choice_wait = 0u;
-    choice_ui(0);
-    ui_show(s_story_lbl, 0);            /* no tap-to-continue while naming */
-    ui_show(s_dlg, 0);                  /* kb taps must reach the key rows */
-    ui_show(s_stface_img, 0);
-    ui_show(s_name_lbl, 1);
-    for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 1);
-    /* name display line */
-    {
-        char disp[40];
-        uint32_t o = 0;
-        const char *pre = "\xE5\x90\x8D\xE5\xAD\x97: ";  /* 名字: */
-        for (; pre[o] != '\0'; o++) disp[o] = pre[o];
-        uint8_t n = s_name_len[actor];
-        for (uint8_t j = 0; j < n && o < 36u; j++) disp[o++] = s_names[actor][j];
-        disp[o] = '\0';
-        if (s_name_lbl != 0) {
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                s_name_lbl, disp);
-        }
-    }
-}
-
-static void story_key(int n)
-{
-    char *buf = s_names[s_kb_actor];
-    if (n < 26) {
-        if (s_name_len[s_kb_actor] < s_kb_max &&
-            s_name_len[s_kb_actor] < 20u)
-            buf[s_name_len[s_kb_actor]++] = (char)('A' + n);
-    } else if (n == 26) {               /* backspace */
-        if (s_name_len[s_kb_actor] > 0u) s_name_len[s_kb_actor]--;
-    } else {                            /* done */
-        if (s_name_len[s_kb_actor] == 0u) {
-            const char *def = "\xE6\xA0\xBC\xE6\x9E\x97";  /* 格林 */
-            uint32_t j = 0;
-            for (; def[j] != '\0'; j++) buf[j] = def[j];
-            s_name_len[s_kb_actor] = (uint8_t)j;
-        }
-        buf[s_name_len[s_kb_actor]] = '\0';
-        for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 0);
-        ui_show(s_name_lbl, 0);
-        ui_show(s_dlg, 1);              /* restore the dialog layer */
-        s_kb_owner = 0u;
-        ui_show(s_story_lbl, 1);        /* restore tap-to-continue */
-        if (!ui_run_until_text()) {     /* resume at the same callback depth */
-            s_ui_mode = 3u;
-            ui_set_dlg("\xE6\x95\x85\xE4\xBA\x8B\xE6\x92\xAD\xE6\x94\xBE\xE5\xAE\x8C\xE6\xAF\x95");
-        }
-        return;
-    }
-    buf[s_name_len[s_kb_actor]] = '\0';
-    {
-        char disp[40];
-        uint32_t o = 0;
-        const char *pre = "\xE5\x90\x8D\xE5\xAD\x97: ";
-        for (; pre[o] != '\0'; o++) disp[o] = pre[o];
-        for (uint8_t j = 0; j < s_name_len[s_kb_actor] && o < 36u; j++)
-            disp[o++] = buf[j];
-        disp[o] = '\0';
-        if (s_name_lbl != 0) {
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                s_name_lbl, disp);
-        }
-    }
-}
-
-static void story_start(void *root)
-{
-    if (!s_ok_init || s_root == 0) return;   /* load-failed page stays */
-    s_started = 1;
-    s_story_on = 1;
-    obj_hide(s_title_img);
-    obj_hide(s_title_lbl);
-    obj_hide(s_menu_ng);
-    obj_hide(s_menu_cont);
-    obj_hide(s_menu_end);
-    if (s_dlg == 0) {
-        s_scene = ui_label(root, 0, 6, 212, 22, 0, s_cjk_font);
-        s_dlg = ui_label(root, 8, 40, 196, 424, 1, s_cjk_font);
-        s_stface_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(root);
-        if (s_stface_img != 0) {
-            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
-                s_stface_img, 96, 96);
-            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
-                FW_OBJ_ALIGN))(s_stface_img, ALIGN_TOP_LEFT, 112, 4);
-            obj_hide(s_stface_img);
-        }
-        s_story_lbl = ui_label(root, 0, 474, 212, 34, 0, s_cjk_font);
-        if (s_story_lbl != 0) {
-            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
-                s_story_lbl, "点击继续");
-        }
-        /* both the text body and the hint row are tap targets */
-        void *taps[2];
-        taps[0] = s_dlg;
-        taps[1] = s_story_lbl;
-        for (int i = 0; i < 2; i++) {
-            if (taps[i] == 0) continue;
-            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-                taps[i], LV_FLAG_CLICKABLE);
-            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-                uintptr_t)VENA(FW_EVENT_ADD))(taps[i], cb_story_next,
-                                              LV_EVENT_CLICKED, 0);
-        }
-        /* G0b: choice rows (created once, hidden until a CHOICE pauses) */
-        static void (*const choice_cbs[CHOICE_MAX])(void *) = {
-            cb_stchoice_0, cb_stchoice_1, cb_stchoice_2, cb_stchoice_3 };
-        for (uint32_t k = 0; k < CHOICE_MAX; k++) {
-            s_stc_lbl[k] = ui_label(root, 6, 288 + (int)k * 46, 200, 42,
-                                       0, s_cjk_font);
-            if (s_stc_lbl[k] == 0) continue;
-            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
-                s_stc_lbl[k], LV_FLAG_CLICKABLE);
-            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
-                uintptr_t)VENA(FW_EVENT_ADD))(s_stc_lbl[k], choice_cbs[k],
-                                              LV_EVENT_CLICKED, 0);
-            obj_hide(s_stc_lbl[k]);
-        }
-    }
-    obj_show(s_scene);
-    obj_show(s_dlg);
-    obj_show(s_story_lbl);
-    ui_set_scene("BSVM 剧情");
-    ui_set_dlg("");
-    ui_pick_story();                         /* data-driven entry selection */
-    if (s_story_ce >= 0) {
-        char hdr[40];
-        char vb[12];
-        int o = 0, n = 0;
-        const char *pre = "BSVM \xE5\x89\xA7\xE6\x83\x85 CE#";  /* 剧情 */
-        for (; pre[o]; o++) hdr[o] = pre[o];
-        u32_to_dec(vb, (uint32_t)s_story_ce);
-        n = 0;
-        while (vb[n] && o < (int)sizeof(hdr) - 2) hdr[o++] = vb[n++];
-        hdr[o] = '\0';
-        ui_set_scene(hdr);
-    }
-    if (!ui_run_until_text()) {              /* empty entry: still a page */
-        s_ui_mode = 3u;
-        ui_set_dlg("故事播放完毕");
-    }
-    log_flush();
-}
-
-static void cb_new_game(void *e)
-{
-    (void)e;
-    if (s_started) return;
-    /* transitional switch: /data/bsvm_prologue.txt runs the hand-written
-     * table; default (file absent) is the bytecode story player */
-    int pfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_prologue.txt",
-                                                  O_RDONLY);
-    if (pfd >= 0) {
-        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(pfd);
-        prologue_start();
-        return;
-    }
-    story_start(s_root);
-}
-
 /* ---------------- v0.8 prologue engine (Map097 character make) ----------------
  * Map view (pre-rendered /data/bsvm_map.bin, knight baked in) + RMVA-style
  * textbox (/data/bsvm_box.bin) + alice portrait (/data/bsvm_face.bin).
@@ -1825,6 +1620,211 @@ static void kb_ensure(void)
         }
     }
     }
+}
+
+/* ---------------- S2: shared keyboard routing + naming ---------------- */
+static void story_key(int n);           /* defined below */
+
+static void kb_key(int n)
+{
+    if (s_kb_owner == 1u) story_key(n);
+    else prologue_key(n);               /* hand-written prologue owner */
+}
+
+static void story_face_show(const char *name)
+{
+    if (s_stface_img == 0) return;
+    if (name[0] == '\0') {               /* narrator / no portrait */
+        ui_show(s_stface_img, 0);
+        return;
+    }
+    /* data-driven path: /data/bsvm_face_<name>.bin; falls back to the
+     * shipped portrait file so today's single asset works for any name */
+    char path[64];
+    uint32_t o = 0;
+    const char *pre = "/data/bsvm_face_";
+    for (; pre[o] != '\0'; o++) path[o] = pre[o];
+    uint32_t j = 0;
+    for (; name[j] != '\0' && o < 48u; j++) path[o++] = name[j];
+    const char *suf = ".bin";
+    for (j = 0; suf[j] != '\0' && o < 56u; j++) path[o++] = suf[j];
+    path[o] = '\0';
+    if (probe_size(path) < 0) {
+        const char *fb = FACE_PATH;
+        o = 0;
+        for (; fb[o] != '\0'; o++) path[o] = fb[o];
+        path[o] = '\0';
+    }
+    ((void (*)(void *, const char *))(uintptr_t)VENA(FW_IMAGE_SET_SRC))(
+        s_stface_img, path);
+    ui_show(s_stface_img, 1);
+}
+
+static void story_name_start(uint32_t actor, uint32_t maxlen)
+{
+    kb_ensure();                        /* shared keyboard, created lazily */
+    s_kb_owner = 1u;
+    s_kb_actor = actor;
+    s_kb_max = (maxlen > 0u && maxlen < 20u) ? maxlen : 20u;
+    s_choice_wait = 0u;
+    choice_ui(0);
+    ui_show(s_story_lbl, 0);            /* no tap-to-continue while naming */
+    ui_show(s_dlg, 0);                  /* kb taps must reach the key rows */
+    ui_show(s_stface_img, 0);
+    ui_show(s_name_lbl, 1);
+    for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 1);
+    /* name display line */
+    {
+        char disp[40];
+        uint32_t o = 0;
+        const char *pre = "\xE5\x90\x8D\xE5\xAD\x97: ";  /* 名字: */
+        for (; pre[o] != '\0'; o++) disp[o] = pre[o];
+        uint8_t n = s_name_len[actor];
+        for (uint8_t j = 0; j < n && o < 36u; j++) disp[o++] = s_names[actor][j];
+        disp[o] = '\0';
+        if (s_name_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_name_lbl, disp);
+        }
+    }
+}
+
+static void story_key(int n)
+{
+    char *buf = s_names[s_kb_actor];
+    if (n < 26) {
+        if (s_name_len[s_kb_actor] < s_kb_max &&
+            s_name_len[s_kb_actor] < 20u)
+            buf[s_name_len[s_kb_actor]++] = (char)('A' + n);
+    } else if (n == 26) {               /* backspace */
+        if (s_name_len[s_kb_actor] > 0u) s_name_len[s_kb_actor]--;
+    } else {                            /* done */
+        if (s_name_len[s_kb_actor] == 0u) {
+            const char *def = "\xE6\xA0\xBC\xE6\x9E\x97";  /* 格林 */
+            uint32_t j = 0;
+            for (; def[j] != '\0'; j++) buf[j] = def[j];
+            s_name_len[s_kb_actor] = (uint8_t)j;
+        }
+        buf[s_name_len[s_kb_actor]] = '\0';
+        for (int i = 0; i < 28; i++) ui_show(s_key_lbl[i], 0);
+        ui_show(s_name_lbl, 0);
+        ui_show(s_dlg, 1);              /* restore the dialog layer */
+        s_kb_owner = 0u;
+        ui_show(s_story_lbl, 1);        /* restore tap-to-continue */
+        if (!ui_run_until_text()) {     /* resume at the same callback depth */
+            s_ui_mode = 3u;
+            ui_set_dlg("\xE6\x95\x85\xE4\xBA\x8B\xE6\x92\xAD\xE6\x94\xBE\xE5\xAE\x8C\xE6\xAF\x95");
+        }
+        return;
+    }
+    buf[s_name_len[s_kb_actor]] = '\0';
+    {
+        char disp[40];
+        uint32_t o = 0;
+        const char *pre = "\xE5\x90\x8D\xE5\xAD\x97: ";
+        for (; pre[o] != '\0'; o++) disp[o] = pre[o];
+        for (uint8_t j = 0; j < s_name_len[s_kb_actor] && o < 36u; j++)
+            disp[o++] = buf[j];
+        disp[o] = '\0';
+        if (s_name_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_name_lbl, disp);
+        }
+    }
+}
+
+static void story_start(void *root)
+{
+    if (!s_ok_init || s_root == 0) return;   /* load-failed page stays */
+    s_started = 1;
+    s_story_on = 1;
+    obj_hide(s_title_img);
+    obj_hide(s_title_lbl);
+    obj_hide(s_menu_ng);
+    obj_hide(s_menu_cont);
+    obj_hide(s_menu_end);
+    if (s_dlg == 0) {
+        s_scene = ui_label(root, 0, 6, 212, 22, 0, s_cjk_font);
+        s_dlg = ui_label(root, 8, 40, 196, 424, 1, s_cjk_font);
+        s_stface_img = ((void *(*)(void *))(uintptr_t)VENA(FW_IMAGE_CREATE))(root);
+        if (s_stface_img != 0) {
+            ((void (*)(void *, int32_t, int32_t))(uintptr_t)VENA(FW_OBJ_SIZE))(
+                s_stface_img, 96, 96);
+            ((void (*)(void *, uint32_t, int32_t, int32_t))(uintptr_t)VENA(
+                FW_OBJ_ALIGN))(s_stface_img, ALIGN_TOP_LEFT, 112, 4);
+            obj_hide(s_stface_img);
+        }
+        s_story_lbl = ui_label(root, 0, 474, 212, 34, 0, s_cjk_font);
+        if (s_story_lbl != 0) {
+            ((void (*)(void *, const char *))(uintptr_t)VENA(FW_LABEL_TEXT))(
+                s_story_lbl, "点击继续");
+        }
+        /* both the text body and the hint row are tap targets */
+        void *taps[2];
+        taps[0] = s_dlg;
+        taps[1] = s_story_lbl;
+        for (int i = 0; i < 2; i++) {
+            if (taps[i] == 0) continue;
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                taps[i], LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(taps[i], cb_story_next,
+                                              LV_EVENT_CLICKED, 0);
+        }
+        /* G0b: choice rows (created once, hidden until a CHOICE pauses) */
+        static void (*const choice_cbs[CHOICE_MAX])(void *) = {
+            cb_stchoice_0, cb_stchoice_1, cb_stchoice_2, cb_stchoice_3 };
+        for (uint32_t k = 0; k < CHOICE_MAX; k++) {
+            s_stc_lbl[k] = ui_label(root, 6, 288 + (int)k * 46, 200, 42,
+                                       0, s_cjk_font);
+            if (s_stc_lbl[k] == 0) continue;
+            ((void (*)(void *, uint32_t))(uintptr_t)VENA(FW_OBJ_ADD_FLAG))(
+                s_stc_lbl[k], LV_FLAG_CLICKABLE);
+            (void)((void *(*)(void *, void (*)(void *), uint32_t, void *))(
+                uintptr_t)VENA(FW_EVENT_ADD))(s_stc_lbl[k], choice_cbs[k],
+                                              LV_EVENT_CLICKED, 0);
+            obj_hide(s_stc_lbl[k]);
+        }
+    }
+    obj_show(s_scene);
+    obj_show(s_dlg);
+    obj_show(s_story_lbl);
+    ui_set_scene("BSVM 剧情");
+    ui_set_dlg("");
+    ui_pick_story();                         /* data-driven entry selection */
+    if (s_story_ce >= 0) {
+        char hdr[40];
+        char vb[12];
+        int o = 0, n = 0;
+        const char *pre = "BSVM \xE5\x89\xA7\xE6\x83\x85 CE#";  /* 剧情 */
+        for (; pre[o]; o++) hdr[o] = pre[o];
+        u32_to_dec(vb, (uint32_t)s_story_ce);
+        n = 0;
+        while (vb[n] && o < (int)sizeof(hdr) - 2) hdr[o++] = vb[n++];
+        hdr[o] = '\0';
+        ui_set_scene(hdr);
+    }
+    if (!ui_run_until_text()) {              /* empty entry: still a page */
+        s_ui_mode = 3u;
+        ui_set_dlg("故事播放完毕");
+    }
+    log_flush();
+}
+
+static void cb_new_game(void *e)
+{
+    (void)e;
+    if (s_started) return;
+    /* transitional switch: /data/bsvm_prologue.txt runs the hand-written
+     * table; default (file absent) is the bytecode story player */
+    int pfd = ((posix_open_fn)vfn(FW_POSIX_OPEN))("/data/bsvm_prologue.txt",
+                                                  O_RDONLY);
+    if (pfd >= 0) {
+        ((posix_close_fn)vfn(FW_POSIX_CLOSE))(pfd);
+        prologue_start();
+        return;
+    }
+    story_start(s_root);
 }
 
 static void prologue_start(void)
