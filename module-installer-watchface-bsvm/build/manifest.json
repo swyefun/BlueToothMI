@@ -1,0 +1,26 @@
+{
+  "product": "bsvm",
+  "targets": {
+    "4.100.139": {
+      "id": "xiaomi-band-11-4.100.139",
+      "firmware": "31ce82257f7c127950dc5070b86316730cf468a41f0d004559e41e7d923b2c74",
+      "runtime_pending": false,
+      "build": "user-4.100.139-cn-202608280000"
+    }
+  },
+  "device_status": "NOT_PROBED",
+  "resources": {
+    "main.lua": {
+      "size": 11938,
+      "sha256": "dfb1af81d0a853295f0c1d8c4bf76997036045f99b9fa0772ec7ca4d30696ac2"
+    },
+    "bsvm-xiaomi-band-11-4.100.139.bin": {
+      "size": 101540,
+      "sha256": "dee3ea9885b45a7a2adfc16679acf63a7bd0dcb5fd9e8cf187e523dba243b1a4"
+    },
+    "bsvm-xiaomi-band-11-4.100.139.cmi.bin": {
+      "size": 176,
+      "sha256": "d7d2e3673cb7bd8b80b4d67718cc423c7abe05384b4104051c8f92e2d29333ac"
+    }
+  }
+}
