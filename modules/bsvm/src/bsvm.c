@@ -1334,6 +1334,7 @@ static void prologue_tick(void *arg);
 static void prologue_key(int n);
 static void prologue_pick(int n);
 
+static void kb_key(int n);     /* S2: keyboard router, defined later */
 #define PKEY_FN(n) static void cb_key_##n(void *e) { (void)e; kb_key(n); }
 PKEY_FN(0)  PKEY_FN(1)  PKEY_FN(2)  PKEY_FN(3)
 PKEY_FN(4)  PKEY_FN(5)  PKEY_FN(6)  PKEY_FN(7)
